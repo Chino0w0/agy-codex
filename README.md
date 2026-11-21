@@ -6,7 +6,7 @@ Delegate bounded coding, debugging, refactoring, and independent code review tas
 
 ## Why `codex-in-anti`?
 
-Running `codex exec` directly against a desktop `~/.codex/config.toml` pulls in GUI plugins, heavy MCP servers, hooks, memories, and nested subagent prompts on every call. In our benchmark on a simple Python task, a raw `codex exec` call consumed **~598k tokens** and triggered context compaction twice, whereas routing through the `worker` profile dropped usage to **~22k tokens (~96% reduction)** and cut runtime from **~70s to ~13s**.
+Running `codex exec` directly against a desktop `~/.codex/config.toml` pulls in GUI plugins, heavy MCP servers, hooks, memories, and nested subagent instructions on every call. In a controlled local benchmark across 3 real tasks (read-only analysis, greenfield module + tests, and bug fix + verification), routing through `-p worker` cut total token usage by **45.2%** (from **108,617** to **59,550** tokens, with up to **64.2%** savings on standalone generation) and reduced total runtime by **8.1%** (up to **17.3%** faster on single tasks) while keeping outputs identical and verified.
 
 `codex-in-anti` packages that setup into a clean, drop-in workflow:
 
@@ -131,6 +131,22 @@ Each run prints a JSON summary to `stdout` and archives `codex.log`, `output.jso
   "log_file": "/tmp/codex-worker-runs/.../codex.log"
 }
 ```
+
+## Benchmark
+
+Measured sequentially on macOS with `codex-cli 0.171.0`. Both variants shared the exact same model, `model_reasoning_effort = "medium"`, `--output-schema`, prompts, and clean workspaces; the only difference was `--no-worker-profile` (desktop config with bundled plugins, hooks, memories, `chronicle`, and MCP servers enabled) vs. the default `-p worker` profile (`worker.config.toml`).
+
+| Task | Mode | Baseline Time | Worker Time | Time Delta | Baseline Tokens | Worker Tokens | Token Delta | Compactions (B/W) |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **T1**: Read-only analysis of `codex_run.py` | `read-only` | 18.16s | 17.99s | -0.9% | 37,692 | 24,703 | **-34.5%** | 0 / 0 |
+| **T2**: Create `math_utils.py` + 6+ `assert` tests & run | `write` | 21.60s | 17.86s | **-17.3%** | 35,516 | 12,730 | **-64.2%** | 0 / 0 |
+| **T3**: Fix `parser.py` bugs to pass `test_parser.py` | `write` | 16.85s | 16.17s | -4.0% | 35,409 | 22,117 | **-37.5%** | 0 / 0 |
+| **Total (3 tasks)** | - | **56.61s** | **52.02s** | **-8.1%** | **108,617** | **59,550** | **-45.2%** | 0 / 0 |
+
+**What caused the difference?**
+- Inspecting the execution logs showed the baseline runs fired `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` hooks on every tool call, injected desktop plugins/MCP schemas into context (even invoking a desktop MCP glob tool inside an empty directory during T2), and emitted `chronicle` feature warnings.
+- With `-p worker`, Codex skipped hooks, desktop plugins, memories, and MCP servers—going straight to shell inspection, patching, and running verification tests with all assertions verified passing post-run.
+- In environments where desktop plugins or remote OAuth MCP servers also stall startup or trigger context compactions, latency and token savings can be even larger.
 
 ## Customization
 

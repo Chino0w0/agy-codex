@@ -6,9 +6,7 @@
 
 ## 为什么做这个项目？
 
-如果直接在非交互模式下调用 `codex exec`，它会默认加载桌面端 `~/.codex/config.toml` 里的全部 GUI 插件、重型 MCP Server、Hooks、Memories 以及嵌套 Subagent 指令。我们在一次简单 Python 任务实测中发现：
-- **裸调 `codex exec`**：消耗约 **59.8 万 tokens**，触发 2 次上下文压缩，耗时 ~70 秒；
-- **接入本项目的 `worker` Profile 后**：仅消耗 **2.2 万 tokens（直降约 96%）**，0 次压缩，耗时 **~13 秒**。
+如果直接在非交互模式下调用 `codex exec`，它会默认加载桌面端 `~/.codex/config.toml` 里的全部 GUI 插件、重型 MCP Server、Hooks、Memories 以及嵌套 Subagent 指令。我们在 macOS 本地针对 3 类真实开发任务（只读源码分析、新建模块并自测、定位并修复 Bug）做了受控对比测试：接入 `-p worker` 后，**总 Token 消耗从 108,617 降至 59,550（整体降低 45.2%，单任务最高降幅 64.2%）**，**总耗时降低 8.1%（单任务最高提速 17.3%）**，且所有验证测试均一次通过。
 
 `codex-in-anti` 将整套工程化实践固化为开箱即用的开源方案：
 
@@ -132,6 +130,22 @@ python3 ~/.gemini/config/skills/codex-worker/scripts/codex_run.py review \
   "log_file": "/tmp/codex-worker-runs/.../codex.log"
 }
 ```
+
+## 实测性能对比
+
+在 macOS 上使用 `codex-cli 0.171.0` 对同一模型、`model_reasoning_effort = "medium"`、相同 `--output-schema`、完全一致的 Prompt 与全新工作目录进行顺序实测，唯一变量为是否启用轻量 Profile（基线 `--no-worker-profile` 加载桌面插件、Hooks、Memories、`chronicle` 与 MCP Server，对照组默认使用 `-p worker`）：
+
+| 任务 | 沙箱模式 | 基线耗时 | Worker 耗时 | 耗时变化 | 基线 Tokens | Worker Tokens | Token 降幅 | 上下文压缩 (基线/Worker) |
+| :--- | :---: | ---: | ---: | ---: | ---: | ---: | ---: | :---: |
+| **T1**：只读分析 `codex_run.py` | `read-only` | 18.16s | 17.99s | -0.9% | 37,692 | 24,703 | **-34.5%** | 0 / 0 |
+| **T2**：新建 `math_utils.py` + 6+ `assert` 自测 | `write` | 21.60s | 17.86s | **-17.3%** | 35,516 | 12,730 | **-64.2%** | 0 / 0 |
+| **T3**：修复 `parser.py` Bug 并跑通 `test_parser.py` | `write` | 16.85s | 16.17s | -4.0% | 35,409 | 22,117 | **-37.5%** | 0 / 0 |
+| **合计（3 项任务）** | - | **56.61s** | **52.02s** | **-8.1%** | **108,617** | **59,550** | **-45.2%** | 0 / 0 |
+
+**日志对比分析：**
+- 从运行日志可以看到，基线模式在每一步工具调用都会触发 `SessionStart` / `UserPromptSubmit` / `PreToolUse` / `PostToolUse` Hooks，加载桌面插件与 MCP 工具定义（T2 在空目录中甚至额外调用了桌面 MCP 的 glob 工具），并输出 `chronicle` 特性告警。
+- 启用 `-p worker` 后，Codex 跳过了所有 Hooks、桌面插件、Memories 与重型 MCP，直接完成文件读写、补丁应用与测试验证（所有写任务在跑完后均复验通过）。
+- 若宿主桌面配置中存在大量远程 OAuth MCP 或引发上下文压缩，耗时与 Token 的节省幅度还会进一步放大。
 
 ## 个性化调优
 
