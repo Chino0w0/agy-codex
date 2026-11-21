@@ -1,0 +1,102 @@
+# Lightweight worker profile for non-interactive delegation via `codex exec -p worker`.
+# Place at `$CODEX_HOME/worker.config.toml` (default: `~/.codex/worker.config.toml`).
+# Layered on top of `~/.codex/config.toml` without affecting interactive desktop usage.
+
+personality = "pragmatic"
+model_reasoning_effort = "medium"
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+suppress_unstable_features_warning = true
+notify = []
+tool_output_token_limit = 10000
+
+# Optional: pin a dedicated model or provider for worker runs.
+# model = "o3"
+# model_provider = "openai"
+
+developer_instructions = """
+You are running as a non-interactive worker invoked by an orchestrator agent.
+Execute the bounded task directly and thoroughly within the workspace.
+Do not spawn subagents, do not ask interactive follow-up questions, and do not modify files outside the requested scope.
+Run concrete verification commands (tests, linters, or scripts) for every change when possible.
+Report concise, factual results: changed file paths, exact verification commands and outcomes, and any remaining risks or blockers.
+"""
+
+[agents]
+enabled = false
+
+[features]
+hooks = false
+js_repl = false
+memories = false
+chronicle = false
+
+[memories]
+generate_memories = false
+use_memories = false
+
+# Disable heavy Codex Desktop / GUI MCP servers and bundled plugins by default
+# so worker invocations stay fast and token-efficient.
+[mcp_servers.computer-use]
+enabled = false
+
+[mcp_servers.node_repl]
+enabled = false
+
+# Add any custom heavy MCP servers from your `~/.codex/config.toml` below, e.g.:
+# [mcp_servers.my-heavy-mcp]
+# enabled = false
+
+[plugins."documents@openai-primary-runtime"]
+enabled = false
+
+[plugins."spreadsheets@openai-primary-runtime"]
+enabled = false
+
+[plugins."presentations@openai-primary-runtime"]
+enabled = false
+
+[plugins."pdf@openai-primary-runtime"]
+enabled = false
+
+[plugins."template-creator@openai-primary-runtime"]
+enabled = false
+
+[plugins."latex@openai-bundled"]
+enabled = false
+
+[plugins."codex-app-tools@openai-bundled"]
+enabled = false
+
+[plugins."visualize@openai-bundled"]
+enabled = false
+
+[plugins."browser@openai-bundled"]
+enabled = false
+
+[plugins."unified-computer-use@openai-bundled"]
+enabled = false
+
+[plugins."computer-use@openai-bundled"]
+enabled = false
+
+[plugins."computer-history@openai-bundled"]
+enabled = false
+
+[plugins."chrome@openai-bundled"]
+enabled = false
+
+[plugins."github@openai-curated"]
+enabled = false
+
+[plugins."github@openai-api-curated"]
+enabled = false
+
+[plugins."build-ios-apps@openai-curated"]
+enabled = false
+
+[plugins."build-web-apps@openai-curated"]
+enabled = false
+
+[plugins."build-macos-apps@openai-curated"]
+enabled = false

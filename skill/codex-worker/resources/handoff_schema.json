@@ -1,0 +1,67 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "status",
+    "summary",
+    "changed_files",
+    "verification",
+    "risks",
+    "next_steps"
+  ],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["done", "partial", "blocked"],
+      "description": "Overall completion state of the delegated task."
+    },
+    "summary": {
+      "type": "string",
+      "description": "Concise factual summary of what was accomplished or why it is blocked."
+    },
+    "changed_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Workspace-relative paths of files created, modified, or deleted. Empty array if read-only or no changes."
+    },
+    "verification": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "passed", "notes"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Exact verification command executed."
+          },
+          "passed": {
+            "type": "boolean",
+            "description": "Whether the verification command succeeded."
+          },
+          "notes": {
+            "type": "string",
+            "description": "Short key output or error summary."
+          }
+        }
+      },
+      "description": "Verification commands executed and their observed results."
+    },
+    "risks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Remaining risks, caveats, untested edge cases, or blockers."
+    },
+    "next_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Suggested follow-up actions for the orchestrator, if any."
+    }
+  }
+}
