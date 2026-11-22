@@ -1,6 +1,13 @@
-# Lightweight worker profile for non-interactive delegation via `codex exec -p worker`.
+# Worker configuration for `codex-in-anti`.
 # Place at `$CODEX_HOME/worker.config.toml` (default: `~/.codex/worker.config.toml`).
-# Layered on top of `~/.codex/config.toml` without affecting interactive desktop usage.
+#
+# How `codex_run.py` uses this file:
+# - `--config-mode isolated` (default on Python 3.11+): passes `--ignore-user-config` to Codex CLI
+#   and whitelist-extracts ONLY `model`, `model_provider`, `model_reasoning_effort`, `personality`,
+#   `tool_output_token_limit`, `developer_instructions`, plus provider/proxy settings from `config.toml`.
+#   Desktop plugins, MCP servers, hooks, memories, and chronicle are completely ignored.
+# - `--config-mode profile` (fallback on Python 3.10): passes `-p worker` layered on top of
+#   `~/.codex/config.toml` and relies on the explicit disable blocks below.
 
 personality = "pragmatic"
 model_reasoning_effort = "medium"
@@ -22,6 +29,8 @@ Run concrete verification commands (tests, linters, or scripts) for every change
 Report concise, factual results: changed file paths, exact verification commands and outcomes, and any remaining risks or blockers.
 """
 
+# --- Settings below apply when running in `--config-mode profile` (`codex exec -p worker`) ---
+
 [agents]
 enabled = false
 
@@ -35,15 +44,13 @@ chronicle = false
 generate_memories = false
 use_memories = false
 
-# Disable heavy Codex Desktop / GUI MCP servers and bundled plugins by default
-# so worker invocations stay fast and token-efficient.
 [mcp_servers.computer-use]
 enabled = false
 
 [mcp_servers.node_repl]
 enabled = false
 
-# Add any custom heavy MCP servers from your `~/.codex/config.toml` below, e.g.:
+# Add any custom heavy MCP servers from your `~/.codex/config.toml` if using `profile` mode:
 # [mcp_servers.my-heavy-mcp]
 # enabled = false
 
