@@ -105,6 +105,9 @@ let tickTimer: number | null = null;
 let panelRefreshTimer: number | null = null;
 let localStartedMs = Date.now();
 let pollInFlight = false;
+let userPinnedToBottom = true;
+let savedScrollTop = 0;
+let lastPanelSignature = "";
 
 function formatTokens(usage?: UsageInfo | null, total?: number | null): string | null {
   if (usage) {
@@ -123,6 +126,17 @@ function escapeHtml(text: string): string {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function formatInlineMarkdown(text: string): string {
+  const escaped = escapeHtml(text);
+  return escaped
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+}
+
+function panelSignature(runs: RunSnapshot[]): string {
+  return runs.map((r) => `${r.run_id}:${r.status}:${r.source || "mcp"}`).join("|");
 }
 
 function toAbsFileUri(filePath: string, cwd: string): string {
@@ -177,6 +191,8 @@ function resetRunTimeline(run: RunSnapshot): void {
   itemIndexById = new Map();
   expandedCmdIds = new Set();
   latestSeq = 0;
+  userPinnedToBottom = true;
+  savedScrollTop = 0;
   localStartedMs = run.started_at ? run.started_at * 1000 : Date.now();
   if (Array.isArray(run.events)) {
     applyIncomingEvents(run.events);
@@ -222,20 +238,37 @@ async function fetchIncrementalEvents(): Promise<void> {
     if (!data) return;
 
     const prevStatus = currentRun?.status;
+    const prevTokens = currentRun?.tokens_used ?? null;
+    const prevError = currentRun?.error ?? null;
+    const prevSeq = latestSeq;
+    const prevResult = currentRun?.result ?? null;
+    const incomingEvents = Array.isArray(data.events) ? data.events : [];
+
     currentRun = data;
-    if (Array.isArray(data.events) && data.events.length > 0) {
-      applyIncomingEvents(data.events);
+    if (incomingEvents.length > 0) {
+      applyIncomingEvents(incomingEvents);
     }
     if (typeof data.latest_seq === "number") {
       latestSeq = data.latest_seq;
     }
+
+    const changed =
+      incomingEvents.length > 0 ||
+      data.status !== prevStatus ||
+      (data.tokens_used ?? null) !== prevTokens ||
+      (data.error ?? null) !== prevError ||
+      latestSeq !== prevSeq ||
+      JSON.stringify(data.result ?? null) !== JSON.stringify(prevResult);
+
     if (data.status !== "running") {
       stopPolling();
       if (viewMode === "panel" && prevStatus === "running") {
         void refreshPanelList();
       }
     }
-    render();
+    if (changed) {
+      render();
+    }
   } catch {
     // Ignore transient errors while view is closing or reloading
   } finally {
@@ -269,6 +302,11 @@ async function refreshPanelList(): Promise<void> {
     });
     const data = res?.structuredContent as { runs?: RunSnapshot[] } | undefined;
     if (Array.isArray(data?.runs)) {
+      const sig = panelSignature(data.runs);
+      if (sig === lastPanelSignature) {
+        return;
+      }
+      lastPanelSignature = sig;
       panelRuns = data.runs;
       render();
     }
@@ -341,11 +379,11 @@ function renderHandoff(run: RunSnapshot): string {
   const res = run.result;
   if (!res || run.status === "running") return "";
   if (typeof res === "string") {
-    return `<div class="handoff"><div class="handoff-summary">${escapeHtml(res)}</div></div>`;
+    return `<div class="handoff"><div class="handoff-summary">${formatInlineMarkdown(res)}</div></div>`;
   }
 
   const summaryHtml = res.summary
-    ? `<div class="handoff-summary">${escapeHtml(res.summary)}</div>`
+    ? `<div class="handoff-summary">${formatInlineMarkdown(res.summary)}</div>`
     : "";
 
   const verifyHtml =
@@ -382,6 +420,15 @@ function renderHandoff(run: RunSnapshot): string {
 function render(): void {
   const root = document.getElementById("root");
   if (!root) return;
+
+  const existingBox = document.getElementById("timeline-box");
+  if (existingBox) {
+    savedScrollTop = existingBox.scrollTop;
+    userPinnedToBottom =
+      existingBox.scrollHeight - existingBox.scrollTop - existingBox.clientHeight < 36;
+  }
+
+  root.className = viewMode === "panel" ? "app is-panel" : "app is-inline";
 
   const panelBarHtml =
     viewMode === "panel"
@@ -422,12 +469,25 @@ function render(): void {
         ? `${run.elapsed_sec.toFixed(1)}s`
         : "0.0s";
   const tokenText = formatTokens(run.usage, run.tokens_used);
+  const cmdCount = timelineEntries.filter((ev) => ev.kind === "command").length;
+  const fileCount = timelineEntries.filter((ev) => ev.kind === "file_change").length;
+  const stepSummary = [
+    cmdCount > 0 ? `${cmdCount} cmd${cmdCount === 1 ? "" : "s"}` : "",
+    fileCount > 0 ? `${fileCount} file${fileCount === 1 ? "" : "s"}` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  const stepPill = stepSummary ? `<span class="meta-pill">${escapeHtml(stepSummary)}</span>` : "";
   const worktreePill = run.worktree?.branch
     ? `<span class="meta-pill">${escapeHtml(run.worktree.branch)}</span>`
     : "";
   const sourcePill = run.source === "cli" ? `<span class="meta-pill">CLI</span>` : "";
   const modelPill = run.model ? `<span class="meta-pill">${escapeHtml(run.model)}</span>` : "";
   const modePill = `<span class="meta-pill">${escapeHtml(run.mode)} · ${escapeHtml(run.config_mode)}</span>`;
+  const jumpBtn =
+    run.status === "running"
+      ? `<button class="btn jump-btn" id="jump-latest-btn" style="display:${userPinnedToBottom ? "none" : "inline-block"}">↓ Latest</button>`
+      : "";
   const stopBtn =
     run.status === "running"
       ? `<button class="btn btn-danger" id="stop-run-btn">Stop</button>`
@@ -444,7 +504,7 @@ function render(): void {
           .map((ev, idx) => {
             if (ev.kind === "commentary") {
               const txt = String(ev.text || "");
-              return `<div class="commentary">${escapeHtml(txt)}</div>`;
+              return `<div class="commentary">${formatInlineMarkdown(txt)}</div>`;
             }
             if (ev.kind === "command") {
               const cmdEv = ev as CommandEvent;
@@ -498,8 +558,10 @@ function render(): void {
         ${worktreePill}
       </div>
       <div class="header-right">
+        ${stepPill}
         ${tokenText ? `<span class="meta-pill">${escapeHtml(tokenText)}</span>` : ""}
         <span class="timer-pill" id="elapsed-timer">${elapsedText}</span>
+        ${jumpBtn}
         ${stopBtn}
       </div>
     </div>
@@ -510,12 +572,41 @@ function render(): void {
 
   bindInteractions();
   const box = document.getElementById("timeline-box");
-  if (box && run.status === "running") {
-    box.scrollTop = box.scrollHeight;
+  if (box) {
+    if (userPinnedToBottom && run.status === "running") {
+      box.scrollTop = box.scrollHeight;
+      savedScrollTop = box.scrollTop;
+    } else {
+      box.scrollTop = savedScrollTop;
+    }
   }
 }
 
 function bindInteractions(): void {
+  const timelineBox = document.getElementById("timeline-box");
+  timelineBox?.addEventListener("scroll", () => {
+    savedScrollTop = timelineBox.scrollTop;
+    userPinnedToBottom =
+      timelineBox.scrollHeight - timelineBox.scrollTop - timelineBox.clientHeight < 36;
+    const jumpBtnEl = document.getElementById("jump-latest-btn");
+    if (jumpBtnEl) {
+      jumpBtnEl.style.display =
+        currentRun?.status === "running" && !userPinnedToBottom ? "inline-block" : "none";
+    }
+  });
+
+  document.getElementById("jump-latest-btn")?.addEventListener("click", () => {
+    userPinnedToBottom = true;
+    const box = document.getElementById("timeline-box");
+    if (box) {
+      box.scrollTop = box.scrollHeight;
+      savedScrollTop = box.scrollTop;
+    }
+    const jumpBtnEl = document.getElementById("jump-latest-btn");
+    if (jumpBtnEl) {
+      jumpBtnEl.style.display = "none";
+    }
+  });
   document.querySelectorAll<HTMLElement>("[data-toggle-cmd]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-toggle-cmd");
@@ -586,6 +677,7 @@ app.ontoolresult = (result) => {
   if (sc.view === "panel") {
     viewMode = "panel";
     panelRuns = Array.isArray(sc.runs) ? (sc.runs as RunSnapshot[]) : [];
+    lastPanelSignature = panelSignature(panelRuns);
     startPanelRefresh();
     const targetId =
       typeof sc.selected_run_id === "string" && sc.selected_run_id

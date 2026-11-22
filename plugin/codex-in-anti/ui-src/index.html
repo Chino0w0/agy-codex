@@ -14,6 +14,7 @@
     }
 
     html, body {
+      height: 100%;
       margin: 0;
       padding: 0;
       background: var(--color-background-primary, #ffffff);
@@ -30,7 +31,13 @@
       gap: 8px;
     }
 
+    .app.is-panel {
+      height: 100vh;
+      overflow: hidden;
+    }
+
     .panel-bar {
+      flex-shrink: 0;
       display: flex;
       align-items: center;
       gap: 6px;
@@ -40,6 +47,7 @@
     }
 
     .run-tab {
+      flex-shrink: 0;
       display: inline-flex;
       align-items: center;
       gap: 6px;
@@ -67,7 +75,15 @@
       overflow: hidden;
     }
 
+    .app.is-panel .card {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+
     .header {
+      flex-shrink: 0;
       display: flex;
       align-items: center;
       justify-content: space-between;
@@ -169,7 +185,13 @@
       border-color: var(--color-border-danger, rgba(207, 34, 46, 0.35));
     }
 
+    .jump-btn {
+      color: var(--color-text-info, #0969da);
+      border-color: var(--color-border-info, rgba(9, 105, 218, 0.4));
+    }
+
     .prompt-bar {
+      flex-shrink: 0;
       padding: 6px 12px;
       font-size: 12px;
       color: var(--color-text-secondary, #57606a);
@@ -185,8 +207,21 @@
       display: flex;
       flex-direction: column;
       gap: 6px;
-      max-height: 440px;
       overflow-y: auto;
+    }
+
+    .app.is-inline .timeline {
+      max-height: 460px;
+    }
+
+    .app.is-panel .timeline {
+      flex: 1;
+      min-height: 0;
+      max-height: none;
+    }
+
+    .timeline > * {
+      flex-shrink: 0;
     }
 
     .empty-hint {
@@ -201,6 +236,16 @@
       padding: 2px 2px;
       white-space: pre-wrap;
       word-break: break-word;
+    }
+
+    .commentary code,
+    .handoff-summary code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 11.5px;
+      background: var(--color-background-tertiary, #eef2f6);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: var(--color-text-primary, #1f2328);
     }
 
     .cmd-block {
@@ -328,12 +373,18 @@
     }
 
     .handoff {
+      flex-shrink: 0;
       padding: 9px 12px;
       border-top: 1px solid var(--color-border-primary, #e5e7eb);
       background: var(--color-background-primary, #ffffff);
       display: flex;
       flex-direction: column;
       gap: 7px;
+    }
+
+    .app.is-panel .handoff {
+      max-height: 220px;
+      overflow-y: auto;
     }
 
     .handoff-summary {
