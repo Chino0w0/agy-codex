@@ -57,7 +57,7 @@ ANTIGRAVITY_SKILLS_DIR=/custom/skills ANTIGRAVITY_PLUGINS_DIR=/custom/plugins CO
 
 Once installed, Antigravity automatically discovers the `Codex Worker` plugin (`codex_worker` MCP server + `codex-worker-mcp` skill):
 - When Antigravity delegates a task via `start_codex_task`, an **inline live Codex timeline card** appears immediately in the conversation (streaming commands, output, and file changes in real time) while the main agent awaits completion via `wait_codex_task` to review the diff.
-- Open **Codex Worker** anytime from the side pane `+` menu or left sidebar (`open_codex_panel`) to monitor active runs or inspect past run timelines.
+- Open **Codex Worker** anytime from the side pane `+` menu or left sidebar (`open_codex_panel`) to monitor active runs or inspect past run timelines; tasks launched externally from the terminal via `codex_run.py` also **auto-sync live** into this panel.
 
 ### 1. Environment Health Check (`doctor`)
 
@@ -124,6 +124,7 @@ python3 ~/.gemini/config/skills/codex-worker/scripts/codex_run.py resume \
 | `--raw` | Disable JSON output schema and return plain text |
 | `--search` | Enable live web search |
 | `--quiet` | Suppress live stderr progress milestones |
+| `--no-panel-sync` | Disable live state sync to the Codex Worker MCP panel |
 | `--timeout` | Subprocess timeout in seconds (default: `600`) |
 | `--log-dir` | Directory for per-run logs and artifacts (default: `$TMPDIR/codex-worker-runs`) |
 

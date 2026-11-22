@@ -13,10 +13,14 @@ Use this skill when Antigravity acts as the **orchestrator, code reviewer, and f
 
 ## Core Architecture & Responsibilities
 
-1. **Main agent owns orchestration, Code Review, and final verification**:
+1. **Prefer MCP App tools whenever available**:
+   - If the `codex-in-anti_codex_worker` MCP tools (`start_codex_task` + `wait_codex_task`) are present in your tool list, **always use them first** instead of running `codex_run.py` via shell so the user sees the live inline Codex process viewer.
+   - Fall back to `codex_run.py` via shell only when the MCP server is unavailable, in terminal-only workflows, or when running `doctor`.
+   - CLI runs via `codex_run.py` automatically stream live state to the shared Codex Worker MCP panel directory (pass `--no-panel-sync` to opt out).
+2. **Main agent owns orchestration, Code Review, and final verification**:
    - Antigravity designs the task, reviews diffs, performs Code Review, and verifies tests/checks before reporting completion.
    - Codex CLI acts strictly as an isolated, bounded execution worker (`exec` / `resume`), not as an autonomous reviewer replacing the main agent.
-2. **Always invoke the wrapper script**: Use `~/.gemini/config/skills/codex-worker/scripts/codex_run.py` instead of raw `codex exec`. It automatically:
+3. **Always invoke the wrapper script when using CLI**: Use `~/.gemini/config/skills/codex-worker/scripts/codex_run.py` instead of raw `codex exec`. It automatically:
    - locates `codex` across macOS, Linux, and Windows (including non-login shells);
    - runs in **`isolated` whitelist mode** by default (`--ignore-user-config`), preserving `$CODEX_HOME/auth.json` and extracting only `model`, `model_provider`, provider settings, reasoning effort, and proxy env settings—eliminating 100% of desktop plugins, MCPs, hooks, memories, and chronicle overhead;
    - streams live execution milestones (`session=...`, `run: ...`, `done (exit=...)`, `turn done (...)`) to `stderr` via `--json` while keeping `stdout` pure JSON;
@@ -84,6 +88,7 @@ python3 ~/.gemini/config/skills/codex-worker/scripts/codex_run.py exec \
 - Adjust reasoning effort: `--effort low|medium|high`
 - Grant extra writable directory: `--add-dir <dir>`
 - Suppress live stderr milestones: `--quiet`
+- Disable syncing CLI progress to the MCP panel: `--no-panel-sync`
 - Long prompt from file: `--prompt-file <path>`
 
 ## Prompting Checklist (Before Delegating)

@@ -22,5 +22,6 @@ Use the `codex_worker` MCP App tools when delegating bounded execution tasks to 
    - Immediately call `wait_codex_task(run_id=...)` to wait for completion and receive the structured handoff JSON (`ok`, `status`, `changed_files`, `result`, `usage`, `worktree`, `log_file`).
 3. **Side-pane dashboard (`open_codex_panel`)**:
    - Call `open_codex_panel` when the user asks to view the Codex Worker monitor or review past/parallel runs.
+   - It also auto-discovers and live-tracks runs started externally via `codex_run.py` (showing a `CLI` badge), including stopping them if needed.
 4. **Never trust self-reported results blindly**:
    - After `wait_codex_task` finishes, inspect `git diff` or read the changed files and verify critical tests yourself before reporting completion.

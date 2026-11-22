@@ -57,7 +57,7 @@ ANTIGRAVITY_SKILLS_DIR=/custom/skills ANTIGRAVITY_PLUGINS_DIR=/custom/plugins CO
 
 安装插件后，Antigravity 会自动发现 `Codex Worker` 插件（提供 `codex_worker` MCP Server 与 `codex-worker-mcp` Skill）：
 - 当 Antigravity 调用 `start_codex_task` 派发任务时，对话中会**立即内联渲染 Codex 实时过程卡片**（每秒自动增量刷新命令、输出与文件改动），随后主 Agent 通过 `wait_codex_task` 等待交付并亲自核对 diff / 做 Code Review。
-- 你也可以随时从右侧边栏 `+` 菜单或左侧全局栏打开 **Codex Worker** 面板（`open_codex_panel`），查看当前与历史任务的完整执行时间线。
+- 你也可以随时从右侧边栏 `+` 菜单或左侧全局栏打开 **Codex Worker** 面板（`open_codex_panel`），查看当前与历史任务的完整执行时间线；从终端或旧脚本通过 `codex_run.py` 跑的任务也会**自动实时同步**进该面板并支持一键中止。
 
 ### 1. 环境自检（`doctor`）
 
@@ -123,6 +123,7 @@ python3 ~/.gemini/config/skills/codex-worker/scripts/codex_run.py resume \
 | `--raw` | 关闭 JSON Schema 约束，直接返回纯文本 |
 | `--search` | 开启实时联网检索 |
 | `--quiet` | 关闭 `stderr` 实时进度里程碑输出 |
+| `--no-panel-sync` | 关闭 CLI 任务向 Codex Worker MCP 面板的实时状态同步 |
 | `--timeout` | 子进程超时时间（秒，默认 `600`） |
 | `--log-dir` | 运行日志与交付产物存档目录（默认 `$TMPDIR/codex-worker-runs`） |
 

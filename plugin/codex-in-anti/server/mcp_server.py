@@ -14,7 +14,7 @@ import argparse
 import importlib.util
 import json
 import os
-import re
+import signal
 import subprocess
 import sys
 import threading
@@ -27,10 +27,6 @@ from typing import Any
 SERVER_DIR = Path(__file__).resolve().parent
 PLUGIN_ROOT = SERVER_DIR.parent
 APP_URI = "ui://codex-in-anti/app.html"
-SHELL_WRAPPER_RE = re.compile(
-    r"^(?:/opt/homebrew/bin/bash|/bin/bash|/bin/zsh|/usr/bin/env\s+\w+|bash|zsh)\s+-(?:l?c)\s+(.*)$",
-    re.DOTALL,
-)
 
 
 def load_codex_run_module() -> Any:
@@ -59,18 +55,33 @@ def load_codex_run_module() -> Any:
 
 
 codex_run = load_codex_run_module()
+strip_shell_wrapper = codex_run.strip_shell_wrapper
+is_structured_handoff_text = codex_run.is_structured_handoff_text
 
 
-def strip_shell_wrapper(command: str) -> str:
-    """Strip `/bin/zsh -lc '...'` wrapper for cleaner Codex-style command display."""
-    text = command.strip()
-    match = SHELL_WRAPPER_RE.match(text)
-    if not match:
-        return text
-    inner = match.group(1).strip()
-    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in ("'", '"'):
-        inner = inner[1:-1]
-    return inner
+def _is_pid_alive(pid: int | None) -> bool:
+    """Return True if a process ID appears to be alive on the host OS."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            os.kill(pid, 0)
+            return True
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
 
 
 def load_app_html() -> str:
@@ -98,18 +109,6 @@ def safe_parse_handoff(raw_text: str) -> Any:
         return json.loads(stripped)
     except json.JSONDecodeError:
         return stripped
-
-
-def is_structured_handoff_text(text: str) -> bool:
-    """Detect whether an agent_message is the final JSON schema payload."""
-    stripped = text.strip()
-    if not (stripped.startswith("{") and stripped.endswith("}")):
-        return False
-    try:
-        obj = json.loads(stripped)
-    except json.JSONDecodeError:
-        return False
-    return isinstance(obj, dict) and {"status", "summary", "changed_files"}.issubset(obj.keys())
 
 
 @dataclass
@@ -159,6 +158,7 @@ class RunState:
         )
         return {
             "run_id": self.run_id,
+            "source": "mcp",
             "ok": self.status == "done" and (self.exit_code == 0 or self.exit_code is None),
             "status": self.status,
             "cwd": self.cwd,
@@ -558,6 +558,21 @@ class RunManager:
                 self._append_event(state, {"kind": "error", "message": state.error})
             self._persist_state(state)
 
+    def _normalize_persisted_state(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Normalize external/persisted state snapshots and detect dead external CLI processes."""
+        if data.get("status") == "running":
+            raw_pid = data.get("pid")
+            pid = raw_pid if isinstance(raw_pid, int) else None
+            if _is_pid_alive(pid):
+                started_at = data.get("started_at")
+                if isinstance(started_at, (int, float)):
+                    data["elapsed_sec"] = round(max(0.0, time.time() - float(started_at)), 2)
+            else:
+                data["status"] = "error"
+                data["ok"] = False
+                data["error"] = "External CLI process exited unexpectedly."
+        return data
+
     def wait_run(self, run_id: str, timeout: int = 600) -> dict[str, Any]:
         with self._lock:
             state = self._runs.get(run_id)
@@ -565,7 +580,8 @@ class RunManager:
             persisted = self._load_persisted_state(run_id)
             if persisted is not None:
                 persisted.pop("events", None)
-                return persisted
+                persisted.pop("seq", None)
+                return self._normalize_persisted_state(persisted)
             raise ValueError(f"Unknown run_id: {run_id}")
 
         finished = state.done_event.wait(timeout=timeout if timeout > 0 else None)
@@ -590,6 +606,7 @@ class RunManager:
         persisted = self._load_persisted_state(run_id)
         if persisted is None:
             raise ValueError(f"Unknown run_id: {run_id}")
+        persisted = self._normalize_persisted_state(persisted)
         all_events = persisted.pop("events", [])
         latest_seq = int(persisted.pop("seq", len(all_events)))
         persisted["events"] = [ev for ev in all_events if int(ev.get("seq", 0)) > since_seq]
@@ -610,6 +627,7 @@ class RunManager:
                     continue
                 persisted = self._load_persisted_state(child.name)
                 if persisted is not None:
+                    persisted = self._normalize_persisted_state(persisted)
                     persisted.pop("events", None)
                     persisted.pop("seq", None)
                     seen[child.name] = persisted
@@ -623,7 +641,33 @@ class RunManager:
         with self._lock:
             state = self._runs.get(run_id)
         if state is None:
-            raise ValueError(f"Run {run_id} is not active in this server process.")
+            persisted = self._load_persisted_state(run_id)
+            if persisted is None:
+                raise ValueError(f"Unknown run_id: {run_id}")
+            if persisted.get("status") == "running":
+                pid = persisted.get("pid")
+                if isinstance(pid, int) and _is_pid_alive(pid):
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+                persisted["status"] = "cancelled"
+                persisted["ok"] = False
+                persisted["error"] = "Cancelled by user."
+                events = persisted.get("events")
+                if isinstance(events, list):
+                    next_seq = int(persisted.get("seq") or len(events)) + 1
+                    events.append({"kind": "error", "message": "Cancelled by user.", "seq": next_seq})
+                    persisted["seq"] = next_seq
+                target = self._state_path(run_id)
+                tmp_path = target.with_suffix(".json.tmp")
+                tmp_path.write_text(
+                    json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                os.replace(tmp_path, target)
+            persisted.pop("events", None)
+            persisted.pop("seq", None)
+            return persisted
 
         with state.lock:
             proc = state.process

@@ -67,6 +67,7 @@ interface HandoffResult {
 
 interface RunSnapshot {
   run_id: string;
+  source?: "mcp" | "cli";
   status: "running" | "done" | "error" | "cancelled";
   cwd: string;
   mode: string;
@@ -101,6 +102,7 @@ let expandedCmdIds = new Set<string>();
 let latestSeq = 0;
 let pollTimer: number | null = null;
 let tickTimer: number | null = null;
+let panelRefreshTimer: number | null = null;
 let localStartedMs = Date.now();
 let pollInFlight = false;
 
@@ -191,6 +193,21 @@ function stopPolling(): void {
     window.clearInterval(tickTimer);
     tickTimer = null;
   }
+}
+
+function stopPanelRefresh(): void {
+  if (panelRefreshTimer !== null) {
+    window.clearInterval(panelRefreshTimer);
+    panelRefreshTimer = null;
+  }
+}
+
+function startPanelRefresh(): void {
+  stopPanelRefresh();
+  if (viewMode !== "panel") return;
+  panelRefreshTimer = window.setInterval(() => {
+    void refreshPanelList();
+  }, 3000);
 }
 
 async function fetchIncrementalEvents(): Promise<void> {
@@ -408,6 +425,7 @@ function render(): void {
   const worktreePill = run.worktree?.branch
     ? `<span class="meta-pill">${escapeHtml(run.worktree.branch)}</span>`
     : "";
+  const sourcePill = run.source === "cli" ? `<span class="meta-pill">CLI</span>` : "";
   const modelPill = run.model ? `<span class="meta-pill">${escapeHtml(run.model)}</span>` : "";
   const modePill = `<span class="meta-pill">${escapeHtml(run.mode)} · ${escapeHtml(run.config_mode)}</span>`;
   const stopBtn =
@@ -474,6 +492,7 @@ function render(): void {
     <div class="header">
       <div class="header-left">
         ${renderStatusBadge(run.status)}
+        ${sourcePill}
         ${modelPill}
         ${modePill}
         ${worktreePill}
@@ -567,6 +586,7 @@ app.ontoolresult = (result) => {
   if (sc.view === "panel") {
     viewMode = "panel";
     panelRuns = Array.isArray(sc.runs) ? (sc.runs as RunSnapshot[]) : [];
+    startPanelRefresh();
     const targetId =
       typeof sc.selected_run_id === "string" && sc.selected_run_id
         ? sc.selected_run_id
@@ -582,6 +602,7 @@ app.ontoolresult = (result) => {
 
   if (typeof sc.run_id === "string") {
     viewMode = "run";
+    stopPanelRefresh();
     resetRunTimeline(sc as unknown as RunSnapshot);
     render();
     startPolling();
@@ -590,6 +611,7 @@ app.ontoolresult = (result) => {
 
 app.ontoolcancelled = () => {
   stopPolling();
+  stopPanelRefresh();
 };
 
 app.onhostcontextchanged = (ctx) => {

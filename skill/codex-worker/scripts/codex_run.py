@@ -44,6 +44,11 @@ DEFAULT_SCHEMA = (
 DEFAULT_LOG_ROOT = Path(tempfile.gettempdir()) / "codex-worker-runs"
 DEFAULT_WORKTREE_ROOT = Path(tempfile.gettempdir()) / "codex-worktrees"
 
+SHELL_WRAPPER_RE = re.compile(
+    r"^(?:/opt/homebrew/bin/bash|/bin/bash|/bin/zsh|/usr/bin/env\s+\w+|bash|zsh)\s+-(?:l?c)\s+(.*)$",
+    re.DOTALL,
+)
+
 DEFAULT_DEVELOPER_INSTRUCTIONS = (
     "You are running as a non-interactive worker invoked by an orchestrator agent. "
     "Execute the bounded task directly and thoroughly within the workspace. "
@@ -370,6 +375,106 @@ def truncate_text(text: str, limit: int = 100) -> str:
     return clean[: limit - 3] + "..."
 
 
+def strip_shell_wrapper(command: str) -> str:
+    """Strip `/bin/zsh -lc '...'` wrapper for cleaner Codex-style command display."""
+    text = command.strip()
+    match = SHELL_WRAPPER_RE.match(text)
+    if not match:
+        return text
+    inner = match.group(1).strip()
+    if len(inner) >= 2 and inner[0] == inner[-1] and inner[0] in ("'", '"'):
+        inner = inner[1:-1]
+    return inner
+
+
+def is_structured_handoff_text(text: str) -> bool:
+    """Detect whether an agent_message is the final JSON schema payload."""
+    stripped = text.strip()
+    if not (stripped.startswith("{") and stripped.endswith("}")):
+        return False
+    try:
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(obj, dict) and {"status", "summary", "changed_files"}.issubset(obj.keys())
+
+
+def get_shared_runs_dir() -> Path:
+    """Resolve the shared runs directory read by the Codex Worker MCP panel."""
+    env_dir = os.environ.get("CODEX_WORKER_DATA_DIR")
+    if env_dir:
+        return Path(env_dir).expanduser() / "runs"
+    return Path.home() / ".gemini" / "antigravity" / "plugin_data" / "codex-in-anti" / "runs"
+
+
+class PanelStateSyncer:
+    """Best-effort atomic sync of live CLI run progress into the MCP panel runs directory."""
+
+    def __init__(self, runs_dir: Path, meta: dict[str, Any]) -> None:
+        self.run_id = str(meta["run_id"])
+        self.state_path = runs_dir / self.run_id / "state.json"
+        self.started_at = float(meta.get("started_at") or time.time())
+        self.events: list[dict[str, Any]] = []
+        self.seq = 0
+        self.state: dict[str, Any] = {
+            "run_id": self.run_id,
+            "source": "cli",
+            "pid": None,
+            "ok": False,
+            "status": "running",
+            "cwd": meta.get("cwd"),
+            "mode": meta.get("mode"),
+            "config_mode": meta.get("config_mode"),
+            "model": meta.get("model"),
+            "effort": meta.get("effort"),
+            "prompt_preview": str(meta.get("prompt") or "")[:180],
+            "started_at": self.started_at,
+            "finished_at": None,
+            "elapsed_sec": 0.0,
+            "duration_sec": None,
+            "exit_code": None,
+            "session_id": None,
+            "tokens_used": None,
+            "usage": None,
+            "worktree": meta.get("worktree"),
+            "result": None,
+            "error": None,
+            "log_file": meta.get("log_file"),
+            "output_file": meta.get("output_file"),
+        }
+
+    def write(self) -> None:
+        try:
+            self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            if self.state["duration_sec"] is None:
+                self.state["elapsed_sec"] = round(max(0.0, time.time() - self.started_at), 2)
+            payload = {
+                **self.state,
+                "events": self.events,
+                "seq": self.seq,
+            }
+            tmp_path = self.state_path.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, self.state_path)
+        except OSError:
+            pass
+
+    def append_event(self, payload: dict[str, Any]) -> None:
+        self.seq += 1
+        payload["seq"] = self.seq
+        payload.setdefault("ts", round(max(0.0, time.time() - self.started_at), 2))
+        self.events.append(payload)
+
+    def was_cancelled_externally(self) -> bool:
+        try:
+            if not self.state_path.is_file():
+                return False
+            data = json.loads(self.state_path.read_text(encoding="utf-8"))
+            return isinstance(data, dict) and data.get("status") == "cancelled"
+        except Exception:
+            return False
+
+
 def emit_progress(quiet: bool, message: str) -> None:
     """Print a live progress line to stderr unless `--quiet` is enabled."""
     if not quiet:
@@ -468,12 +573,15 @@ def run_codex(
     *,
     quiet: bool,
     fallback_model: str | None = None,
+    panel_meta: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     """Execute Codex CLI via Popen, stream milestones to stderr, and capture structured telemetry."""
     env = build_exec_env()
     start = time.monotonic()
     timed_out = False
     log_lines: list[str] = []
+
+    syncer = PanelStateSyncer(get_shared_runs_dir(), panel_meta) if panel_meta is not None else None
 
     session_id: str | None = None
     last_agent_message = ""
@@ -495,6 +603,9 @@ def run_codex(
         bufsize=1,
         env=env,
     )
+    if syncer is not None:
+        syncer.state["pid"] = proc.pid
+        syncer.write()
 
     def on_timeout() -> None:
         nonlocal timed_out
@@ -531,23 +642,70 @@ def run_codex(
                         if isinstance(tid, str) and tid:
                             session_id = tid
                             emit_progress(quiet, f"session={tid}")
-                    elif etype == "item.started":
+                            if syncer is not None:
+                                syncer.state["session_id"] = tid
+                                syncer.append_event({"kind": "session", "session_id": tid})
+                                syncer.write()
+                    elif etype in ("item.started", "item.completed"):
                         item = event.get("item") or {}
-                        if item.get("type") == "command_execution":
-                            cmd_txt = truncate_text(str(item.get("command", "")), 100)
-                            emit_progress(quiet, f"run: {cmd_txt}")
-                    elif etype == "item.completed":
-                        item = event.get("item") or {}
-                        itype = item.get("type")
+                        item_id = str(item.get("id") or "")
+                        itype = str(item.get("type") or "")
                         if itype == "command_execution":
-                            code = item.get("exit_code")
-                            cmd_txt = truncate_text(str(item.get("command", "")), 100)
-                            emit_progress(quiet, f"done (exit={code}): {cmd_txt}")
-                        elif itype == "agent_message":
+                            raw_cmd = str(item.get("command") or "")
+                            cmd_txt = truncate_text(raw_cmd, 100)
+                            if etype == "item.started":
+                                emit_progress(quiet, f"run: {cmd_txt}")
+                            else:
+                                emit_progress(quiet, f"done (exit={item.get('exit_code')}): {cmd_txt}")
+                            if syncer is not None:
+                                syncer.append_event(
+                                    {
+                                        "kind": "command",
+                                        "item_id": item_id,
+                                        "command": raw_cmd,
+                                        "display_command": strip_shell_wrapper(raw_cmd),
+                                        "status": str(item.get("status") or ""),
+                                        "exit_code": item.get("exit_code"),
+                                        "output": str(item.get("aggregated_output") or "")[:12000],
+                                    }
+                                )
+                                syncer.write()
+                        elif itype == "file_change":
+                            if etype == "item.completed":
+                                emit_progress(quiet, itype)
+                            if syncer is not None:
+                                changes = item.get("changes") or []
+                                norm_changes = [
+                                    {
+                                        "path": str(c.get("path") or ""),
+                                        "kind": str(c.get("kind") or "modify"),
+                                    }
+                                    for c in changes
+                                    if isinstance(c, dict)
+                                ]
+                                syncer.append_event(
+                                    {
+                                        "kind": "file_change",
+                                        "item_id": item_id,
+                                        "status": str(item.get("status") or ""),
+                                        "changes": norm_changes,
+                                    }
+                                )
+                                syncer.write()
+                        elif itype == "agent_message" and etype == "item.completed":
                             txt = item.get("text")
                             if isinstance(txt, str):
                                 last_agent_message = txt
-                        elif isinstance(itype, str) and itype:
+                                if syncer is not None and txt.strip() and not is_structured_handoff_text(txt):
+                                    syncer.append_event(
+                                        {
+                                            "kind": "commentary",
+                                            "item_id": item_id,
+                                            "text": txt.strip(),
+                                        }
+                                    )
+                                    syncer.write()
+                        elif etype == "item.completed" and itype:
                             emit_progress(quiet, itype)
                     elif etype == "turn.completed":
                         u = event.get("usage") or {}
@@ -564,6 +722,23 @@ def run_codex(
                             emit_progress(
                                 quiet, f"turn done (in={in_t}, cached={c_t}, out={out_t})"
                             )
+                            if syncer is not None:
+                                syncer.state["usage"] = dict(usage_totals)
+                                syncer.state["tokens_used"] = (
+                                    usage_totals["input_tokens"] + usage_totals["output_tokens"]
+                                )
+                                syncer.append_event(
+                                    {
+                                        "kind": "turn_done",
+                                        "usage": {
+                                            "input_tokens": in_t,
+                                            "cached_input_tokens": c_t,
+                                            "output_tokens": out_t,
+                                            "reasoning_output_tokens": r_t,
+                                        },
+                                    }
+                                )
+                                syncer.write()
                     elif etype in ("error", "turn.failed"):
                         err_obj = event.get("error")
                         msg = (
@@ -572,10 +747,17 @@ def run_codex(
                             or stripped
                         )
                         emit_progress(quiet, f"error: {truncate_text(str(msg), 160)}")
+                        if syncer is not None:
+                            syncer.state["error"] = str(msg)
+                            syncer.append_event({"kind": "error", "message": str(msg)})
+                            syncer.write()
                     continue
 
             if "ERROR" in stripped or "fatal" in stripped.lower():
                 emit_progress(quiet, truncate_text(stripped, 160))
+                if syncer is not None:
+                    syncer.append_event({"kind": "log", "text": stripped})
+                    syncer.write()
 
         if timed_out and proc.poll() is None:
             try:
@@ -616,6 +798,40 @@ def run_codex(
         else fallback["tokens_used"]
     )
     resolved_model = fallback["model"] or fallback_model
+
+    if syncer is not None:
+        cancelled = syncer.was_cancelled_externally()
+        final_status = (
+            "cancelled"
+            if cancelled
+            else ("done" if (exit_code == 0 and not timed_out) else "error")
+        )
+        syncer.state.update(
+            {
+                "pid": None,
+                "ok": final_status == "done",
+                "status": final_status,
+                "model": resolved_model,
+                "finished_at": time.time(),
+                "duration_sec": duration_sec,
+                "elapsed_sec": duration_sec,
+                "exit_code": exit_code,
+                "session_id": resolved_session,
+                "tokens_used": resolved_tokens,
+                "usage": dict(usage_totals) if saw_usage else None,
+                "result": parsed_result,
+                "error": (
+                    "Cancelled by user."
+                    if cancelled
+                    else (
+                        f"Timed out after {timeout}s"
+                        if timed_out
+                        else (None if exit_code == 0 else (syncer.state.get("error") or f"codex exited with code {exit_code}"))
+                    )
+                ),
+            }
+        )
+        syncer.write()
 
     summary: dict[str, object] = {
         "ok": exit_code == 0 and not timed_out,
@@ -808,6 +1024,11 @@ def add_shared_options(parser: argparse.ArgumentParser, default_mode: str = "wri
         help="Suppress live stderr progress milestones.",
     )
     parser.add_argument(
+        "--no-panel-sync",
+        action="store_true",
+        help="Do not sync live run progress to the Codex Worker MCP panel runs directory.",
+    )
+    parser.add_argument(
         "--timeout", type=int, default=600, help="Timeout in seconds (default: 600)."
     )
     parser.add_argument(
@@ -890,10 +1111,11 @@ def main() -> int:
     cmd = [codex_bin, "exec"]
     sandbox = "read-only" if args.mode == "read-only" else "workspace-write"
     has_prompt = False
+    prompt_text = ""
     isolated_meta: dict[str, Any] = {}
 
     if args.subcommand == "exec":
-        prompt = read_prompt(args.prompt, args.prompt_file)
+        prompt_text = read_prompt(args.prompt, args.prompt_file)
         isolated_meta = append_codex_flags(
             cmd,
             args,
@@ -909,10 +1131,10 @@ def main() -> int:
             allow_json=True,
             check_git=True,
         )
-        cmd.append(prompt)
+        cmd.append(prompt_text)
         has_prompt = True
     elif args.subcommand == "resume":
-        prompt = read_prompt(args.prompt, args.prompt_file)
+        prompt_text = read_prompt(args.prompt, args.prompt_file)
         isolated_meta = append_codex_flags(
             cmd,
             args,
@@ -935,7 +1157,7 @@ def main() -> int:
             cmd.append(args.session_id)
         else:
             raise ValueError("Provide a session_id or pass --last.")
-        cmd.append(prompt)
+        cmd.append(prompt_text)
         has_prompt = True
     elif args.subcommand == "review":
         isolated_meta = append_codex_flags(
@@ -961,7 +1183,8 @@ def main() -> int:
         if args.commit:
             cmd.extend(["--commit", args.commit])
         if args.prompt or args.prompt_file:
-            cmd.append(read_prompt(args.prompt, args.prompt_file))
+            prompt_text = read_prompt(args.prompt, args.prompt_file)
+            cmd.append(prompt_text)
             has_prompt = True
     else:
         raise ValueError(f"Unsupported subcommand: {args.subcommand}")
@@ -970,6 +1193,22 @@ def main() -> int:
         args.model
         or (isolated_meta.get("model") if isinstance(isolated_meta.get("model"), str) else None)
     )
+    panel_meta: dict[str, Any] | None = None
+    if args.subcommand in ("exec", "resume") and not args.no_panel_sync:
+        panel_meta = {
+            "run_id": run_id,
+            "cwd": str(cwd),
+            "mode": args.mode,
+            "config_mode": effective_config_mode,
+            "model": fallback_model,
+            "effort": args.effort,
+            "prompt": prompt_text,
+            "worktree": worktree_info,
+            "started_at": time.time(),
+            "log_file": str(log_file),
+            "output_file": str(output_file),
+        }
+
     summary = run_codex(
         cmd,
         log_file,
@@ -977,6 +1216,7 @@ def main() -> int:
         args.timeout,
         quiet=args.quiet,
         fallback_model=fallback_model,
+        panel_meta=panel_meta,
     )
     summary["config_mode"] = effective_config_mode
     if worktree_info is not None:
