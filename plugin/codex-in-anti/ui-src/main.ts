@@ -43,11 +43,16 @@ interface ErrorEvent {
   text?: string;
 }
 
-type TimelineEvent = CommandEvent | FileChangeEvent | CommentaryEvent | ErrorEvent | {
-  seq: number;
-  kind: string;
-  [k: string]: unknown;
-};
+type TimelineEvent =
+  | CommandEvent
+  | FileChangeEvent
+  | CommentaryEvent
+  | ErrorEvent
+  | {
+      seq: number;
+      kind: string;
+      [k: string]: unknown;
+    };
 
 interface UsageInfo {
   input_tokens: number;
@@ -88,6 +93,18 @@ interface RunSnapshot {
   latest_seq?: number;
 }
 
+type SemanticKind = "read" | "list" | "search" | "exec";
+
+interface ClassifiedCmd {
+  semantic: SemanticKind;
+  label: string;
+  isProseLabel: boolean;
+}
+
+type TimelineBlock =
+  | { type: "commentary"; text: string }
+  | { type: "group"; id: string; events: TimelineEvent[] };
+
 const AuxPaneResponseSchema = z.object({ isError: z.boolean().optional() }).passthrough();
 
 const app = new App({ name: "Codex Worker", version: "0.2.0" }, {});
@@ -99,6 +116,9 @@ let currentRun: RunSnapshot | null = null;
 let timelineEntries: TimelineEvent[] = [];
 let itemIndexById = new Map<string, number>();
 let expandedCmdIds = new Set<string>();
+let groupOpenOverrides = new Map<string, boolean>();
+let traceExpanded = true;
+let promptExpanded = false;
 let latestSeq = 0;
 let pollTimer: number | null = null;
 let tickTimer: number | null = null;
@@ -109,10 +129,30 @@ let userPinnedToBottom = true;
 let savedScrollTop = 0;
 let lastPanelSignature = "";
 
-function formatTokens(usage?: UsageInfo | null, total?: number | null): string | null {
+// Inline 14x14 monochrome SVG icons (Codex-style)
+const ICONS = {
+  chevron: `<svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8 6 12.5"/></svg>`,
+  chevronDown: `<svg class="chev open" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8 6 12.5"/></svg>`,
+  terminal: `<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.75" y="2.75" width="12.5" height="10.5" rx="2"/><path d="M4.75 6.25L7 8 4.75 9.75"/><path d="M8.5 9.75h2.75"/></svg>`,
+  folder: `<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.25A1.25 1.25 0 0 1 3.25 3h3l1.3 1.5h5.2A1.25 1.25 0 0 1 14 5.75v6A1.25 1.25 0 0 1 12.75 13h-9.5A1.25 1.25 0 0 1 2 11.75v-7.5Z"/></svg>`,
+  doc: `<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 2.25h5l3 3v8.5A1.25 1.25 0 0 1 10.75 15h-6.5A1.25 1.25 0 0 1 3 13.75v-10.25A1.25 1.25 0 0 1 4.25 2.25Z"/><path d="M9 2.25v3h3"/><path d="M5.5 8.5h5M5.5 11h3.5"/></svg>`,
+  search: `<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="7" cy="7" r="4.25"/><path d="M10.2 10.2L13.5 13.5"/></svg>`,
+  fileEdit: `<svg class="ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.25l3.25 3.25-6.75 6.75H2.75V10l6.75-6.75Z"/></svg>`,
+  arrowDown: `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v9.5"/><path d="M4 8.75L8 12.75l4-4"/></svg>`,
+};
+
+function formatDuration(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}m ${rem}s`;
+}
+
+function formatTokensCompact(usage?: UsageInfo | null, total?: number | null): string | null {
   if (usage) {
     const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n));
-    return `in ${fmt(usage.input_tokens)} · cached ${fmt(usage.cached_input_tokens)} · out ${fmt(usage.output_tokens)}`;
+    return `${fmt(usage.input_tokens)} in · ${fmt(usage.cached_input_tokens)} cached · ${fmt(usage.output_tokens)} out`;
   }
   if (typeof total === "number") {
     return `${total.toLocaleString()} tok`;
@@ -159,6 +199,146 @@ function shortFileName(filePath: string, cwd: string): string {
   return normFile;
 }
 
+function classifyCommand(cmdEv: CommandEvent): ClassifiedCmd {
+  const raw = (cmdEv.display_command || cmdEv.command || "").trim();
+  const failed = typeof cmdEv.exit_code === "number" && cmdEv.exit_code !== 0;
+  if (failed) {
+    return {
+      semantic: "exec",
+      label: `Command failed (${raw})`,
+      isProseLabel: true,
+    };
+  }
+  if (cmdEv.status === "in_progress" || cmdEv.exit_code === null) {
+    return { semantic: "exec", label: raw, isProseLabel: false };
+  }
+
+  // Strip simple leading "cd ... && " or "pwd && " for classification
+  const trimmed = raw.replace(/^(?:pwd|cd\s+\S+)\s*(?:&&|;)\s*/i, "").trim();
+
+  // Read-like commands (cat, head, tail, sed -n) without pipes/redirects
+  if (!/[|>;]/.test(trimmed)) {
+    const readMatch = trimmed.match(/^(?:cat|head|tail|nl|bat)\s+(?:-\S+\s+)*(.+)$/);
+    if (readMatch) {
+      const target = readMatch[1].trim();
+      const parts = target.split(/\s+/);
+      if (parts.length <= 2) {
+        return { semantic: "read", label: `已读取 ${target}`, isProseLabel: true };
+      }
+      return {
+        semantic: "read",
+        label: `已读取 ${parts[0]} 等 ${parts.length} 个文件`,
+        isProseLabel: true,
+      };
+    }
+    if (/^sed\s+-n\s+/.test(trimmed)) {
+      const parts = trimmed.split(/\s+/);
+      const last = parts[parts.length - 1] || "";
+      if (last && !last.startsWith("-")) {
+        return { semantic: "read", label: `已读取 ${last}`, isProseLabel: true };
+      }
+    }
+    if (/^(?:rg\s+--files|find\s+|ls\b|tree\b)/.test(trimmed)) {
+      return { semantic: "list", label: `已列出文件（${raw}）`, isProseLabel: true };
+    }
+    if (/^(?:rg|grep)\s+/.test(trimmed)) {
+      return { semantic: "search", label: `已搜索（${raw}）`, isProseLabel: true };
+    }
+  }
+
+  return { semantic: "exec", label: raw, isProseLabel: false };
+}
+
+function buildTimelineBlocks(events: TimelineEvent[]): TimelineBlock[] {
+  const blocks: TimelineBlock[] = [];
+  let currentGroup: TimelineEvent[] = [];
+  let groupCounter = 0;
+
+  const flushGroup = () => {
+    if (currentGroup.length === 0) return;
+    groupCounter += 1;
+    blocks.push({
+      type: "group",
+      id: `grp_${groupCounter}`,
+      events: currentGroup,
+    });
+    currentGroup = [];
+  };
+
+  for (const ev of events) {
+    if (ev.kind === "commentary") {
+      flushGroup();
+      const text = String((ev as CommentaryEvent).text || "").trim();
+      if (text) {
+        blocks.push({ type: "commentary", text });
+      }
+    } else {
+      currentGroup.push(ev);
+    }
+  }
+  flushGroup();
+  return blocks;
+}
+
+function summarizeGroup(events: TimelineEvent[]): { icon: string; title: string; hasRunning: boolean } {
+  let reads = 0;
+  let lists = 0;
+  let searches = 0;
+  let execs = 0;
+  let fileEdits = 0;
+  let failures = 0;
+  let hasRunning = false;
+
+  for (const ev of events) {
+    if (ev.kind === "command") {
+      const cmdEv = ev as CommandEvent;
+      if (cmdEv.status === "in_progress" || cmdEv.exit_code === null) {
+        hasRunning = true;
+      } else if (typeof cmdEv.exit_code === "number" && cmdEv.exit_code !== 0) {
+        failures += 1;
+      }
+      const cls = classifyCommand(cmdEv);
+      if (cls.semantic === "read") reads += 1;
+      else if (cls.semantic === "list") lists += 1;
+      else if (cls.semantic === "search") searches += 1;
+      else execs += 1;
+    } else if (ev.kind === "file_change") {
+      fileEdits += (ev as FileChangeEvent).changes?.length || 1;
+    } else if (ev.kind === "error") {
+      failures += 1;
+    }
+  }
+
+  const exploreParts: string[] = [];
+  if (reads > 0) exploreParts.push(`读取 ${reads} 个文件`);
+  if (lists > 0) exploreParts.push(`列出目录 ${lists} 次`);
+  if (searches > 0) exploreParts.push(`搜索 ${searches} 次`);
+
+  const actionParts: string[] = [];
+  if (exploreParts.length > 0) actionParts.push(exploreParts.join("、"));
+  if (execs > 0) actionParts.push(`运行 ${execs} 条命令`);
+  if (fileEdits > 0) actionParts.push(`变更 ${fileEdits} 个文件`);
+
+  let icon = ICONS.terminal;
+  if (fileEdits > 0 && execs === 0 && exploreParts.length === 0) {
+    icon = ICONS.fileEdit;
+  } else if (exploreParts.length > 0 && execs === 0 && fileEdits === 0) {
+    icon = ICONS.folder;
+  }
+
+  let title = actionParts.join(" · ") || `${events.length} 项操作`;
+  if (hasRunning) {
+    title = `正在执行（${title}）`;
+  } else if (exploreParts.length > 0 && execs === 0 && fileEdits === 0) {
+    title = `已探索（${exploreParts.join(" · ")}）`;
+  }
+  if (failures > 0) {
+    title += ` · ${failures} 项失败`;
+  }
+
+  return { icon, title, hasRunning };
+}
+
 function applyIncomingEvents(events: TimelineEvent[]): void {
   for (const ev of events) {
     if (ev.kind === "session" || ev.kind === "turn_done") {
@@ -190,6 +370,9 @@ function resetRunTimeline(run: RunSnapshot): void {
   timelineEntries = [];
   itemIndexById = new Map();
   expandedCmdIds = new Set();
+  groupOpenOverrides = new Map();
+  traceExpanded = true;
+  promptExpanded = false;
   latestSeq = 0;
   userPinnedToBottom = true;
   savedScrollTop = 0;
@@ -288,9 +471,9 @@ function startPolling(): void {
     const el = document.getElementById("elapsed-timer");
     if (el && currentRun?.status === "running") {
       const sec = Math.max(0, (Date.now() - localStartedMs) / 1000);
-      el.textContent = `${sec.toFixed(1)}s`;
+      el.textContent = `运行中 ${formatDuration(sec)}`;
     }
-  }, 150);
+  }, 500);
   void fetchIncrementalEvents();
 }
 
@@ -320,6 +503,7 @@ async function selectRun(runId: string): Promise<void> {
   timelineEntries = [];
   itemIndexById = new Map();
   expandedCmdIds = new Set();
+  groupOpenOverrides = new Map();
   latestSeq = 0;
   try {
     const res = await app.callServerTool({
@@ -357,22 +541,67 @@ async function openFileInAuxPane(filePath: string): Promise<void> {
   }
 }
 
-function renderStatusBadge(status: RunSnapshot["status"]): string {
-  const labels: Record<RunSnapshot["status"], string> = {
-    running: "Running",
-    done: "Done",
-    error: "Failed",
-    cancelled: "Cancelled",
-  };
-  const pulse = status === "running" ? " pulse" : "";
-  return `<span class="status-pill status-${status}"><span class="dot${pulse}"></span>${labels[status]}</span>`;
-}
-
 function renderKindTag(kind: string): string {
   const lower = kind.toLowerCase();
   if (lower === "add" || lower === "create") return `<span class="kind-add">+</span>`;
   if (lower === "delete" || lower === "remove") return `<span class="kind-delete">-</span>`;
   return `<span class="kind-update">M</span>`;
+}
+
+function renderStepEvent(ev: TimelineEvent, idx: number, cwd: string): string {
+  if (ev.kind === "command") {
+    const cmdEv = ev as CommandEvent;
+    const id = cmdEv.item_id || `cmd_${idx}`;
+    const expanded = expandedCmdIds.has(id);
+    const isRunning = cmdEv.status === "in_progress" || cmdEv.exit_code === null;
+    const isFailed = typeof cmdEv.exit_code === "number" && cmdEv.exit_code !== 0;
+    const cls = classifyCommand(cmdEv);
+
+    const rowClass = `step-row${isFailed ? " is-failed" : ""}${isRunning ? " is-running" : ""}`;
+    const leadIcon =
+      cls.semantic === "read"
+        ? ICONS.doc
+        : cls.semantic === "list"
+          ? ICONS.folder
+          : cls.semantic === "search"
+            ? ICONS.search
+            : ICONS.terminal;
+    const runningDot = isRunning
+      ? `<span class="dot pulse" style="color:var(--color-text-info,#58a6ff)"></span>`
+      : "";
+    const labelClass = `step-label${cls.isProseLabel ? " is-prose-label" : ""}`;
+    const outputBody = cmdEv.output
+      ? `$ ${cmdEv.command}\n\n${cmdEv.output}`
+      : `$ ${cmdEv.command}`;
+    const outputHtml = expanded
+      ? `<pre class="step-output">${escapeHtml(outputBody)}</pre>`
+      : "";
+
+    return `<div class="step-item">
+      <button class="${rowClass}" data-toggle-cmd="${escapeHtml(id)}" title="${escapeHtml(cmdEv.command)}">
+        ${leadIcon}${runningDot}<span class="${labelClass}">${escapeHtml(cls.label)}</span>
+      </button>
+      ${outputHtml}
+    </div>`;
+  }
+
+  if (ev.kind === "file_change") {
+    const fcEv = ev as FileChangeEvent;
+    const chips = (fcEv.changes || [])
+      .map((c) => {
+        const name = shortFileName(c.path, cwd);
+        return `<button class="file-link" data-open-file="${escapeHtml(c.path)}" title="打开 ${escapeHtml(c.path)}">${renderKindTag(c.kind)}<span>${escapeHtml(name)}</span></button>`;
+      })
+      .join("");
+    return `<div class="file-row">${chips}</div>`;
+  }
+
+  if (ev.kind === "error" || ev.kind === "log") {
+    const msg = String((ev as ErrorEvent).message || (ev as ErrorEvent).text || "");
+    return `<div class="log-error">${escapeHtml(msg)}</div>`;
+  }
+
+  return "";
 }
 
 function renderHandoff(run: RunSnapshot): string {
@@ -403,7 +632,7 @@ function renderHandoff(run: RunSnapshot): string {
       ? `<div class="file-row">${res.changed_files
           .map(
             (f) =>
-              `<button class="file-chip" data-open-file="${escapeHtml(f)}" title="Open in side pane">${escapeHtml(f)}</button>`,
+              `<button class="file-link" data-open-file="${escapeHtml(f)}" title="在侧边栏打开">${escapeHtml(f)}</button>`,
           )
           .join("")}</div>`
       : "";
@@ -433,20 +662,20 @@ function render(): void {
   const panelBarHtml =
     viewMode === "panel"
       ? `<div class="panel-bar">
-          <button class="btn" id="refresh-runs-btn">Refresh</button>
+          <button class="icon-btn" id="refresh-runs-btn">刷新</button>
           ${
             panelRuns.length === 0
-              ? `<span class="empty-hint" style="padding:2px 4px">No Codex runs yet</span>`
+              ? `<span class="empty-hint" style="padding:2px 4px">暂无运行记录</span>`
               : panelRuns
                   .map((r) => {
                     const active = r.run_id === activeRunId ? " active" : "";
                     const dotCls = r.status === "running" ? "dot pulse" : "dot";
                     const colorStyle =
                       r.status === "running"
-                        ? "color:var(--color-text-info,#0969da)"
+                        ? "color:var(--color-text-info,#58a6ff)"
                         : r.status === "done"
-                          ? "color:var(--color-text-success,#1a7f37)"
-                          : "color:var(--color-text-danger,#cf222e)";
+                          ? "color:var(--color-text-success,#3fb950)"
+                          : "color:var(--color-text-danger,#f85149)";
                     const label = r.run_id.slice(9);
                     return `<button class="run-tab${active}" data-select-run="${escapeHtml(r.run_id)}"><span class="${dotCls}" style="${colorStyle}"></span>${escapeHtml(label)}</button>`;
                   })
@@ -456,117 +685,109 @@ function render(): void {
       : "";
 
   if (!currentRun) {
-    root.innerHTML = `${panelBarHtml}<div class="card"><div class="timeline"><div class="empty-hint">Select or start a Codex Worker task to view live execution progress.</div></div></div>`;
+    root.innerHTML = `${panelBarHtml}<div class="empty-hint">选择或启动一个 Codex Worker 任务以查看实时过程输出。</div>`;
     bindInteractions();
     return;
   }
 
   const run = currentRun;
-  const elapsedText =
+  const elapsedSec =
     typeof run.duration_sec === "number"
-      ? `${run.duration_sec.toFixed(2)}s`
+      ? run.duration_sec
       : typeof run.elapsed_sec === "number"
-        ? `${run.elapsed_sec.toFixed(1)}s`
-        : "0.0s";
-  const tokenText = formatTokens(run.usage, run.tokens_used);
-  const cmdCount = timelineEntries.filter((ev) => ev.kind === "command").length;
-  const fileCount = timelineEntries.filter((ev) => ev.kind === "file_change").length;
-  const stepSummary = [
-    cmdCount > 0 ? `${cmdCount} cmd${cmdCount === 1 ? "" : "s"}` : "",
-    fileCount > 0 ? `${fileCount} file${fileCount === 1 ? "" : "s"}` : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
-  const stepPill = stepSummary ? `<span class="meta-pill">${escapeHtml(stepSummary)}</span>` : "";
-  const worktreePill = run.worktree?.branch
-    ? `<span class="meta-pill">${escapeHtml(run.worktree.branch)}</span>`
-    : "";
-  const sourcePill = run.source === "cli" ? `<span class="meta-pill">CLI</span>` : "";
-  const modelPill = run.model ? `<span class="meta-pill">${escapeHtml(run.model)}</span>` : "";
-  const modePill = `<span class="meta-pill">${escapeHtml(run.mode)} · ${escapeHtml(run.config_mode)}</span>`;
-  const jumpBtn =
+        ? run.elapsed_sec
+        : 0;
+  const statusLabel =
     run.status === "running"
-      ? `<button class="btn jump-btn" id="jump-latest-btn" style="display:${userPinnedToBottom ? "none" : "inline-block"}">↓ Latest</button>`
+      ? `运行中 ${formatDuration(elapsedSec)}`
+      : run.status === "done"
+        ? `用时 ${formatDuration(elapsedSec)}`
+        : run.status === "cancelled"
+          ? `已取消 (${formatDuration(elapsedSec)})`
+          : `执行失败 (${formatDuration(elapsedSec)})`;
+
+  const statusDot =
+    run.status === "running"
+      ? `<span class="dot pulse" style="color:var(--color-text-info,#58a6ff)"></span>`
       : "";
+
+  const metaParts: string[] = [];
+  if (run.source === "cli") metaParts.push("CLI");
+  if (run.model) metaParts.push(run.model);
+  metaParts.push(`${run.mode} · ${run.config_mode}`);
+  if (run.worktree?.branch) metaParts.push(run.worktree.branch);
+  const tokenText = formatTokensCompact(run.usage, run.tokens_used);
+  if (tokenText) metaParts.push(tokenText);
+
+  const metaHtml = metaParts
+    .map((p) => `<span>${escapeHtml(p)}</span>`)
+    .join(`<span class="meta-sep">·</span>`);
+
   const stopBtn =
     run.status === "running"
-      ? `<button class="btn btn-danger" id="stop-run-btn">Stop</button>`
+      ? `<button class="stop-link" id="stop-run-btn">停止</button>`
       : "";
 
   const promptHtml = run.prompt_preview
-    ? `<div class="prompt-bar" title="${escapeHtml(run.prompt_preview)}">${escapeHtml(run.prompt_preview)}</div>`
+    ? `<div class="prompt-strip${promptExpanded ? " expanded" : ""}" id="prompt-toggle" title="点击展开/收起任务指令">${promptExpanded ? ICONS.chevronDown : ICONS.chevron}<span class="prompt-strip-text">${escapeHtml(run.prompt_preview)}</span></div>`
     : "";
 
+  const blocks = buildTimelineBlocks(timelineEntries);
+  const lastGroupIdx = (() => {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      if (blocks[i].type === "group") return i;
+    }
+    return -1;
+  })();
+
   const timelineHtml =
-    timelineEntries.length === 0
-      ? `<div class="empty-hint">${run.status === "running" ? "Waiting for Codex output..." : "No intermediate tool events recorded."}</div>`
-      : timelineEntries
-          .map((ev, idx) => {
-            if (ev.kind === "commentary") {
-              const txt = String(ev.text || "");
-              return `<div class="commentary">${formatInlineMarkdown(txt)}</div>`;
+    blocks.length === 0
+      ? `<div class="empty-hint">${run.status === "running" ? "正在等待 Codex 输出..." : "暂无中间过程记录。"}</div>`
+      : blocks
+          .map((blk, bIdx) => {
+            if (blk.type === "commentary") {
+              return `<div class="commentary">${formatInlineMarkdown(blk.text)}</div>`;
             }
-            if (ev.kind === "command") {
-              const cmdEv = ev as CommandEvent;
-              const id = cmdEv.item_id || `cmd_${idx}`;
-              const expanded = expandedCmdIds.has(id);
-              const badge =
-                cmdEv.status === "in_progress" || cmdEv.exit_code === null
-                  ? `<span class="exit-badge exit-run">running</span>`
-                  : cmdEv.exit_code === 0
-                    ? `<span class="exit-badge exit-ok">exit 0</span>`
-                    : `<span class="exit-badge exit-fail">exit ${cmdEv.exit_code}</span>`;
-              const outputBody = cmdEv.output
-                ? `${cmdEv.command}\n\n${cmdEv.output}`
-                : cmdEv.command;
-              const outputHtml = expanded
-                ? `<pre class="cmd-output">${escapeHtml(outputBody)}</pre>`
-                : "";
-              return `<div class="cmd-block">
-                <button class="cmd-row" data-toggle-cmd="${escapeHtml(id)}">
-                  <span class="cmd-left"><span>${expanded ? "▾" : "▸"}</span><span class="cmd-text">$ ${escapeHtml(cmdEv.display_command || cmdEv.command)}</span></span>
-                  <span class="cmd-right">${badge}</span>
-                </button>
-                ${outputHtml}
-              </div>`;
-            }
-            if (ev.kind === "file_change") {
-              const fcEv = ev as FileChangeEvent;
-              const chips = (fcEv.changes || [])
-                .map((c) => {
-                  const name = shortFileName(c.path, run.cwd);
-                  return `<button class="file-chip" data-open-file="${escapeHtml(c.path)}" title="Open ${escapeHtml(c.path)}">${renderKindTag(c.kind)}<span>${escapeHtml(name)}</span></button>`;
-                })
-                .join("");
-              return `<div class="file-row">${chips}</div>`;
-            }
-            if (ev.kind === "error" || ev.kind === "log") {
-              const msg = String((ev as ErrorEvent).message || (ev as ErrorEvent).text || "");
-              return `<div class="log-error">${escapeHtml(msg)}</div>`;
-            }
-            return "";
+
+            const { icon, title, hasRunning } = summarizeGroup(blk.events);
+            const isLastGroup = bIdx === lastGroupIdx;
+            const defaultOpen =
+              hasRunning || isLastGroup || blk.events.length <= 4;
+            const isOpen = groupOpenOverrides.has(blk.id)
+              ? groupOpenOverrides.get(blk.id)!
+              : defaultOpen;
+
+            const innerHtml = isOpen
+              ? `<div class="group-rail">${blk.events
+                  .map((ev, eIdx) => renderStepEvent(ev, eIdx, run.cwd))
+                  .join("")}</div>`
+              : "";
+
+            return `<div class="group">
+              <button class="group-header" data-toggle-group="${escapeHtml(blk.id)}" data-current-open="${isOpen ? "1" : "0"}">
+                ${icon}<span class="group-header-label">${escapeHtml(title)}</span>${isOpen ? ICONS.chevronDown : ICONS.chevron}
+              </button>
+              ${innerHtml}
+            </div>`;
           })
           .join("");
 
-  root.innerHTML = `${panelBarHtml}<div class="card">
-    <div class="header">
-      <div class="header-left">
-        ${renderStatusBadge(run.status)}
-        ${sourcePill}
-        ${modelPill}
-        ${modePill}
-        ${worktreePill}
-      </div>
-      <div class="header-right">
-        ${stepPill}
-        ${tokenText ? `<span class="meta-pill">${escapeHtml(tokenText)}</span>` : ""}
-        <span class="timer-pill" id="elapsed-timer">${elapsedText}</span>
-        ${jumpBtn}
-        ${stopBtn}
-      </div>
+  const traceBodyHtml = traceExpanded
+    ? `<div class="timeline-wrap">
+        <div class="timeline" id="timeline-box">${timelineHtml}</div>
+        <button class="jump-circle-btn" id="jump-latest-btn" title="回到底部" style="display:${!userPinnedToBottom ? "inline-flex" : "none"}">${ICONS.arrowDown}</button>
+      </div>`
+    : "";
+
+  root.innerHTML = `${panelBarHtml}<div class="shell">
+    <div class="trace-header">
+      <button class="trace-toggle${run.status === "error" ? " is-error" : ""}" id="trace-toggle-btn">
+        ${statusDot}<span id="elapsed-timer">${escapeHtml(statusLabel)}</span>${traceExpanded ? ICONS.chevronDown : ICONS.chevron}
+      </button>
+      <div class="trace-meta">${metaHtml}${stopBtn}</div>
     </div>
     ${promptHtml}
-    <div class="timeline" id="timeline-box">${timelineHtml}</div>
+    ${traceBodyHtml}
     ${renderHandoff(run)}
   </div>`;
 
@@ -579,7 +800,16 @@ function render(): void {
     } else {
       box.scrollTop = savedScrollTop;
     }
+    updateJumpButtonVisibility(box);
   }
+}
+
+function updateJumpButtonVisibility(box: HTMLElement): void {
+  const jumpBtnEl = document.getElementById("jump-latest-btn");
+  if (!jumpBtnEl) return;
+  const canScroll = box.scrollHeight - box.clientHeight > 24;
+  const pinned = box.scrollHeight - box.scrollTop - box.clientHeight < 36;
+  jumpBtnEl.style.display = canScroll && !pinned ? "inline-flex" : "none";
 }
 
 function bindInteractions(): void {
@@ -588,11 +818,7 @@ function bindInteractions(): void {
     savedScrollTop = timelineBox.scrollTop;
     userPinnedToBottom =
       timelineBox.scrollHeight - timelineBox.scrollTop - timelineBox.clientHeight < 36;
-    const jumpBtnEl = document.getElementById("jump-latest-btn");
-    if (jumpBtnEl) {
-      jumpBtnEl.style.display =
-        currentRun?.status === "running" && !userPinnedToBottom ? "inline-block" : "none";
-    }
+    updateJumpButtonVisibility(timelineBox);
   });
 
   document.getElementById("jump-latest-btn")?.addEventListener("click", () => {
@@ -601,12 +827,30 @@ function bindInteractions(): void {
     if (box) {
       box.scrollTop = box.scrollHeight;
       savedScrollTop = box.scrollTop;
-    }
-    const jumpBtnEl = document.getElementById("jump-latest-btn");
-    if (jumpBtnEl) {
-      jumpBtnEl.style.display = "none";
+      updateJumpButtonVisibility(box);
     }
   });
+
+  document.getElementById("trace-toggle-btn")?.addEventListener("click", () => {
+    traceExpanded = !traceExpanded;
+    render();
+  });
+
+  document.getElementById("prompt-toggle")?.addEventListener("click", () => {
+    promptExpanded = !promptExpanded;
+    render();
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-toggle-group]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = btn.getAttribute("data-toggle-group");
+      const curOpen = btn.getAttribute("data-current-open") === "1";
+      if (!id) return;
+      groupOpenOverrides.set(id, !curOpen);
+      render();
+    });
+  });
+
   document.querySelectorAll<HTMLElement>("[data-toggle-cmd]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.getAttribute("data-toggle-cmd");
