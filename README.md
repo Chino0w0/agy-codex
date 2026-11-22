@@ -14,15 +14,18 @@
 
 - **白名单彻底隔离（默认 `isolated` 模式）**：通过 `--ignore-user-config` 跳过整个 `~/.codex/config.toml`（保留 `auth.json` 登录态），再由 Python `tomllib` 仅白名单提取 `model`、`model_provider`、推理强度、基础供应商字段及代理环境变量注入 `-c`——无论是内置插件还是个人第三方重型 MCP、Hooks、Memories、`chronicle`，**100% 零加载、无需维护黑名单**（Python 3.10 环境自动回退至 `-p worker` 模式）。
 - **严格的职责与沙箱边界**：主 Agent（Antigravity）负责任务拆解、Code Review 与最终验收；Codex CLI 仅作为有界执行 Worker，写任务强制锁定 `workspace-write`，只读分析强制 `read-only`。
-- **实时进度流 + 结构化 JSON 交付**：接入 `codex exec --json` 事件流，在 `stderr` 实时输出执行命令、退出码与 Token 消耗里程碑；同时通过 `--output-schema` + `-o` 让 `stdout` 保持纯净结构化 JSON（含 `status`、`changed_files`、`verification`、`risks`、`next_steps`）。
+- **实时进度流 + 原生风格可视化面板（MCP App 插件）**：
+  - **对话内联实时卡片 + 侧边栏面板**：提供 Antigravity MCP App 插件（`plugin/codex-in-anti`），在对话内或侧边栏实时展示类似 Codex 原生的可折叠过程流——当前运行的 Shell 命令、退出码与可展开输出、文件变更芯片（点击直接在 Antigravity 侧边栏打开文件 Review）、实时计时器与 Input/Cached/Output Token 统计，并支持一键停止任务；
+  - **零构建依赖**：仓库已预打包单个离线 HTML UI（`assets/app.html`），终端用户无需安装 Node.js 即可直接安装使用；
+  - **CLI 实时回传**：独立 Skill 模式通过 `codex exec --json` 在 `stderr` 实时输出里程碑，同时保持 `stdout` 为纯净结构化 JSON（含 `status`、`changed_files`、`verification`、`risks`、`next_steps`）。
 - **Git Worktree 并行隔离（`--worktree`）**：支持一键在临时独立 Git Worktree 分支中执行任务，主工作区保持绝对干净，方便多任务并行派活后统一 Review 合并。
 - **开箱自检 `doctor` & 跨平台安装**：提供零第三方依赖的 `install.py`（支持 macOS / Linux / Windows）与 `codex_run.py doctor` 环境自检命令。
 
 ## 环境要求
 
-- **Antigravity**（用户级 Skills 目录通常为 `~/.gemini/config/skills`）
+- **Antigravity**（用户级 Skills 目录 `~/.gemini/config/skills`、Plugins 目录 `~/.gemini/config/plugins`）
 - **OpenAI Codex CLI**（已安装并完成 `codex login` 登录）
-- **Python 3.10+**（推荐 **Python 3.11+** 以启用内置 `tomllib` 支持默认 `isolated` 白名单隔离；Python 3.10 会自动回退为 `profile` 模式）
+- **Python 3.10+**（推荐 **Python 3.11+** 以启用内置 `tomllib` 支持默认 `isolated` 白名单隔离；Python 3.10 会自动回退为 `profile` 模式；终端用户**无需安装 Node.js**）
 
 ## 快速安装
 
@@ -34,20 +37,27 @@ cd codex-in-anti
 python3 install.py
 ```
 
-macOS / Linux 也可以直接运行 `./install.sh`（内部调用 `install.py`）。安装脚本会自动完成：
-1. 将 `codex-worker` Skill 安装到 `~/.gemini/config/skills/codex-worker/`。
-2. 将 `profiles/worker.config.toml` 复制到 `~/.codex/worker.config.toml`（若已存在则默认跳过，加 `--force` 可覆盖）。
-3. 自动执行 `codex_run.py doctor`，确认 Codex CLI、登录态、配置白名单与 Schema 全部就绪。
+macOS / Linux 也可以直接运行 `./install.sh`（内部调用 `install.py`）。默认会自动完成：
+1. 将独立 CLI Skill 安装到 `~/.gemini/config/skills/codex-worker/`（可传 `--plugin-only` 跳过）。
+2. 将 **Codex Worker MCP App 插件** 安装到 `~/.gemini/config/plugins/codex-in-anti/`（可传 `--skill-only` 跳过）。
+3. 将 `profiles/worker.config.toml` 复制到 `~/.codex/worker.config.toml`（若已存在则默认跳过，加 `--force` 可覆盖）。
+4. 自动执行 `codex_run.py doctor`，确认 Codex CLI、登录态、配置白名单与 Schema 全部就绪。
 
 可通过参数或环境变量自定义安装路径：
 
 ```bash
-python3 install.py --skills-dir /custom/skills --codex-home /custom/.codex
+python3 install.py --skills-dir /custom/skills --plugins-dir /custom/plugins --codex-home /custom/.codex
 # 或使用环境变量：
-ANTIGRAVITY_SKILLS_DIR=/custom/skills CODEX_HOME=/custom/.codex python3 install.py
+ANTIGRAVITY_SKILLS_DIR=/custom/skills ANTIGRAVITY_PLUGINS_DIR=/custom/plugins CODEX_HOME=/custom/.codex python3 install.py
 ```
 
 ## 使用方式
+
+### 0. 在 Antigravity 中使用原生风格过程面板（MCP App 插件）
+
+安装插件后，Antigravity 会自动发现 `Codex Worker` 插件（提供 `codex_worker` MCP Server 与 `codex-worker-mcp` Skill）：
+- 当 Antigravity 调用 `start_codex_task` 派发任务时，对话中会**立即内联渲染 Codex 实时过程卡片**（每秒自动增量刷新命令、输出与文件改动），随后主 Agent 通过 `wait_codex_task` 等待交付并亲自核对 diff / 做 Code Review。
+- 你也可以随时从右侧边栏 `+` 菜单或左侧全局栏打开 **Codex Worker** 面板（`open_codex_panel`），查看当前与历史任务的完整执行时间线。
 
 ### 1. 环境自检（`doctor`）
 
@@ -196,11 +206,24 @@ python3 ~/.gemini/config/skills/codex-worker/scripts/codex_run.py resume \
 codex-in-anti/
 ├── install.py                                  # 跨平台一键安装脚本 (macOS / Linux / Windows)
 ├── install.sh                                  # POSIX 入口脚本（转发至 install.py）
+├── plugin/
+│   └── codex-in-anti/                          # Antigravity MCP App 实时过程插件
+│       ├── plugin.json                         # 插件元数据
+│       ├── mcp_config.json                     # MCP Server 启动配置
+│       ├── assets/
+│       │   ├── app.html                        # 预构建单文件 MCP App 前端 UI
+│       │   └── logo.svg                        # 插件图标
+│       ├── server/
+│       │   └── mcp_server.py                   # 零依赖 Python MCP App 服务端
+│       ├── skills/
+│       │   └── codex-worker-mcp/
+│       │       └── SKILL.md                    # MCP App 编排指引
+│       └── ui-src/                             # 前端源码（开发二次打包用，运行无需 Node）
 ├── profiles/
 │   └── worker.config.toml                      # Codex CLI Worker 配置文件
 ├── skill/
 │   └── codex-worker/
-│       ├── SKILL.md                            # Antigravity 编排、验收与 Review Skill
+│       ├── SKILL.md                            # 独立 CLI 版 Antigravity 编排 Skill
 │       ├── resources/
 │       │   └── handoff_schema.json           # --output-schema 强约束交付结构
 │       └── scripts/

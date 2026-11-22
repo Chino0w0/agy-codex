@@ -14,15 +14,18 @@ Building on that, `codex-in-anti` uses **whitelist isolation (`--ignore-user-con
 
 - **Whitelist config isolation (default `isolated` mode)**: Passes `--ignore-user-config` to skip `~/.codex/config.toml` (keeping `auth.json`), and uses stdlib `tomllib` to whitelist only `model`, `model_provider`, reasoning effort, active provider scalars, and proxy settings via `-c`. All desktop plugins, third-party MCP servers, hooks, memories, and `chronicle` are 100% excluded with zero blacklist maintenance (gracefully falls back to `-p worker` on Python 3.10).
 - **Clear separation of duties & strict sandboxing**: Antigravity (the main agent) owns task design, Code Review, and final verification; Codex CLI acts strictly as a bounded execution worker locked to `workspace-write` (or `read-only` for investigation).
-- **Live stderr progress + structured JSON handoffs**: Streams real-time milestones from `codex exec --json` to `stderr` while keeping `stdout` pure JSON enforced by `--output-schema` (`status`, `changed_files`, `verification`, `risks`, `next_steps`).
+- **Live progress stream + native-style MCP App UI plugin**:
+  - **Inline process card & side-pane monitor**: Ships an Antigravity MCP App plugin (`plugin/codex-in-anti`) that renders a live, collapsible Codex-native timeline inline in chat or in the side pane—live shell commands, exit badges and expandable output, clickable changed-file chips (opening directly in Antigravity's side pane), live elapsed timer, live In/Cached/Output token counter, and a one-click `Stop` button;
+  - **Zero build step for users**: Pre-bundled single-file HTML UI (`assets/app.html`) means end users do not need Node.js installed;
+  - **CLI streaming**: Standalone skill mode streams concise milestones to `stderr` from `codex exec --json` while keeping `stdout` pure JSON enforced by `--output-schema` (`status`, `changed_files`, `verification`, `risks`, `next_steps`).
 - **Git worktree isolation (`--worktree`)**: Spin up an isolated temporary Git worktree branch per task so parallel workers never step on each other or dirty your main working tree.
 - **Built-in `doctor` & cross-platform installer**: Zero-dependency `install.py` works across macOS, Linux, and Windows and runs `codex_run.py doctor` automatically to validate readiness.
 
 ## Prerequisites
 
-- **Antigravity** (user skills under `~/.gemini/config/skills`)
+- **Antigravity** (user skills under `~/.gemini/config/skills`, plugins under `~/.gemini/config/plugins`)
 - **OpenAI Codex CLI** installed and authenticated (`codex login`)
-- **Python 3.10+** (**Python 3.11+** recommended for stdlib `tomllib` whitelist isolation; Python 3.10 falls back to `profile` mode)
+- **Python 3.10+** (**Python 3.11+** recommended for stdlib `tomllib` whitelist isolation; Python 3.10 falls back to `profile` mode; **Node.js is not required** for end users)
 
 ## Quick Start
 
@@ -35,19 +38,26 @@ python3 install.py
 ```
 
 On macOS / Linux you can also run `./install.sh` (which delegates to `install.py`). By default, the installer:
-1. Installs the `codex-worker` skill to `~/.gemini/config/skills/codex-worker/`.
-2. Copies `profiles/worker.config.toml` to `~/.codex/worker.config.toml` (skips if already present; pass `--force` to overwrite).
-3. Runs `codex_run.py doctor` to verify CLI resolution, login auth, config parsing, and schema validity.
+1. Installs the standalone `codex-worker` skill to `~/.gemini/config/skills/codex-worker/` (skip with `--plugin-only`).
+2. Installs the **Codex Worker MCP App plugin** to `~/.gemini/config/plugins/codex-in-anti/` (skip with `--skill-only`).
+3. Copies `profiles/worker.config.toml` to `~/.codex/worker.config.toml` (skips if already present; pass `--force` to overwrite).
+4. Runs `codex_run.py doctor` to verify CLI resolution, login auth, config parsing, and schema validity.
 
 Override target paths with flags or environment variables:
 
 ```bash
-python3 install.py --skills-dir /custom/skills --codex-home /custom/.codex
+python3 install.py --skills-dir /custom/skills --plugins-dir /custom/plugins --codex-home /custom/.codex
 # Or via environment variables:
-ANTIGRAVITY_SKILLS_DIR=/custom/skills CODEX_HOME=/custom/.codex python3 install.py
+ANTIGRAVITY_SKILLS_DIR=/custom/skills ANTIGRAVITY_PLUGINS_DIR=/custom/plugins CODEX_HOME=/custom/.codex python3 install.py
 ```
 
 ## Usage
+
+### 0. Native-Style Live Process Viewer (MCP App Plugin)
+
+Once installed, Antigravity automatically discovers the `Codex Worker` plugin (`codex_worker` MCP server + `codex-worker-mcp` skill):
+- When Antigravity delegates a task via `start_codex_task`, an **inline live Codex timeline card** appears immediately in the conversation (streaming commands, output, and file changes in real time) while the main agent awaits completion via `wait_codex_task` to review the diff.
+- Open **Codex Worker** anytime from the side pane `+` menu or left sidebar (`open_codex_panel`) to monitor active runs or inspect past run timelines.
 
 ### 1. Environment Health Check (`doctor`)
 
@@ -197,11 +207,24 @@ Edit `~/.codex/worker.config.toml` to customize defaults:
 codex-in-anti/
 ├── install.py                                  # Cross-platform installer (macOS / Linux / Windows)
 ├── install.sh                                  # POSIX wrapper invoking install.py
+├── plugin/
+│   └── codex-in-anti/                          # Antigravity MCP App live-viewer plugin
+│       ├── plugin.json                         # Plugin manifest
+│       ├── mcp_config.json                     # MCP server config
+│       ├── assets/
+│       │   ├── app.html                        # Pre-bundled single-file MCP App HTML UI
+│       │   └── logo.svg                        # Plugin icon
+│       ├── server/
+│       │   └── mcp_server.py                   # Zero-dependency Python MCP App server
+│       ├── skills/
+│       │   └── codex-worker-mcp/
+│       │       └── SKILL.md                    # MCP App orchestration skill
+│       └── ui-src/                             # Frontend TypeScript source (rebuild only)
 ├── profiles/
 │   └── worker.config.toml                      # Codex CLI worker configuration
 ├── skill/
 │   └── codex-worker/
-│       ├── SKILL.md                            # Antigravity orchestration, review & verification skill
+│       ├── SKILL.md                            # Standalone CLI orchestration skill
 │       ├── resources/
 │       │   └── handoff_schema.json           # JSON Schema enforced via --output-schema
 │       └── scripts/

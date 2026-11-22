@@ -6,3 +6,6 @@ __pycache__/
 .env
 *.log
 /tmp/
+node_modules/
+package-lock.json
+

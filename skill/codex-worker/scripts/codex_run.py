@@ -34,8 +34,13 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
     tomllib = None  # type: ignore[assignment]
 
-SKILL_DIR = Path(__file__).resolve().parent.parent
-DEFAULT_SCHEMA = SKILL_DIR / "resources" / "handoff_schema.json"
+SCRIPT_DIR = Path(__file__).resolve().parent
+SKILL_DIR = SCRIPT_DIR.parent
+DEFAULT_SCHEMA = (
+    SKILL_DIR / "resources" / "handoff_schema.json"
+    if (SKILL_DIR / "resources" / "handoff_schema.json").is_file()
+    else SCRIPT_DIR / "handoff_schema.json"
+)
 DEFAULT_LOG_ROOT = Path(tempfile.gettempdir()) / "codex-worker-runs"
 DEFAULT_WORKTREE_ROOT = Path(tempfile.gettempdir()) / "codex-worktrees"
 
