@@ -155,6 +155,8 @@ class TestMcpServerAndRunner(unittest.TestCase):
             self.assertIn(app_tool, tools)
             self.assertEqual(tools[app_tool]["_meta"]["ui"]["visibility"], ["app"])
 
+        self.assertIsNone(((tools["start_codex_task"].get("_meta") or {}).get("ui") or {}).get("resourceUri"))
+        self.assertEqual(tools["open_codex_panel"]["_meta"]["ui"]["resourceUri"], mcp_server.APP_URI)
         panel_meta = tools["open_codex_panel"]["_meta"]["com.google.antigravity/ui"]["entrypoints"]
         self.assertEqual({e["type"] for e in panel_meta}, {"aux_pane", "global"})
 

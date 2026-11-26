@@ -34,11 +34,11 @@ description: >-
 验证：<完成后必须执行的测试/静态检查/构建命令>
 ```
 
-### 3. 启动、监控与收尾
-1. 调用 `start_codex_task(prompt=..., cwd=..., preset=..., model=..., provider=..., effort=..., mode=...)`：
-   - 对话中会立即渲染可折叠的 Codex 实时过程卡片，并返回 `run_id`、`requested`、`effective` 与可能的 `warnings`（如档位自动降级提醒）。
-2. 主 Agent 可先推进自己的只读分析或其他不冲突工作；在真正依赖结果时调用 `wait_codex_task(run_id=..., timeout=...)`（或先用 `get_codex_task_status` 非阻塞探活）。
-3. **等待超时 ≠ 失败**：如果 `wait_codex_task` 返回 `wait_timed_out=true`，任务仍在运行中，请继续用 `get_codex_task_status` / `wait_codex_task` 跟踪，或确认跑偏时调用 `stop_codex_task(run_id)`，**禁止重复启动同一任务造成写冲突**。
+### 3. 启动、右侧监控与收尾
+1. 调用 `start_codex_task(prompt=..., cwd=..., preset=..., model=..., provider=..., effort=..., mode=...)` 立即拿到 `run_id`、`requested`、`effective` 与可能的 `warnings`（如档位自动降级提醒）。
+2. 紧接着调用一次 `open_codex_panel(tab="subagents", run_id=<run_id>)`，在右侧边栏打开或刷新实时进度标签页（不在对话流里渲染内联卡片）。
+3. 主 Agent 可先推进自己的只读分析或其他不冲突工作；在真正依赖结果时调用 `wait_codex_task(run_id=..., timeout=...)`（或先用 `get_codex_task_status` 非阻塞探活）。
+4. **等待超时 ≠ 失败**：如果 `wait_codex_task` 返回 `wait_timed_out=true`，任务仍在运行中，请继续用 `get_codex_task_status` / `wait_codex_task` 跟踪，或确认跑偏时调用 `stop_codex_task(run_id)`，**禁止重复启动同一任务造成写冲突**。
 
 ## 失败归因与控制纪律（防死循环）
 

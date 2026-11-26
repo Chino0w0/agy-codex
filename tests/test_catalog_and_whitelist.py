@@ -338,6 +338,7 @@ class TestCatalogAndWhitelist(unittest.TestCase):
                     'model = "gpt-5.2-codex"',
                     "",
                     "[mcp_servers.fastctx]",
+                    'type = "stdio"',
                     'command = "C:/bin/fastctx.exe"',
                     'args = ["serve", "--enable-shell"]',
                     "",
@@ -369,6 +370,8 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         )
         ov_fwd, meta_fwd = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
         ov_dict = dict(ov_fwd)
+        self.assertNotIn("mcp_servers.fastctx.type", ov_dict)
+        self.assertEqual(ov_dict["features.code_mode.direct_only_tool_namespaces"], ["mcp__fastctx"])
         self.assertEqual(ov_dict["mcp_servers.fastctx.command"], "C:/bin/fastctx.exe")
         self.assertEqual(ov_dict["mcp_servers.fastctx.args"], ["serve", "--enable-shell"])
         self.assertEqual(
