@@ -20,8 +20,9 @@ description: >-
 
 ### 1. 模型与预设发现（首次或不确定时必做）
 调用 `list_codex_models(query=..., provider=...)` 获取：
-- 可用模型（含 `custom_models`、`model_catalog_json`、`models_cache.json` 与 `config.toml`）、支持的 `supported_reasoning_levels` 与 `context_window`；
+- 可见模型（`visibility != "hide"`，含 `custom_models`、`model_catalog_json`、`models_cache.json` 与 `config.toml`）、支持的 `supported_reasoning_levels` 与 `context_window`；
 - 已脱敏的 `providers`、`presets`（默认包含 `explore` / `coding` / `frontend` / `review` / `debug` / `fast`，含各自 `when_to_use`）与 `excluded_models`（不要主动把已排除模型当默认值或回退候选）。
+- **用户选型优先**：如果用户在当前请求中没有明确指定具体模型，且所用 `preset` 与 `workbench_config.defaults.model` 也未绑定具体模型（均为 `null`），派发 `start_codex_task` 前先展示可见候选模型与支持档位让用户选定（或建议用「模型与配置」预设绑定），再按用户选择执行。
 
 ### 2. 选型与五段式自包含任务契约
 在 `prompt` 中不要只丢一句话，使用精炼的五段式契约让 Codex 一次性独立跑通：
