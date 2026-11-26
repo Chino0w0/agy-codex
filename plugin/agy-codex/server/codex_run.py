@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""Wrapper CLI for delegating bounded coding tasks to OpenAI Codex CLI.
-
-Features:
-- Resolves the `codex` binary across macOS, Linux, and Windows (including non-login shells).
-- Whitelist-isolated config mode (`--config-mode isolated`, default) via `--ignore-user-config`:
-  keeps `$CODEX_HOME/auth.json` and extracts only model, provider, reasoning, and proxy settings
-  without loading desktop plugins, MCP servers, hooks, memories, or chronicle.
-- Streams real-time progress milestones to stderr from `codex exec --json` while keeping stdout pure JSON.
-- Supports isolated Git worktrees (`--worktree [NAME]`) for safe parallel workers.
-- Enforces explicit sandbox mode (`workspace-write` or `read-only`) and structured JSON handoffs.
-- Provides a built-in `doctor` subcommand to validate local prerequisites before running tasks.
-"""
+"""Wrapper CLI & shared Codex execution helpers for Agy Codex."""
 
 from __future__ import annotations
 
@@ -20,6 +9,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -29,66 +19,61 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-try:
-    import tomllib  # Python 3.11+
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
-    tomllib = None  # type: ignore[assignment]
-
 SCRIPT_DIR = Path(__file__).resolve().parent
-SKILL_DIR = SCRIPT_DIR.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import codex_catalog  # noqa: E402
+import codex_telemetry  # noqa: E402
+
 DEFAULT_SCHEMA = (
-    SKILL_DIR / "resources" / "handoff_schema.json"
-    if (SKILL_DIR / "resources" / "handoff_schema.json").is_file()
-    else SCRIPT_DIR / "handoff_schema.json"
+    SCRIPT_DIR / "handoff_schema.json"
+    if (SCRIPT_DIR / "handoff_schema.json").is_file()
+    else SCRIPT_DIR.parent / "resources" / "handoff_schema.json"
 )
-DEFAULT_LOG_ROOT = Path(tempfile.gettempdir()) / "codex-worker-runs"
-DEFAULT_WORKTREE_ROOT = Path(tempfile.gettempdir()) / "codex-worktrees"
+DEFAULT_LOG_ROOT = Path(tempfile.gettempdir()) / "agy-codex-runs"
+DEFAULT_WORKTREE_ROOT = Path(tempfile.gettempdir()) / "agy-codex-worktrees"
 
 SHELL_WRAPPER_RE = re.compile(
-    r"^(?:/opt/homebrew/bin/bash|/bin/bash|/bin/zsh|/usr/bin/env\s+\w+|bash|zsh)\s+-(?:l?c)\s+(.*)$",
-    re.DOTALL,
-)
-
-DEFAULT_DEVELOPER_INSTRUCTIONS = (
-    "You are running as a non-interactive worker invoked by an orchestrator agent. "
-    "Execute the bounded task directly and thoroughly within the workspace. "
-    "Do not spawn subagents, do not ask interactive follow-up questions, and do not modify "
-    "files outside the requested scope. Run concrete verification commands (tests, linters, "
-    "or scripts) for every change when possible. Report concise, factual results: changed "
-    "file paths, exact verification commands and outcomes, and any remaining risks or blockers."
-)
-
-SENSITIVE_KEY_PATTERN = re.compile(
-    r"(api_?key|bearer|secret|password|authorization|cookie|credential|_token$|^token$)",
-    re.IGNORECASE,
+    r"^(?:"
+    r"(?:/opt/homebrew/bin/bash|/bin/bash|/bin/zsh|/usr/bin/env\s+\w+|bash|zsh)\s+-(?:l?c)"
+    r"|(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)(?:\s+-\w+)*\s+-(?:c|Command)"
+    r"|(?:cmd(?:\.exe)?)\s+/c"
+    r")\s+(.*)$",
+    re.IGNORECASE | re.DOTALL,
 )
 
 
-def get_codex_home() -> Path:
-    """Resolve CODEX_HOME dynamically from environment or `~/.codex`."""
-    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
+def get_codex_home(explicit: Path | str | None = None) -> Path:
+    return codex_catalog.get_codex_home(explicit)
+
+
+def get_shared_runs_dir(data_dir: Path | str | None = None) -> Path:
+    return codex_catalog.get_plugin_data_dir(data_dir) / "runs"
 
 
 def find_codex_bin() -> str:
-    """Locate the `codex` CLI binary across macOS, Linux, and Windows."""
+    """Locate `codex` CLI executable across Windows, macOS, and Linux (skipping .ps1 on Windows)."""
     env_bin = os.environ.get("CODEX_BIN")
     if env_bin and Path(env_bin).is_file():
         return env_bin
 
     candidates: list[str] = []
-    for name in ("codex", "codex.cmd", "codex.exe") if os.name == "nt" else ("codex",):
-        found = shutil.which(name)
-        if found:
-            candidates.append(found)
-
     if os.name == "nt":
+        for name in ("codex.exe", "codex.cmd", "codex.bat", "codex"):
+            found = shutil.which(name)
+            if found and not found.lower().endswith(".ps1"):
+                candidates.append(found)
         appdata = os.environ.get("APPDATA")
         localappdata = os.environ.get("LOCALAPPDATA")
-        if appdata:
-            candidates.append(str(Path(appdata) / "npm" / "codex.cmd"))
         if localappdata:
             candidates.append(str(Path(localappdata) / "Programs" / "codex" / "codex.exe"))
+        if appdata:
+            candidates.append(str(Path(appdata) / "npm" / "codex.cmd"))
     else:
+        found = shutil.which("codex")
+        if found:
+            candidates.append(found)
         candidates.extend(
             [
                 "/opt/homebrew/bin/codex",
@@ -98,16 +83,16 @@ def find_codex_bin() -> str:
         )
 
     for candidate in candidates:
-        if candidate and Path(candidate).is_file():
+        if candidate and Path(candidate).is_file() and not candidate.lower().endswith(".ps1"):
             return candidate
 
     raise FileNotFoundError(
-        "codex CLI not found. Checked CODEX_BIN, PATH, and standard OS install locations."
+        "codex CLI executable not found. Checked CODEX_BIN, PATH, and standard OS install locations."
     )
 
 
 def build_exec_env() -> dict[str, str]:
-    """Ensure standard CLI install directories are present in PATH."""
+    """Ensure standard CLI install dirs and UTF-8 Python settings are present in env."""
     env = os.environ.copy()
     path_parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
     if os.name == "nt":
@@ -130,21 +115,72 @@ def build_exec_env() -> dict[str, str]:
         if prefix not in path_parts:
             path_parts.insert(0, prefix)
     env["PATH"] = os.pathsep.join(path_parts)
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
 
 
+def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> None:
+    """Terminate a process and all its descendants cleanly across Windows and POSIX."""
+    if proc_or_pid is None:
+        return
+    pid = proc_or_pid.pid if isinstance(proc_or_pid, subprocess.Popen) else int(proc_or_pid)
+    if pid <= 0:
+        return
+
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return
+        except Exception:
+            pass
+        if isinstance(proc_or_pid, subprocess.Popen):
+            try:
+                proc_or_pid.terminate()
+            except OSError:
+                pass
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        return
+    except OSError:
+        pass
+    if isinstance(proc_or_pid, subprocess.Popen):
+        try:
+            proc_or_pid.terminate()
+        except OSError:
+            pass
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
 def run_git(cwd: Path, args: list[str], timeout: int = 10) -> subprocess.CompletedProcess[str]:
-    """Run a git command in `cwd`."""
     return subprocess.run(
         ["git", "-C", str(cwd), *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=timeout,
     )
 
 
 def is_git_repo(path: Path) -> bool:
-    """Return True if `path` is inside a Git working tree."""
     try:
         res = run_git(path, ["rev-parse", "--is-inside-work-tree"], timeout=5)
         return res.returncode == 0 and res.stdout.strip() == "true"
@@ -153,7 +189,6 @@ def is_git_repo(path: Path) -> bool:
 
 
 def get_git_root(path: Path) -> Path:
-    """Resolve the top-level Git repository directory for `path`."""
     res = run_git(path, ["rev-parse", "--show-toplevel"], timeout=5)
     if res.returncode != 0 or not res.stdout.strip():
         raise ValueError(f"--worktree requires a Git repository, but {path} is not inside one.")
@@ -161,7 +196,7 @@ def get_git_root(path: Path) -> Path:
 
 
 def create_isolated_worktree(cwd: Path, name: str | None, run_id: str) -> dict[str, str]:
-    """Create a fresh Git worktree under `$TMPDIR/codex-worktrees` from HEAD."""
+    """Create a fresh Git worktree under `$TMPDIR/agy-codex-worktrees` from HEAD."""
     base_repo = get_git_root(cwd)
     head_check = run_git(base_repo, ["rev-parse", "--verify", "HEAD"], timeout=5)
     if head_check.returncode != 0:
@@ -203,7 +238,6 @@ def create_isolated_worktree(cwd: Path, name: str | None, run_id: str) -> dict[s
 
 
 def read_prompt(prompt: str | None, prompt_file: str | None) -> str:
-    """Read task instructions from `--prompt-file`, `--prompt`, or piped stdin."""
     if prompt_file:
         return Path(prompt_file).read_text(encoding="utf-8")
     if prompt is not None:
@@ -213,138 +247,10 @@ def read_prompt(prompt: str | None, prompt_file: str | None) -> str:
     raise ValueError("A prompt is required via --prompt, --prompt-file, or stdin.")
 
 
-def load_toml_file(path: Path) -> tuple[dict[str, Any], str | None]:
-    """Load a TOML file with `tomllib`, returning `(data, error_message)`."""
-    if not path.is_file():
-        return {}, None
-    if tomllib is None:
-        return {}, "Python < 3.11 lacks stdlib tomllib"
-    try:
-        with path.open("rb") as fh:
-            data = tomllib.load(fh)
-        return (data if isinstance(data, dict) else {}), None
-    except Exception as exc:
-        return {}, f"Failed to parse {path}: {exc}"
-
-
-def to_toml_key(key: str) -> str:
-    """Format a TOML key safely for `-c dotted.path=value`."""
-    if re.fullmatch(r"[A-Za-z0-9_-]+", key):
-        return key
-    return json.dumps(key)
-
-
-def to_toml_literal(value: Any) -> str:
-    """Serialize a Python scalar into a valid TOML literal string."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    if isinstance(value, str):
-        return json.dumps(value, ensure_ascii=False)
-    raise TypeError(f"Unsupported TOML scalar type: {type(value).__name__}")
-
-
-def collect_isolated_overrides(
-    codex_home: Path,
-    *,
-    cli_model: str | None = None,
-    cli_effort: str | None = None,
-) -> tuple[list[tuple[str, Any]], dict[str, Any]]:
-    """Build whitelisted `(dotted_key, scalar_value)` overrides for `--ignore-user-config`."""
-    base_cfg, base_err = load_toml_file(codex_home / "config.toml")
-    worker_cfg, worker_err = load_toml_file(codex_home / "worker.config.toml")
-    if base_err:
-        raise RuntimeError(base_err)
-    if worker_err:
-        raise RuntimeError(worker_err)
-
-    overrides: dict[str, Any] = {}
-
-    # 1. Scalar fields whitelisted from base config.toml
-    for key in ("model", "model_provider"):
-        val = base_cfg.get(key)
-        if isinstance(val, (str, bool, int, float)):
-            overrides[key] = val
-
-    # 2. Overrides whitelisted from worker.config.toml
-    for key in (
-        "model",
-        "model_provider",
-        "model_reasoning_effort",
-        "personality",
-        "tool_output_token_limit",
-        "developer_instructions",
-    ):
-        val = worker_cfg.get(key)
-        if isinstance(val, (str, bool, int, float)):
-            overrides[key] = val
-
-    # 3. Safe non-interactive worker defaults
-    overrides["approval_policy"] = "never"
-    overrides["suppress_unstable_features_warning"] = True
-    if "developer_instructions" not in overrides:
-        overrides["developer_instructions"] = DEFAULT_DEVELOPER_INSTRUCTIONS
-
-    # Apply explicit CLI overrides for provider selection accuracy
-    if cli_model:
-        overrides["model"] = cli_model
-    if cli_effort:
-        overrides["model_reasoning_effort"] = cli_effort
-
-    # 4. Active model provider table (only scalar settings)
-    active_provider = overrides.get("model_provider")
-    provider_keys: list[str] = []
-    if isinstance(active_provider, str) and active_provider:
-        base_providers = base_cfg.get("model_providers", {})
-        worker_providers = worker_cfg.get("model_providers", {})
-        merged_provider: dict[str, Any] = {}
-        if isinstance(base_providers, dict) and isinstance(base_providers.get(active_provider), dict):
-            merged_provider.update(base_providers[active_provider])
-        if isinstance(worker_providers, dict) and isinstance(
-            worker_providers.get(active_provider), dict
-        ):
-            merged_provider.update(worker_providers[active_provider])
-
-        p_prefix = f"model_providers.{to_toml_key(active_provider)}"
-        for p_key, p_val in merged_provider.items():
-            if isinstance(p_val, (str, bool, int, float)):
-                dotted = f"{p_prefix}.{to_toml_key(p_key)}"
-                overrides[dotted] = p_val
-                provider_keys.append(p_key)
-
-    # 5. Shell environment policy (inherit + proxy/env `set` scalars)
-    env_policy_keys: list[str] = []
-    for cfg in (base_cfg, worker_cfg):
-        policy = cfg.get("shell_environment_policy")
-        if not isinstance(policy, dict):
-            continue
-        inherit = policy.get("inherit")
-        if isinstance(inherit, str):
-            overrides["shell_environment_policy.inherit"] = inherit
-        env_set = policy.get("set")
-        if isinstance(env_set, dict):
-            for e_key, e_val in env_set.items():
-                if isinstance(e_val, (str, bool, int, float)):
-                    overrides[f"shell_environment_policy.set.{to_toml_key(e_key)}"] = e_val
-                    if e_key not in env_policy_keys:
-                        env_policy_keys.append(e_key)
-
-    meta = {
-        "model": overrides.get("model"),
-        "model_provider": active_provider,
-        "provider_keys": provider_keys,
-        "env_set_keys": env_policy_keys,
-        "whitelisted_keys": list(overrides.keys()),
-    }
-    return list(overrides.items()), meta
-
-
 def resolve_config_mode(requested_mode: str, no_worker_profile: bool, quiet: bool) -> str:
-    """Resolve effective config mode (`isolated`, `profile`, or `inherit`)."""
     if no_worker_profile:
         return "inherit"
-    if requested_mode == "isolated" and tomllib is None:
+    if requested_mode == "isolated" and codex_catalog.tomllib is None:
         if not quiet:
             print(
                 "[codex] warning: Python < 3.11 lacks tomllib; falling back to profile mode.",
@@ -355,20 +261,21 @@ def resolve_config_mode(requested_mode: str, no_worker_profile: bool, quiet: boo
     return requested_mode
 
 
-def parse_telemetry(log_text: str) -> dict[str, object]:
-    """Fallback regex telemetry parser for non-JSON Codex CLI output."""
+def parse_telemetry(log_text: str) -> dict[str, Any]:
+    """Extract observed session_id, tokens_used, model, and effort from Codex logs."""
     session_match = re.search(r"session id:\s*([0-9a-fA-F-]+)", log_text)
     tokens_match = re.search(r"tokens used\s*\n\s*([0-9,]+)", log_text)
     model_match = re.search(r"^model:\s*(.+)$", log_text, re.MULTILINE)
+    effort_match = re.search(r"^reasoning effort:\s*(.+)$", log_text, re.MULTILINE)
     return {
         "session_id": session_match.group(1) if session_match else None,
         "tokens_used": int(tokens_match.group(1).replace(",", "")) if tokens_match else None,
         "model": model_match.group(1).strip() if model_match else None,
+        "effort": effort_match.group(1).strip() if effort_match else None,
     }
 
 
 def truncate_text(text: str, limit: int = 100) -> str:
-    """Collapse whitespace and truncate long strings for clean stderr progress lines."""
     clean = " ".join(text.split())
     if len(clean) <= limit:
         return clean
@@ -376,7 +283,7 @@ def truncate_text(text: str, limit: int = 100) -> str:
 
 
 def strip_shell_wrapper(command: str) -> str:
-    """Strip `/bin/zsh -lc '...'` wrapper for cleaner Codex-style command display."""
+    """Strip bash/zsh/powershell/pwsh/cmd shell wrapper for cleaner step titles."""
     text = command.strip()
     match = SHELL_WRAPPER_RE.match(text)
     if not match:
@@ -388,7 +295,6 @@ def strip_shell_wrapper(command: str) -> str:
 
 
 def is_structured_handoff_text(text: str) -> bool:
-    """Detect whether an agent_message is the final JSON schema payload."""
     stripped = text.strip()
     if not (stripped.startswith("{") and stripped.endswith("}")):
         return False
@@ -399,16 +305,145 @@ def is_structured_handoff_text(text: str) -> bool:
     return isinstance(obj, dict) and {"status", "summary", "changed_files"}.issubset(obj.keys())
 
 
-def get_shared_runs_dir() -> Path:
-    """Resolve the shared runs directory read by the Codex Worker MCP panel."""
-    env_dir = os.environ.get("CODEX_WORKER_DATA_DIR")
-    if env_dir:
-        return Path(env_dir).expanduser() / "runs"
-    return Path.home() / ".gemini" / "antigravity" / "plugin_data" / "codex-in-anti" / "runs"
+def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
+    """Redact potential secret `-c` values and prompt text before storing/displaying."""
+    redacted: list[str] = []
+    i = 0
+    last_idx = len(cmd) - 1 if has_prompt else len(cmd)
+    while i < last_idx:
+        tok = cmd[i]
+        if tok == "-c" and i + 1 < last_idx:
+            arg = cmd[i + 1]
+            key_part = arg.split("=", 1)[0]
+            if codex_catalog.is_sensitive_key(key_part):
+                redacted.extend(["-c", f'{key_part}="<redacted>"'])
+            else:
+                redacted.extend(["-c", arg])
+            i += 2
+            continue
+        redacted.append(tok)
+        i += 1
+    if has_prompt:
+        redacted.append("<prompt>")
+    return redacted
+
+
+def build_codex_command(
+    codex_bin: str,
+    cwd: Path,
+    output_file: Path,
+    *,
+    subcommand: str = "exec",
+    codex_home: Path | None = None,
+    data_dir: Path | None = None,
+    cli_model: str | None = None,
+    cli_provider: str | None = None,
+    cli_effort: str | None = None,
+    preset: str | None = None,
+    cli_mode: str | None = None,
+    cli_config_mode: str | None = None,
+    no_worker_profile: bool = False,
+    persist: bool = False,
+    raw: bool = False,
+    search: bool = False,
+    add_dir: list[str] | None = None,
+    allow_ephemeral: bool = True,
+    allow_schema: bool = True,
+    allow_extra_dirs: bool = True,
+    allow_search: bool = True,
+    allow_json: bool = True,
+    check_git: bool = True,
+    quiet: bool = True,
+) -> tuple[list[str], dict[str, Any]]:
+    """Build full Codex CLI command and resolution metadata consistently for CLI, MCP, and preview."""
+    chome = get_codex_home(codex_home)
+    ddir = codex_catalog.get_plugin_data_dir(data_dir)
+
+    resolved_cfg = codex_catalog.resolve_effective_run_config(
+        chome,
+        ddir,
+        cli_model=cli_model,
+        cli_provider=cli_provider,
+        cli_effort=cli_effort,
+        preset=preset,
+        cli_mode=cli_mode,
+        cli_config_mode=cli_config_mode,
+    )
+    eff = resolved_cfg["effective"]
+    req_cfg_mode = cli_config_mode or eff.get("config_mode") or "isolated"
+    effective_config_mode = resolve_config_mode(req_cfg_mode, no_worker_profile, quiet)
+    eff_mode = eff.get("mode") or "write"
+    sandbox = "read-only" if (subcommand == "review" or eff_mode == "read-only") else "workspace-write"
+
+    cmd: list[str] = [codex_bin, "exec"]
+    meta: dict[str, Any] = {
+        "requested": resolved_cfg["requested"],
+        "effective": {**eff, "config_mode": effective_config_mode, "mode": eff_mode},
+        "catalog_path": resolved_cfg["catalog_path"],
+        "warnings": list(resolved_cfg["warnings"]),
+        "whitelisted_keys": [],
+        "redacted_overrides": {},
+    }
+
+    worker_profile_path = chome / "worker.config.toml"
+
+    if effective_config_mode == "isolated":
+        cmd.append("--ignore-user-config")
+        overrides, iso_meta = codex_catalog.collect_isolated_overrides(
+            chome,
+            ddir,
+            cli_model=cli_model,
+            cli_provider=cli_provider,
+            cli_effort=cli_effort,
+            preset=preset,
+            cli_mode=eff_mode,
+            cli_config_mode=effective_config_mode,
+        )
+        for key, val in overrides:
+            cmd.extend(["-c", f"{key}={codex_catalog.to_toml_literal(val)}"])
+        meta["whitelisted_keys"] = iso_meta["whitelisted_keys"]
+        meta["redacted_overrides"] = iso_meta["redacted_overrides"]
+        meta["provider_keys"] = iso_meta["provider_keys"]
+        meta["warnings"] = iso_meta["warnings"]
+    elif effective_config_mode == "profile":
+        if worker_profile_path.is_file():
+            cmd.extend(["-p", "worker"])
+        if eff.get("model"):
+            cmd.extend(["-m", str(eff["model"])])
+        if eff.get("provider"):
+            cmd.extend(["-c", f"model_provider={codex_catalog.to_toml_literal(eff['provider'])}"])
+        if eff.get("effort"):
+            cmd.extend(["-c", f"model_reasoning_effort={codex_catalog.to_toml_literal(eff['effort'])}"])
+    else:  # inherit
+        if eff.get("model"):
+            cmd.extend(["-m", str(eff["model"])])
+        if eff.get("provider"):
+            cmd.extend(["-c", f"model_provider={codex_catalog.to_toml_literal(eff['provider'])}"])
+        if eff.get("effort"):
+            cmd.extend(["-c", f"model_reasoning_effort={codex_catalog.to_toml_literal(eff['effort'])}"])
+
+    cmd.extend(["-s", sandbox])
+    if allow_search and search:
+        cmd.append("--search")
+    cmd.extend(["-C", str(cwd)])
+    if allow_extra_dirs:
+        for extra_dir in add_dir or []:
+            cmd.extend(["--add-dir", str(Path(extra_dir).resolve())])
+    if check_git and not is_git_repo(cwd):
+        cmd.append("--skip-git-repo-check")
+    if allow_ephemeral and not persist:
+        cmd.append("--ephemeral")
+    if allow_schema and not raw and DEFAULT_SCHEMA.is_file():
+        cmd.extend(["--output-schema", str(DEFAULT_SCHEMA)])
+    if allow_json:
+        cmd.append("--json")
+    cmd.extend(["-o", str(output_file)])
+
+    return cmd, meta
 
 
 class PanelStateSyncer:
-    """Best-effort atomic sync of live CLI run progress into the MCP panel runs directory."""
+    """Best-effort atomic sync of live CLI run progress into the Agy Codex MCP panel runs dir."""
 
     def __init__(self, runs_dir: Path, meta: dict[str, Any]) -> None:
         self.run_id = str(meta["run_id"])
@@ -426,7 +461,14 @@ class PanelStateSyncer:
             "mode": meta.get("mode"),
             "config_mode": meta.get("config_mode"),
             "model": meta.get("model"),
+            "provider": meta.get("provider"),
             "effort": meta.get("effort"),
+            "preset": meta.get("preset"),
+            "persist": bool(meta.get("persist", False)),
+            "requested": meta.get("requested"),
+            "effective": meta.get("effective"),
+            "observed": {"model": None, "effort": None},
+            "warnings": meta.get("warnings") or [],
             "prompt_preview": str(meta.get("prompt") or "")[:180],
             "started_at": self.started_at,
             "finished_at": None,
@@ -448,14 +490,10 @@ class PanelStateSyncer:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self.state["duration_sec"] is None:
                 self.state["elapsed_sec"] = round(max(0.0, time.time() - self.started_at), 2)
-            payload = {
-                **self.state,
-                "events": self.events,
-                "seq": self.seq,
-            }
-            tmp_path = self.state_path.with_suffix(".json.tmp")
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            os.replace(tmp_path, self.state_path)
+            payload = {**self.state, "events": self.events, "seq": self.seq}
+            codex_catalog.atomic_write_text(
+                self.state_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+            )
         except OSError:
             pass
 
@@ -476,93 +514,8 @@ class PanelStateSyncer:
 
 
 def emit_progress(quiet: bool, message: str) -> None:
-    """Print a live progress line to stderr unless `--quiet` is enabled."""
     if not quiet:
         print(f"[codex] {message}", file=sys.stderr, flush=True)
-
-
-def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
-    """Redact potential secret `-c` values and prompt text before storing/printing metadata."""
-    redacted: list[str] = []
-    i = 0
-    last_idx = len(cmd) - 1 if has_prompt else len(cmd)
-    while i < last_idx:
-        tok = cmd[i]
-        if tok == "-c" and i + 1 < last_idx:
-            arg = cmd[i + 1]
-            key_part = arg.split("=", 1)[0].split(".")[-1].strip('"')
-            if SENSITIVE_KEY_PATTERN.search(key_part) and key_part != "tool_output_token_limit":
-                redacted.extend(["-c", f'{arg.split("=", 1)[0]}="<redacted>"'])
-            else:
-                redacted.extend(["-c", arg])
-            i += 2
-            continue
-        redacted.append(tok)
-        i += 1
-    if has_prompt:
-        redacted.append("<prompt>")
-    return redacted
-
-
-def append_codex_flags(
-    cmd: list[str],
-    args: argparse.Namespace,
-    cwd: Path,
-    output_file: Path,
-    *,
-    config_mode: str,
-    codex_home: Path,
-    sandbox: str,
-    allow_ephemeral: bool,
-    allow_schema: bool,
-    allow_extra_dirs: bool,
-    allow_search: bool,
-    allow_json: bool,
-    check_git: bool,
-) -> dict[str, Any]:
-    """Append Codex CLI flags consistently across `exec`, `resume`, and `review`."""
-    isolated_meta: dict[str, Any] = {}
-    worker_profile_path = codex_home / "worker.config.toml"
-
-    if config_mode == "isolated":
-        cmd.append("--ignore-user-config")
-        overrides, isolated_meta = collect_isolated_overrides(
-            codex_home,
-            cli_model=args.model,
-            cli_effort=args.effort,
-        )
-        for key, val in overrides:
-            cmd.extend(["-c", f"{key}={to_toml_literal(val)}"])
-    elif config_mode == "profile":
-        if worker_profile_path.is_file():
-            cmd.extend(["-p", "worker"])
-        if args.model:
-            cmd.extend(["-m", args.model])
-        if args.effort:
-            cmd.extend(["-c", f'model_reasoning_effort="{args.effort}"'])
-    else:  # inherit
-        if args.model:
-            cmd.extend(["-m", args.model])
-        if args.effort:
-            cmd.extend(["-c", f'model_reasoning_effort="{args.effort}"'])
-
-    cmd.extend(["-s", sandbox])
-    if allow_search and args.search:
-        cmd.append("--search")
-    cmd.extend(["-C", str(cwd)])
-    if allow_extra_dirs:
-        for extra_dir in args.add_dir or []:
-            cmd.extend(["--add-dir", str(Path(extra_dir).resolve())])
-    if check_git and not is_git_repo(cwd):
-        cmd.append("--skip-git-repo-check")
-    if allow_ephemeral and not args.persist:
-        cmd.append("--ephemeral")
-    if allow_schema and not args.raw and DEFAULT_SCHEMA.is_file():
-        cmd.extend(["--output-schema", str(DEFAULT_SCHEMA)])
-    if allow_json:
-        cmd.append("--json")
-    cmd.extend(["-o", str(output_file)])
-    return isolated_meta
 
 
 def run_codex(
@@ -574,17 +527,24 @@ def run_codex(
     quiet: bool,
     fallback_model: str | None = None,
     panel_meta: dict[str, Any] | None = None,
-) -> dict[str, object]:
-    """Execute Codex CLI via Popen, stream milestones to stderr, and capture structured telemetry."""
+    data_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Execute Codex CLI via Popen, stream milestones to stderr, and capture telemetry."""
     env = build_exec_env()
     start = time.monotonic()
     timed_out = False
     log_lines: list[str] = []
 
-    syncer = PanelStateSyncer(get_shared_runs_dir(), panel_meta) if panel_meta is not None else None
+    syncer = (
+        PanelStateSyncer(get_shared_runs_dir(data_dir), panel_meta)
+        if panel_meta is not None
+        else None
+    )
 
     session_id: str | None = None
     last_agent_message = ""
+    observed_model: str | None = None
+    observed_effort: str | None = None
     usage_totals = {
         "input_tokens": 0,
         "cached_input_tokens": 0,
@@ -593,16 +553,22 @@ def run_codex(
     }
     saw_usage = False
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
-        env=env,
-    )
+    popen_kwargs: dict[str, Any] = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+        "env": env,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    else:
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
     if syncer is not None:
         syncer.state["pid"] = proc.pid
         syncer.write()
@@ -610,11 +576,8 @@ def run_codex(
     def on_timeout() -> None:
         nonlocal timed_out
         timed_out = True
-        emit_progress(quiet, f"timeout after {timeout}s; terminating process")
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+        emit_progress(quiet, f"timeout after {timeout}s; terminating process tree")
+        terminate_process_tree(proc)
 
     timer: threading.Timer | None = None
     if timeout and timeout > 0:
@@ -637,6 +600,10 @@ def run_codex(
                     event = None
                 if isinstance(event, dict):
                     etype = event.get("type")
+                    if isinstance(event.get("model"), str) and event["model"].strip():
+                        observed_model = event["model"].strip()
+                    if isinstance(event.get("reasoning_effort"), str) and event["reasoning_effort"].strip():
+                        observed_effort = event["reasoning_effort"].strip()
                     if etype == "thread.started":
                         tid = event.get("thread_id")
                         if isinstance(tid, str) and tid:
@@ -656,7 +623,9 @@ def run_codex(
                             if etype == "item.started":
                                 emit_progress(quiet, f"run: {cmd_txt}")
                             else:
-                                emit_progress(quiet, f"done (exit={item.get('exit_code')}): {cmd_txt}")
+                                emit_progress(
+                                    quiet, f"done (exit={item.get('exit_code')}): {cmd_txt}"
+                                )
                             if syncer is not None:
                                 syncer.append_event(
                                     {
@@ -763,13 +732,18 @@ def run_codex(
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                terminate_process_tree(proc)
+                proc.wait(timeout=5)
         else:
             proc.wait()
     finally:
         if timer is not None:
             timer.cancel()
+        if proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
 
     if timed_out:
         log_lines.append(f"\n[codex_run] Timed out after {timeout}s\n")
@@ -777,13 +751,13 @@ def run_codex(
     exit_code = 124 if timed_out else (proc.returncode if proc.returncode is not None else 1)
     duration_sec = round(time.monotonic() - start, 2)
     combined_log = "".join(log_lines)
-    log_file.write_text(combined_log, encoding="utf-8")
+    log_file.write_text(combined_log, encoding="utf-8", newline="\n")
 
     raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
     if not raw_output and last_agent_message:
         raw_output = last_agent_message.strip()
 
-    parsed_result: object = raw_output
+    parsed_result: Any = raw_output
     if raw_output:
         try:
             parsed_result = json.loads(raw_output)
@@ -797,7 +771,9 @@ def run_codex(
         if saw_usage
         else fallback["tokens_used"]
     )
-    resolved_model = fallback["model"] or fallback_model
+    obs_model = observed_model or fallback["model"]
+    obs_effort = observed_effort or fallback["effort"]
+    resolved_model = obs_model or fallback_model
 
     if syncer is not None:
         cancelled = syncer.was_cancelled_externally()
@@ -812,6 +788,7 @@ def run_codex(
                 "ok": final_status == "done",
                 "status": final_status,
                 "model": resolved_model,
+                "observed": {"model": obs_model, "effort": obs_effort},
                 "finished_at": time.time(),
                 "duration_sec": duration_sec,
                 "elapsed_sec": duration_sec,
@@ -826,19 +803,24 @@ def run_codex(
                     else (
                         f"Timed out after {timeout}s"
                         if timed_out
-                        else (None if exit_code == 0 else (syncer.state.get("error") or f"codex exited with code {exit_code}"))
+                        else (
+                            None
+                            if exit_code == 0
+                            else (syncer.state.get("error") or f"codex exited with code {exit_code}")
+                        )
                     )
                 ),
             }
         )
         syncer.write()
 
-    summary: dict[str, object] = {
+    summary: dict[str, Any] = {
         "ok": exit_code == 0 and not timed_out,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_sec": duration_sec,
         "model": resolved_model,
+        "observed": {"model": obs_model, "effort": obs_effort},
         "session_id": resolved_session,
         "tokens_used": resolved_tokens,
         "result": parsed_result,
@@ -850,31 +832,78 @@ def run_codex(
     return summary
 
 
-def run_doctor() -> int:
-    """Validate local prerequisites (Python, codex CLI, auth, configs, schema, git)."""
-    codex_home = get_codex_home()
+def preview_command_report(
+    codex_home: Path | str | None = None,
+    data_dir: Path | str | None = None,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    effort: str | None = None,
+    preset: str | None = None,
+    config_mode: str | None = None,
+    mode: str | None = None,
+) -> dict[str, Any]:
+    """Build a dry-run preview of the redacted Codex command and resolved config."""
+    try:
+        codex_bin = find_codex_bin()
+    except FileNotFoundError:
+        codex_bin = "codex"
+
+    cmd, meta = build_codex_command(
+        codex_bin,
+        Path("."),
+        Path("output.json"),
+        codex_home=codex_home,
+        data_dir=data_dir,
+        cli_model=model,
+        cli_provider=provider,
+        cli_effort=effort,
+        preset=preset,
+        cli_mode=mode,
+        cli_config_mode=config_mode,
+        check_git=False,
+        quiet=True,
+    )
+    redacted_cmd = sanitize_command_for_meta(cmd, has_prompt=False)
+    return {
+        "command": redacted_cmd,
+        "command_line": " ".join(
+            shlex.quote(tok) if os.name != "nt" else (f'"{tok}"' if " " in tok else tok)
+            for tok in redacted_cmd
+        ),
+        **meta,
+    }
+
+
+def doctor_report(
+    codex_home: Path | str | None = None,
+    data_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Validate local prerequisites and return structured health check report (secrets redacted)."""
+    chome = get_codex_home(codex_home)
+    ddir = codex_catalog.get_plugin_data_dir(data_dir)
     env = build_exec_env()
     checks: dict[str, dict[str, Any]] = {}
     all_required_ok = True
 
-    # 1. Python & tomllib
     py_ver = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     checks["python"] = {
         "ok": sys.version_info >= (3, 10),
         "required": True,
         "version": py_ver,
-        "tomllib_available": tomllib is not None,
+        "tomllib_available": codex_catalog.tomllib is not None,
     }
     if not checks["python"]["ok"]:
         all_required_ok = False
 
-    # 2. codex binary + version
     try:
         codex_bin = find_codex_bin()
         ver_proc = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
             timeout=10,
         )
@@ -887,54 +916,74 @@ def run_doctor() -> int:
             "version": ver_str,
         }
     except Exception as exc:
-        checks["codex_bin"] = {
-            "ok": False,
-            "required": True,
-            "error": str(exc),
-        }
+        checks["codex_bin"] = {"ok": False, "required": True, "error": str(exc)}
     if not checks["codex_bin"]["ok"]:
         all_required_ok = False
 
-    # 3. auth.json
-    auth_file = codex_home / "auth.json"
-    auth_ok = auth_file.is_file() and auth_file.stat().st_size > 0
-    checks["auth"] = {
-        "ok": auth_ok,
-        "required": True,
-        "path": str(auth_file),
-        "hint": None if auth_ok else "Run 'codex login' to authenticate.",
-    }
-    if not auth_ok:
-        all_required_ok = False
+    # Config + catalog + models discovery
+    base_cfg_path = chome / "config.toml"
+    worker_cfg_path = chome / "worker.config.toml"
+    _, base_err = codex_catalog.load_toml_file(base_cfg_path)
+    _, worker_err = codex_catalog.load_toml_file(worker_cfg_path)
 
-    # 4. config.toml & worker.config.toml + whitelisted summary
-    base_cfg_path = codex_home / "config.toml"
-    worker_cfg_path = codex_home / "worker.config.toml"
-    _, base_err = load_toml_file(base_cfg_path)
-    _, worker_err = load_toml_file(worker_cfg_path)
-
-    whitelist_summary: dict[str, Any] = {}
-    whitelist_err: str | None = None
-    if tomllib is not None and not base_err and not worker_err:
+    disc: dict[str, Any] = {}
+    iso_meta: dict[str, Any] = {}
+    cfg_err: str | None = None
+    if codex_catalog.tomllib is not None and not base_err and not worker_err:
         try:
-            _, whitelist_summary = collect_isolated_overrides(codex_home)
+            disc = codex_catalog.discover_models_and_config(chome, ddir)
+            _, iso_meta = codex_catalog.collect_isolated_overrides(chome, ddir)
         except Exception as exc:
-            whitelist_err = str(exc)
+            cfg_err = str(exc)
 
-    config_ok = (base_err is None) and (worker_err is None) and (whitelist_err is None)
+    config_ok = (base_err is None) and (worker_err is None) and (cfg_err is None)
     checks["config"] = {
         "ok": config_ok,
         "required": True,
-        "codex_home": str(codex_home),
+        "codex_home": str(chome),
+        "data_dir": str(ddir),
         "config_toml_exists": base_cfg_path.is_file(),
         "worker_config_exists": worker_cfg_path.is_file(),
-        "whitelisted_summary": whitelist_summary,
-        "error": base_err or worker_err or whitelist_err,
+        "catalog_mode": disc.get("catalog_mode"),
+        "catalog_path": disc.get("catalog_path"),
+        "catalog_loaded": bool(disc.get("catalog_loaded")),
+        "models_cache_loaded": bool(disc.get("models_cache_loaded")),
+        "all_models_count": disc.get("all_models_count", 0),
+        "visible_models_count": disc.get("visible_models_count", 0),
+        "hidden_models_count": disc.get("hidden_models_count", 0),
+        "providers": disc.get("providers", []),
+        "effective_defaults": disc.get("effective_defaults", {}),
+        "redacted_overrides": iso_meta.get("redacted_overrides", {}),
+        "warnings": (disc.get("warnings") or []) + (iso_meta.get("warnings") or []),
+        "error": base_err or worker_err or cfg_err,
     }
     if not config_ok:
         all_required_ok = False
 
-    # 5. handoff_schema.json
+    # Auth: non-fatal if active custom provider has token/env_key
+    auth_file = chome / "auth.json"
+    auth_exists = auth_file.is_file() and auth_file.stat().st_size > 0
+    active_prov_id = (disc.get("effective_defaults") or {}).get("provider")
+    active_prov = next(
+        (p for p in (disc.get("providers") or []) if p.get("id") == active_prov_id), None
+    )
+    has_provider_auth = bool(active_prov and active_prov.get("has_auth_token"))
+    auth_required = not has_provider_auth
+    auth_ok = auth_exists or has_provider_auth
+    checks["auth"] = {
+        "ok": auth_ok,
+        "required": auth_required,
+        "auth_json_exists": auth_exists,
+        "provider_auth_configured": has_provider_auth,
+        "path": str(auth_file),
+        "hint": None
+        if auth_ok
+        else "Run 'codex login' or configure provider env_key/token in config.toml.",
+    }
+    if auth_required and not auth_ok:
+        all_required_ok = False
+
+    # Schema
     schema_ok = False
     schema_err: str | None = None
     if DEFAULT_SCHEMA.is_file():
@@ -954,7 +1003,7 @@ def run_doctor() -> int:
     if not schema_ok:
         all_required_ok = False
 
-    # 6. git (informational, required for --worktree)
+    # Git (optional, required for --worktree)
     git_bin = shutil.which("git", path=env.get("PATH"))
     git_ok = False
     git_ver: str | None = None
@@ -965,125 +1014,134 @@ def run_doctor() -> int:
             git_ver = gp.stdout.strip()
         except Exception:
             git_ok = False
-    checks["git"] = {
-        "ok": git_ok,
+    checks["git"] = {"ok": git_ok, "required": False, "path": git_bin, "version": git_ver}
+
+    # Local SQLite telemetry status (optional)
+    db_path = codex_telemetry.find_latest_state_db(chome)
+    checks["telemetry_db"] = {
+        "ok": db_path is not None,
         "required": False,
-        "path": git_bin,
-        "version": git_ver,
+        "path": str(db_path) if db_path else None,
+        "hint": None if db_path else "No local state_*.sqlite found yet (optional).",
     }
 
-    report = {
+    return {
         "ok": all_required_ok,
-        "recommended_config_mode": "isolated" if tomllib is not None else "profile",
+        "recommended_config_mode": "isolated" if codex_catalog.tomllib is not None else "profile",
         "checks": checks,
     }
+
+
+def run_doctor() -> int:
+    report = doctor_report()
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if all_required_ok else 1
+    return 0 if report["ok"] else 1
 
 
-def add_shared_options(parser: argparse.ArgumentParser, default_mode: str = "write") -> None:
-    """Register CLI flags shared by `exec`, `resume`, and `review`."""
+def add_shared_options(parser: argparse.ArgumentParser, default_mode: str | None = None) -> None:
     parser.add_argument("-C", "--cwd", default=".", help="Working directory for Codex.")
     parser.add_argument(
         "--mode",
         choices=["write", "read-only"],
         default=default_mode,
-        help=f"Sandbox mode (default: {default_mode}).",
+        help="Sandbox mode (`write` or `read-only`).",
     )
     parser.add_argument(
         "--config-mode",
         choices=["isolated", "profile", "inherit"],
-        default="isolated",
-        help="Config isolation mode: isolated (whitelist via --ignore-user-config, default), profile (-p worker), or inherit.",
+        default=None,
+        help="Config isolation mode: isolated, profile, or inherit.",
     )
     parser.add_argument("-m", "--model", default=None, help="Override Codex model.")
-    parser.add_argument(
-        "--effort",
-        choices=["low", "medium", "high"],
-        default=None,
-        help="Override model_reasoning_effort.",
-    )
-    parser.add_argument(
-        "--persist", action="store_true", help="Keep session on disk (disable --ephemeral)."
-    )
-    parser.add_argument(
-        "--add-dir", action="append", default=[], help="Extra writable directory (repeatable)."
-    )
-    parser.add_argument(
-        "--raw", action="store_true", help="Disable JSON output schema; return raw text."
-    )
+    parser.add_argument("--provider", default=None, help="Override Codex model_provider.")
+    parser.add_argument("--effort", default=None, help="Override model_reasoning_effort.")
+    parser.add_argument("--preset", default=None, help="Role preset (explore/coding/frontend/review/debug/fast).")
+    parser.add_argument("--persist", action="store_true", help="Keep session on disk (disable --ephemeral).")
+    parser.add_argument("--add-dir", action="append", default=[], help="Extra writable directory.")
+    parser.add_argument("--raw", action="store_true", help="Disable JSON output schema.")
     parser.add_argument("--search", action="store_true", help="Enable live web search.")
-    parser.add_argument(
-        "--no-worker-profile",
-        action="store_true",
-        help="Deprecated alias for `--config-mode inherit`.",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress live stderr progress milestones.",
-    )
-    parser.add_argument(
-        "--no-panel-sync",
-        action="store_true",
-        help="Do not sync live run progress to the Codex Worker MCP panel runs directory.",
-    )
-    parser.add_argument(
-        "--timeout", type=int, default=600, help="Timeout in seconds (default: 600)."
-    )
-    parser.add_argument(
-        "--log-dir", default=str(DEFAULT_LOG_ROOT), help="Directory for run logs and outputs."
-    )
+    parser.add_argument("--no-worker-profile", action="store_true", help="Alias for `--config-mode inherit`.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress live stderr progress milestones.")
+    parser.add_argument("--no-panel-sync", action="store_true", help="Disable live sync to panel.")
+    parser.add_argument("--timeout", type=int, default=600, help="Timeout in seconds (default: 600).")
+    parser.add_argument("--log-dir", default=str(DEFAULT_LOG_ROOT), help="Directory for run logs.")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Orchestrate OpenAI Codex CLI cleanly.")
+    parser = argparse.ArgumentParser(description="Orchestrate OpenAI Codex CLI cleanly (Agy Codex).")
     subparsers = parser.add_subparsers(dest="subcommand", required=True)
 
     p_exec = subparsers.add_parser("exec", help="Run a new non-interactive Codex task.")
-    add_shared_options(p_exec, default_mode="write")
+    add_shared_options(p_exec, default_mode=None)
     p_exec.add_argument(
         "--worktree",
         nargs="?",
         const="",
         default=None,
         metavar="NAME",
-        help="Run inside a newly created isolated Git worktree (optionally named NAME).",
+        help="Run inside an isolated Git worktree.",
     )
     p_exec.add_argument("--prompt", default=None, help="Task prompt.")
     p_exec.add_argument("--prompt-file", default=None, help="File containing the task prompt.")
 
     p_resume = subparsers.add_parser("resume", help="Resume an existing Codex session.")
-    add_shared_options(p_resume, default_mode="write")
-    p_resume.add_argument(
-        "session_id", nargs="?", default=None, help="Session ID to resume (or pass --last)."
-    )
+    add_shared_options(p_resume, default_mode=None)
+    p_resume.add_argument("session_id", nargs="?", default=None, help="Session ID to resume.")
     p_resume.add_argument("--last", action="store_true", help="Resume the most recent session.")
     p_resume.add_argument("--prompt", default=None, help="Follow-up instructions.")
-    p_resume.add_argument(
-        "--prompt-file", default=None, help="File containing follow-up instructions."
-    )
+    p_resume.add_argument("--prompt-file", default=None, help="File containing follow-up instructions.")
 
     p_review = subparsers.add_parser("review", help="Run a read-only code review.")
     add_shared_options(p_review, default_mode="read-only")
     p_review.add_argument("--base", default=None, help="Review changes against a base branch.")
     p_review.add_argument("--commit", default=None, help="Review a specific commit SHA.")
-    p_review.add_argument(
-        "--uncommitted", action="store_true", help="Review staged, unstaged, and untracked changes."
-    )
+    p_review.add_argument("--uncommitted", action="store_true", help="Review uncommitted changes.")
     p_review.add_argument("--prompt", default=None, help="Custom review instructions.")
-    p_review.add_argument(
-        "--prompt-file", default=None, help="File containing custom review instructions."
-    )
+    p_review.add_argument("--prompt-file", default=None, help="File containing custom review instructions.")
 
-    subparsers.add_parser("doctor", help="Check local Codex CLI, auth, config, and schema health.")
+    subparsers.add_parser("doctor", help="Check local Codex CLI, auth, catalog, config, and SQLite health.")
+
+    p_models = subparsers.add_parser("models", help="List discovered Codex models, providers, and presets.")
+    p_models.add_argument("--query", default="", help="Filter models by slug/display name.")
+    p_models.add_argument("--provider", default="", help="Filter models by provider.")
+    p_models.add_argument("--include-hidden", action="store_true", help="Include visibility=hide models.")
+    p_models.add_argument("--exclude-filtered", action="store_true", help="Hide excluded_models entries.")
+
+    p_preview = subparsers.add_parser("preview", help="Dry-run preview of resolved Codex flags (redacted).")
+    p_preview.add_argument("-m", "--model", default=None)
+    p_preview.add_argument("--provider", default=None)
+    p_preview.add_argument("--effort", default=None)
+    p_preview.add_argument("--preset", default=None)
+    p_preview.add_argument("--config-mode", choices=["isolated", "profile", "inherit"], default=None)
+    p_preview.add_argument("--mode", choices=["write", "read-only"], default=None)
 
     args = parser.parse_args()
     if args.subcommand == "doctor":
         return run_doctor()
+    if args.subcommand == "models":
+        res = codex_catalog.discover_models_and_config(
+            query=args.query,
+            provider=args.provider,
+            include_hidden=args.include_hidden,
+            include_excluded=not args.exclude_filtered,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
+    if args.subcommand == "preview":
+        res = preview_command_report(
+            model=args.model,
+            provider=args.provider,
+            effort=args.effort,
+            preset=args.preset,
+            config_mode=args.config_mode,
+            mode=args.mode,
+        )
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0
 
     codex_bin = find_codex_bin()
     codex_home = get_codex_home()
+    data_dir = codex_catalog.get_plugin_data_dir()
     initial_cwd = Path(args.cwd).resolve()
     run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run_dir = Path(args.log_dir) / run_id
@@ -1093,9 +1151,6 @@ def main() -> int:
         "output.txt" if args.raw or args.subcommand == "review" else "output.json"
     )
 
-    effective_config_mode = resolve_config_mode(
-        args.config_mode, args.no_worker_profile, args.quiet
-    )
     worktree_info: dict[str, str] | None = None
     cwd = initial_cwd
     if args.subcommand == "exec" and args.worktree is not None:
@@ -1108,47 +1163,64 @@ def main() -> int:
             f"worktree={worktree_info['path']} (branch={worktree_info['branch']})",
         )
 
-    cmd = [codex_bin, "exec"]
-    sandbox = "read-only" if args.mode == "read-only" else "workspace-write"
     has_prompt = False
     prompt_text = ""
-    isolated_meta: dict[str, Any] = {}
 
     if args.subcommand == "exec":
         prompt_text = read_prompt(args.prompt, args.prompt_file)
-        isolated_meta = append_codex_flags(
-            cmd,
-            args,
+        cmd, meta = build_codex_command(
+            codex_bin,
             cwd,
             output_file,
-            config_mode=effective_config_mode,
+            subcommand="exec",
             codex_home=codex_home,
-            sandbox=sandbox,
+            data_dir=data_dir,
+            cli_model=args.model,
+            cli_provider=args.provider,
+            cli_effort=args.effort,
+            preset=args.preset,
+            cli_mode=args.mode,
+            cli_config_mode=args.config_mode,
+            no_worker_profile=args.no_worker_profile,
+            persist=args.persist,
+            raw=args.raw,
+            search=args.search,
+            add_dir=args.add_dir,
             allow_ephemeral=True,
             allow_schema=True,
             allow_extra_dirs=True,
             allow_search=True,
             allow_json=True,
             check_git=True,
+            quiet=args.quiet,
         )
         cmd.append(prompt_text)
         has_prompt = True
     elif args.subcommand == "resume":
         prompt_text = read_prompt(args.prompt, args.prompt_file)
-        isolated_meta = append_codex_flags(
-            cmd,
-            args,
+        cmd, meta = build_codex_command(
+            codex_bin,
             cwd,
             output_file,
-            config_mode=effective_config_mode,
+            subcommand="resume",
             codex_home=codex_home,
-            sandbox=sandbox,
+            data_dir=data_dir,
+            cli_model=args.model,
+            cli_provider=args.provider,
+            cli_effort=args.effort,
+            preset=args.preset,
+            cli_mode=args.mode,
+            cli_config_mode=args.config_mode,
+            no_worker_profile=args.no_worker_profile,
+            persist=args.persist,
+            raw=args.raw,
             allow_ephemeral=False,
             allow_schema=True,
             allow_extra_dirs=False,
             allow_search=False,
             allow_json=True,
             check_git=True,
+            quiet=args.quiet,
         )
         cmd.append("resume")
         if args.last:
@@ -1160,20 +1232,29 @@ def main() -> int:
         cmd.append(prompt_text)
         has_prompt = True
     elif args.subcommand == "review":
-        isolated_meta = append_codex_flags(
-            cmd,
-            args,
+        cmd, meta = build_codex_command(
+            codex_bin,
             cwd,
             output_file,
-            config_mode=effective_config_mode,
+            subcommand="review",
             codex_home=codex_home,
-            sandbox="read-only",
+            data_dir=data_dir,
+            cli_model=args.model,
+            cli_provider=args.provider,
+            cli_effort=args.effort,
+            preset=args.preset,
+            cli_mode="read-only",
+            cli_config_mode=args.config_mode,
+            no_worker_profile=args.no_worker_profile,
+            persist=args.persist,
+            raw=args.raw,
             allow_ephemeral=True,
             allow_schema=False,
             allow_extra_dirs=False,
             allow_search=False,
             allow_json=False,
             check_git=False,
+            quiet=args.quiet,
         )
         cmd.append("review")
         if args.uncommitted:
@@ -1189,19 +1270,23 @@ def main() -> int:
     else:
         raise ValueError(f"Unsupported subcommand: {args.subcommand}")
 
-    fallback_model = (
-        args.model
-        or (isolated_meta.get("model") if isinstance(isolated_meta.get("model"), str) else None)
-    )
+    eff = meta["effective"]
+    fallback_model = eff.get("model")
     panel_meta: dict[str, Any] | None = None
     if args.subcommand in ("exec", "resume") and not args.no_panel_sync:
         panel_meta = {
             "run_id": run_id,
             "cwd": str(cwd),
-            "mode": args.mode,
-            "config_mode": effective_config_mode,
+            "mode": eff.get("mode"),
+            "config_mode": eff.get("config_mode"),
             "model": fallback_model,
-            "effort": args.effort,
+            "provider": eff.get("provider"),
+            "effort": eff.get("effort"),
+            "preset": eff.get("preset"),
+            "persist": bool(args.persist),
+            "requested": meta.get("requested"),
+            "effective": eff,
+            "warnings": meta.get("warnings") or [],
             "prompt": prompt_text,
             "worktree": worktree_info,
             "started_at": time.time(),
@@ -1217,14 +1302,21 @@ def main() -> int:
         quiet=args.quiet,
         fallback_model=fallback_model,
         panel_meta=panel_meta,
+        data_dir=data_dir,
     )
-    summary["config_mode"] = effective_config_mode
+    summary["config_mode"] = eff.get("config_mode")
+    summary["provider"] = eff.get("provider")
+    summary["effort"] = eff.get("effort")
+    summary["preset"] = eff.get("preset")
+    summary["requested"] = meta.get("requested")
+    summary["effective"] = eff
+    summary["warnings"] = meta.get("warnings") or []
     if worktree_info is not None:
         summary["worktree"] = worktree_info
     summary["command"] = sanitize_command_for_meta(cmd, has_prompt)
 
-    (run_dir / "meta.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    codex_catalog.atomic_write_text(
+        run_dir / "meta.json", json.dumps(summary, ensure_ascii=False, indent=2) + "\n"
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary["ok"] else 1

@@ -1,25 +1,27 @@
-# Worker configuration for `codex-in-anti`.
+# Worker configuration for `agy-codex`.
 # Place at `$CODEX_HOME/worker.config.toml` (default: `~/.codex/worker.config.toml`).
 #
-# How `codex_run.py` uses this file:
+# How `agy-codex` uses this file:
 # - `--config-mode isolated` (default on Python 3.11+): passes `--ignore-user-config` to Codex CLI
-#   and whitelist-extracts ONLY `model`, `model_provider`, `model_reasoning_effort`, `personality`,
-#   `tool_output_token_limit`, `developer_instructions`, plus provider/proxy settings from `config.toml`.
+#   and whitelist-extracts model, provider, reasoning effort, resolved `model_catalog_json` (if active),
+#   and proxy/provider settings from `config.toml` + `worker.config.toml` + `${PLUGIN_DATA}/workbench-config.json`.
 #   Desktop plugins, MCP servers, hooks, memories, and chronicle are completely ignored.
 # - `--config-mode profile` (fallback on Python 3.10): passes `-p worker` layered on top of
 #   `~/.codex/config.toml` and relies on the explicit disable blocks below.
+#
+# Note: `model` and `model_reasoning_effort` are commented out below so they inherit your
+# `~/.codex/config.toml` or Agy Codex workbench defaults/presets (supporting none/minimal/low/medium/high/xhigh/max/ultra).
+# Uncomment any line to pin a hard override in `worker.config.toml`.
 
 personality = "pragmatic"
-model_reasoning_effort = "medium"
+# model = "o3"
+# model_provider = "openai"
+# model_reasoning_effort = "medium"
 approval_policy = "never"
 sandbox_mode = "workspace-write"
 suppress_unstable_features_warning = true
 notify = []
 tool_output_token_limit = 10000
-
-# Optional: pin a dedicated model or provider for worker runs.
-# model = "o3"
-# model_provider = "openai"
 
 developer_instructions = """
 You are running as a non-interactive worker invoked by an orchestrator agent.
@@ -49,10 +51,6 @@ enabled = false
 
 [mcp_servers.node_repl]
 enabled = false
-
-# Add any custom heavy MCP servers from your `~/.codex/config.toml` if using `profile` mode:
-# [mcp_servers.my-heavy-mcp]
-# enabled = false
 
 [plugins."documents@openai-primary-runtime"]
 enabled = false
