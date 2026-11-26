@@ -822,9 +822,10 @@ TOOLS_DEF: list[dict[str, Any]] = [
         "name": "list_codex_models",
         "title": "List Codex Models & Presets",
         "description": (
-            "Discover available Codex models (from custom_models, model_catalog_json, "
-            "models_cache.json, and config.toml), redacted providers, effective defaults, "
-            "role presets, and excluded_models. Always call before guessing unfamiliar model slugs or efforts."
+            "Discover visible (visibility != 'hide') Codex models (from custom_models, "
+            "model_catalog_json, models_cache.json, and config.toml), redacted providers, "
+            "effective defaults, role presets, and excluded_models. Always call before guessing "
+            "unfamiliar model slugs or efforts."
         ),
         "inputSchema": {
             "type": "object",
@@ -832,7 +833,6 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "properties": {
                 "query": {"type": "string", "description": "Optional substring filter on slug or display_name."},
                 "provider": {"type": "string", "description": "Optional provider id filter."},
-                "include_hidden": {"type": "boolean", "default": False, "description": "Include visibility=hide models."},
                 "include_excluded": {"type": "boolean", "default": True, "description": "Include excluded_models entries."},
             },
         },
@@ -1153,14 +1153,18 @@ class McpServer:
         ddir = self.manager.data_dir
 
         if name == "list_codex_models":
-            payload = codex_catalog.discover_models_and_config(
-                chome,
-                ddir,
-                query=str(arguments.get("query") or ""),
-                provider=str(arguments.get("provider") or ""),
-                include_hidden=bool(arguments.get("include_hidden", False)),
-                include_excluded=bool(arguments.get("include_excluded", True)),
+            payload = dict(
+                codex_catalog.discover_models_and_config(
+                    chome,
+                    ddir,
+                    query=str(arguments.get("query") or ""),
+                    provider=str(arguments.get("provider") or ""),
+                    include_hidden=False,
+                    include_excluded=bool(arguments.get("include_excluded", True)),
+                )
             )
+            payload.pop("hidden_models_count", None)
+            payload["all_models_count"] = payload["visible_models_count"]
             return self._tool_ok(payload)
 
         if name == "start_codex_task":

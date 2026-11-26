@@ -239,7 +239,7 @@ flowchart LR
    - **档位自动平滑降级（不硬拒）**：定义标准档位序 `["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]`。当目标模型存在于 `model_catalog_json` 且声明了非空 `supported_reasoning_levels`、而解析后的 `effort` 不在支持列表内时（例如对仅支持到 `high` 的模型使用 `debug=xhigh` 预设），自动向最近的较低支持档位收敛（若目标档位低于最低支持档则取最低支持档；未在序列表内则回退 `default_reasoning_level`），并在 `start_codex_task` 返回体与 UI 中带出非致命 `warnings`（如 `effort clamped: xhigh -> high`）。目标模型不在 catalog 中时原样透传。
    - **上下文窗口防串味**：仅当本次任务使用的 `model` 与 `config.toml` 默认模型一致时，才透传 `config.toml` 的 `model_context_window` 与 `model_auto_compact_token_limit`；一旦单次任务覆写了不同 `model`，自动省略这两项让 Codex 直接读取目标模型在 catalog 或内置定义中的真实窗口上限。
 4. **`model_catalog_json` 可见性与 Provider 归属**：
-   - 支持读取 catalog 条目的 `visibility` 字段（如 `"list"` / `"hide"`）：`list_codex_models` 与 Tab 3 默认优先展示可见模型（`visibility != "hide"`），同时提供 `include_hidden=true` 参数与前端「显示隐藏模型」开关查看全量；执行校验与查找始终覆盖全部条目（含隐藏条目）。
+   - 支持读取 catalog 条目的 `visibility` 字段（如 `"list"` / `"hide"`）：`list_codex_models` 与 CLI `models` 仅返回可见模型（`visibility != "hide"`），不提供 `include_hidden` 参数、不暴露隐藏数量；Tab 3 默认仅展示可见模型并提供可选的前端「显示隐藏模型」开关；执行校验与查找始终覆盖全部条目（含隐藏条目）。
    - catalog 条目未声明 `provider` 时视为适用于所有 Provider；若条目显式声明了 `provider` 且调用方未显式传 `provider`，则自动切换到该条目的 `provider`（显式传参始终最高优先级）。
    - 仅当 `config.toml` 未定义任何 `[model_providers.*]` 或当前 `model_provider == "openai"` 时，在 Provider 列表中自动补充内置 `"openai"` 选项。
 5. **面板发回对话的交互语义与临时会话（`persist=false`）**：

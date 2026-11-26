@@ -23,23 +23,50 @@ EFFORT_RANK: list[str] = ["none", "minimal", "low", "medium", "high", "xhigh", "
 EFFORT_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 EXTRA_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
+SUBAGENT_ROLE_PREFIX = (
+    "[SUBAGENT ROLE DECLARATION / 子代理身份声明] "
+    "You are running as a non-interactive LEAF SUBAGENT (子代理/Worker) invoked by an external parent orchestrator (Antigravity), "
+    "NOT the root/main agent (根主代理). Your parent orchestrator has already decomposed the task and delegated this bounded subtask to you. "
+    "Any global AGENTS.md, user config, or default workflow instructions telling the root agent to split work, spawn subagents "
+    "(`spawn_agent`, `multi_agent`), or delegate to child agents DO NOT APPLY to you. "
+    "Execute this task directly yourself with zero nested subagent spawning. "
+    "If an optional MCP tool referenced in AGENTS.md (such as `fastctx` or `runtime_identity`) is unavailable in this session, "
+    "silently use built-in tools without wasting turns searching for missing tools."
+)
+
+NESTED_SUBAGENT_PREFIX = (
+    "[SUBAGENT ROLE DECLARATION / 子代理身份声明] "
+    "You are running as a non-interactive delegated subagent (子代理/Worker) invoked by an external parent orchestrator (Antigravity), "
+    "NOT the root/main agent (根主代理). Nested subagents are explicitly enabled for this run, but only use them when genuinely necessary."
+)
+
 DEFAULT_DEVELOPER_INSTRUCTIONS = (
-    "You are running as a non-interactive worker invoked by an orchestrator agent. "
-    "Execute the bounded task directly and thoroughly within the workspace. "
-    "Do not spawn subagents, do not ask interactive follow-up questions, and do not modify "
-    "files outside the requested scope. Run concrete verification commands (tests, linters, "
-    "or scripts) for every change when possible. Report concise, factual results: changed "
-    "file paths, exact verification commands and outcomes, and any remaining risks or blockers."
+    SUBAGENT_ROLE_PREFIX
+    + " Do not ask interactive follow-up questions, and do not modify files outside the requested scope. "
+    "Run concrete verification commands (tests, linters, or scripts) for every change when possible. "
+    "Report concise, factual results: changed file paths, exact verification commands and outcomes, and any remaining risks or blockers."
 )
 
 NESTED_SUBAGENT_INSTRUCTIONS = (
-    "You are running as a non-interactive worker invoked by an orchestrator agent. "
-    "Execute the bounded task directly and thoroughly within the workspace. "
-    "Do not ask interactive follow-up questions and do not modify files outside the requested scope. "
+    NESTED_SUBAGENT_PREFIX
+    + " Execute the bounded task directly and thoroughly within the workspace. "
+    "Do not ask interactive follow-up questions, and do not modify files outside the requested scope. "
     "Run concrete verification commands (tests, linters, or scripts) for every change when possible. "
-    "Report concise, factual results: changed file paths, exact verification commands and outcomes, "
-    "and any remaining risks or blockers."
+    "Report concise, factual results: changed file paths, exact verification commands and outcomes, and any remaining risks or blockers."
 )
+
+
+def build_worker_developer_instructions(
+    worker_cfg: dict[str, Any], *, allow_nested: bool = False
+) -> str:
+    """Build explicit subagent-scoped developer_instructions, preserving custom additions."""
+    custom = _clean_optional_str(worker_cfg.get("developer_instructions"))
+    if not custom:
+        return NESTED_SUBAGENT_INSTRUCTIONS if allow_nested else DEFAULT_DEVELOPER_INSTRUCTIONS
+    if "SUBAGENT ROLE DECLARATION" in custom:
+        return custom
+    prefix = NESTED_SUBAGENT_PREFIX if allow_nested else SUBAGENT_ROLE_PREFIX
+    return f"{prefix}\n\n{custom}"
 
 NON_SECRET_KEYS: set[str] = {
     "tool_output_token_limit",
@@ -989,14 +1016,11 @@ def collect_isolated_overrides(
     allow_nested = bool(mapping.get("allow_nested_subagents", False))
     if not allow_nested:
         overrides["agents.enabled"] = False
+        overrides["features.multi_agent"] = False
 
-    dev_inst = _clean_optional_str(worker_cfg.get("developer_instructions"))
-    if dev_inst:
-        overrides["developer_instructions"] = dev_inst
-    else:
-        overrides["developer_instructions"] = (
-            NESTED_SUBAGENT_INSTRUCTIONS if allow_nested else DEFAULT_DEVELOPER_INSTRUCTIONS
-        )
+    overrides["developer_instructions"] = build_worker_developer_instructions(
+        worker_cfg, allow_nested=allow_nested
+    )
 
     # Extra user-specified top-level scalar whitelist keys
     for extra_key in mapping.get("extra_whitelist_keys") or []:

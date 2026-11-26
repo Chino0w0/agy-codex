@@ -282,6 +282,96 @@ class TestMcpServerAndRunner(unittest.TestCase):
         cmd_ev = next(e for e in ev_fast["events"] if e["kind"] == "command")
         self.assertEqual(cmd_ev["display_command"], "pytest -q")
 
+    def test_list_codex_models_never_lists_hidden_models(self) -> None:
+        (self.codex_home / "config.toml").write_text(
+            '\n'.join(
+                [
+                    'model = "demo/visible-m"',
+                    'model_provider = "gw"',
+                    'model_catalog_json = "models-catelog.local.json"',
+                    "",
+                    "[model_providers.gw]",
+                    'name = "Gateway"',
+                    'base_url = "https://gw.example.com/v1"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (self.codex_home / "models-catelog.local.json").write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "demo/visible-m",
+                            "display_name": "Visible Model",
+                            "visibility": "list",
+                            "supported_reasoning_levels": ["low", "medium", "high"],
+                        },
+                        {
+                            "slug": "demo/hidden-m",
+                            "display_name": "Hidden Model",
+                            "visibility": "hide",
+                            "supported_reasoning_levels": ["low", "medium"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 30, "method": "tools/list"})
+        list_tool = next(t for t in tools_resp["result"]["tools"] if t["name"] == "list_codex_models")
+        self.assertNotIn("include_hidden", list_tool["inputSchema"]["properties"])
+
+        for call_id, args in ((31, {}), (32, {"include_hidden": True})):
+            res = self.server.handle_request(
+                {
+                    "jsonrpc": "2.0",
+                    "id": call_id,
+                    "method": "tools/call",
+                    "params": {"name": "list_codex_models", "arguments": args},
+                }
+            )["result"]["structuredContent"]
+            slugs = [m["slug"] for m in res["models"]]
+            self.assertIn("demo/visible-m", slugs)
+            self.assertNotIn("demo/hidden-m", slugs)
+            self.assertNotIn("hidden_models_count", res)
+            self.assertEqual(res["all_models_count"], res["visible_models_count"])
+
+        wb_default = self.server.handle_request(
+            {"jsonrpc": "2.0", "id": 33, "method": "tools/call", "params": {"name": "get_workbench_config", "arguments": {}}}
+        )["result"]["structuredContent"]
+        self.assertNotIn("demo/hidden-m", [m["slug"] for m in wb_default["models"]])
+
+        wb_inc = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 34,
+                "method": "tools/call",
+                "params": {"name": "get_workbench_config", "arguments": {"include_hidden": True}},
+            }
+        )["result"]["structuredContent"]
+        self.assertIn("demo/hidden-m", [m["slug"] for m in wb_inc["models"]])
+
+    def test_subagent_declaration_in_inherit_and_profile_modes(self) -> None:
+        for cfg_mode in ("inherit", "profile"):
+            cmd, _ = codex_run.build_codex_command(
+                str(self.fake_bin),
+                self.workdir,
+                self.root / f"out-{cfg_mode}.json",
+                codex_home=self.codex_home,
+                data_dir=self.data_dir,
+                cli_config_mode=cfg_mode,
+                check_git=False,
+            )
+            joined = " ".join(cmd)
+            self.assertIn("agents.enabled=false", joined)
+            self.assertIn("features.multi_agent=false", joined)
+            self.assertIn("SUBAGENT ROLE DECLARATION", joined)
+
 
 if __name__ == "__main__":
     unittest.main()
