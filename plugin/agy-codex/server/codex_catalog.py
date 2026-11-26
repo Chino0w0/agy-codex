@@ -61,14 +61,16 @@ NESTED_SUBAGENT_INSTRUCTIONS = (
 def build_worker_developer_instructions(
     worker_cfg: dict[str, Any], *, allow_nested: bool = False
 ) -> str:
-    """Build explicit subagent-scoped developer_instructions, preserving custom additions."""
+    """Build explicit subagent-scoped developer_instructions flattened to single line for Windows `.cmd` safety."""
     custom = _clean_optional_str(worker_cfg.get("developer_instructions"))
     if not custom:
-        return NESTED_SUBAGENT_INSTRUCTIONS if allow_nested else DEFAULT_DEVELOPER_INSTRUCTIONS
-    if "SUBAGENT ROLE DECLARATION" in custom:
-        return custom
-    prefix = NESTED_SUBAGENT_PREFIX if allow_nested else SUBAGENT_ROLE_PREFIX
-    return f"{prefix}\n\n{custom}"
+        raw_inst = NESTED_SUBAGENT_INSTRUCTIONS if allow_nested else DEFAULT_DEVELOPER_INSTRUCTIONS
+    elif "SUBAGENT ROLE DECLARATION" in custom:
+        raw_inst = custom
+    else:
+        prefix = NESTED_SUBAGENT_PREFIX if allow_nested else SUBAGENT_ROLE_PREFIX
+        raw_inst = f"{prefix} {custom}"
+    return " ".join(raw_inst.split())
 
 NON_SECRET_KEYS: set[str] = {
     "tool_output_token_limit",

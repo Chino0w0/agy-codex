@@ -381,6 +381,22 @@ def extract_mcp_tool_call_event(
     return ev, obs_model, obs_effort
 
 
+def write_prompt_to_stdin(proc: subprocess.Popen[str], stdin_prompt: str | None) -> None:
+    """Write UTF-8 prompt to child stdin and close the pipe immediately."""
+    if stdin_prompt is None or proc.stdin is None:
+        return
+    try:
+        proc.stdin.write(stdin_prompt)
+        proc.stdin.flush()
+    except OSError:
+        pass
+    finally:
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+
+
 def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
     """Redact potential secret `-c` values and prompt text before storing/displaying."""
     redacted: list[str] = []
@@ -400,7 +416,7 @@ def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
         redacted.append(tok)
         i += 1
     if has_prompt:
-        redacted.append("<prompt>")
+        redacted.append("<prompt via stdin>" if cmd and cmd[-1] == "-" else "<prompt>")
     return redacted
 
 
@@ -616,6 +632,7 @@ def run_codex(
     fallback_model: str | None = None,
     panel_meta: dict[str, Any] | None = None,
     data_dir: Path | str | None = None,
+    stdin_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Execute Codex CLI via Popen, stream milestones to stderr, and capture telemetry."""
     env = build_exec_env()
@@ -644,7 +661,7 @@ def run_codex(
     popen_kwargs: dict[str, Any] = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
+        "stdin": subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
         "text": True,
         "encoding": "utf-8",
         "errors": "replace",
@@ -657,6 +674,7 @@ def run_codex(
         popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
     proc = subprocess.Popen(cmd, **popen_kwargs)
+    write_prompt_to_stdin(proc, stdin_prompt)
     if syncer is not None:
         syncer.state["pid"] = proc.pid
         syncer.write()
@@ -843,6 +861,11 @@ def run_codex(
     finally:
         if timer is not None:
             timer.cancel()
+        if proc.stdin is not None and not proc.stdin.closed:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
         if proc.stdout is not None:
             try:
                 proc.stdout.close()
@@ -1325,7 +1348,7 @@ def main() -> int:
             check_git=True,
             quiet=args.quiet,
         )
-        cmd.append(prompt_text)
+        cmd.append("-")
         has_prompt = True
     elif args.subcommand == "resume":
         prompt_text = read_prompt(args.prompt, args.prompt_file)
@@ -1360,7 +1383,7 @@ def main() -> int:
             cmd.append(args.session_id)
         else:
             raise ValueError("Provide a session_id or pass --last.")
-        cmd.append(prompt_text)
+        cmd.append("-")
         has_prompt = True
     elif args.subcommand == "review":
         cmd, meta = build_codex_command(
@@ -1396,7 +1419,7 @@ def main() -> int:
             cmd.extend(["--commit", args.commit])
         if args.prompt or args.prompt_file:
             prompt_text = read_prompt(args.prompt, args.prompt_file)
-            cmd.append(prompt_text)
+            cmd.append("-")
             has_prompt = True
     else:
         raise ValueError(f"Unsupported subcommand: {args.subcommand}")
@@ -1434,6 +1457,7 @@ def main() -> int:
         fallback_model=fallback_model,
         panel_meta=panel_meta,
         data_dir=data_dir,
+        stdin_prompt=prompt_text if has_prompt else None,
     )
     summary["config_mode"] = eff.get("config_mode")
     summary["provider"] = eff.get("provider")

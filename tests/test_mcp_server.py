@@ -29,6 +29,8 @@ for i, a in enumerate(args):
     if a == "-o" and i + 1 < len(args):
         out_file = Path(args[i + 1])
 prompt = args[-1] if args else ""
+if prompt == "-":
+    prompt = sys.stdin.read()
 if "SLEEP_LONG" in prompt:
     sleep_sec = 3.0
 
@@ -434,6 +436,30 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.assertEqual(waited["status"], "blocked")
         self.assertFalse(waited["ok"])
         self.assertIn("sandbox policy rejected shell", waited["error"])
+
+    def test_multiline_prompt_delivered_via_stdin(self) -> None:
+        multiline_prompt = "Line 1 header\nLine 2 BODY_OK\nLine 3 TAIL_MARKER"
+        started = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 50,
+                "method": "tools/call",
+                "params": {
+                    "name": "start_codex_task",
+                    "arguments": {"prompt": multiline_prompt, "cwd": str(self.workdir)},
+                },
+            }
+        )["result"]["structuredContent"]
+        waited = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "tools/call",
+                "params": {"name": "wait_codex_task", "arguments": {"run_id": started["run_id"], "timeout": 10}},
+            }
+        )["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "done")
+        self.assertIn("Line 2 BODY_OK", waited["result"]["summary"])
 
 
 if __name__ == "__main__":
