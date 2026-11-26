@@ -922,8 +922,8 @@ app.ontoolresult = (result) => {
     if (activeTab === "stats") void refreshStats();
     else if (activeTab === "models") void refreshWorkbenchConfig();
     else {
-      void refreshSubagentsData();
       if (targetId) void selectRun(targetId);
+      void refreshSubagentsData();
     }
     render();
     return;

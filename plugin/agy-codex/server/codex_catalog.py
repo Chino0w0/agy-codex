@@ -1132,6 +1132,7 @@ def collect_isolated_overrides(
                     if isinstance(mid, str) and isinstance(mdata, dict):
                         merged_mcps.setdefault(mid, {}).update(mdata)
 
+        active_forwarded_mcps: list[str] = []
         for mid in forwarded_mcps:
             mdata = merged_mcps.get(mid)
             if not isinstance(mdata, dict):
@@ -1139,11 +1140,11 @@ def collect_isolated_overrides(
                 continue
             if mdata.get("enabled") is False:
                 continue
+            active_forwarded_mcps.append(mid)
             m_prefix = f"mcp_servers.{to_toml_key(mid)}"
             for m_key in (
                 "command",
                 "url",
-                "type",
                 "cwd",
                 "enabled",
                 "startup_timeout_sec",
@@ -1168,6 +1169,10 @@ def collect_isolated_overrides(
                             overrides[
                                 f"{m_prefix}.{to_toml_key(m_map_key)}.{to_toml_key(sub_k)}"
                             ] = sub_v
+        if active_forwarded_mcps:
+            overrides["features.code_mode.direct_only_tool_namespaces"] = [
+                f"mcp__{mid}" for mid in active_forwarded_mcps
+            ]
 
     redacted_overrides = {
         k: redact_value_for_key(k, v)

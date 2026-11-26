@@ -584,6 +584,13 @@ class RunManager:
                                 "text": text.strip(),
                             },
                         )
+                elif itype == "mcp_tool_call":
+                    mcp_ev, obs_m, obs_e = codex_run.extract_mcp_tool_call_event(item)
+                    if obs_m:
+                        state.observed["model"] = obs_m
+                    if obs_e:
+                        state.observed["effort"] = obs_e
+                    self._append_event(state, mcp_ev)
             elif etype == "turn.completed":
                 u = evt.get("usage") or {}
                 if isinstance(u, dict):
@@ -861,8 +868,8 @@ TOOLS_DEF: list[dict[str, Any]] = [
         "title": "Start Codex Worker",
         "description": (
             "Start a bounded OpenAI Codex CLI worker asynchronously with whitelist config isolation "
-            "and render a live collapsible Codex timeline inline. Supports model, provider, extended effort, "
-            "role preset, and git worktree isolation. Returns run_id immediately."
+            "(no inline chat card; call open_codex_panel to open/update live progress in the right side pane). "
+            "Supports model, provider, extended effort, role preset, and git worktree isolation. Returns run_id immediately."
         ),
         "inputSchema": {
             "type": "object",
@@ -886,7 +893,6 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "timeout": {"type": "integer", "default": 600, "description": "Execution timeout in seconds."},
             },
         },
-        "_meta": {"ui": {"resourceUri": APP_URI}},
     },
     {
         "name": "wait_codex_task",
@@ -933,7 +939,11 @@ TOOLS_DEF: list[dict[str, Any]] = [
     {
         "name": "open_codex_panel",
         "title": "Agy Codex",
-        "description": "Open the Agy Codex 3-tab workbench (Subagents Monitor, Usage Stats, Models & Config) in the side pane or sidebar.",
+        "description": (
+            "Open or update the Agy Codex 3-tab workbench (Subagents Monitor, Usage Stats, Models & Config) "
+            "in the right side pane (aux_pane) instead of inline in chat. Call right after start_codex_task "
+            "with tab='subagents' and run_id to focus live execution."
+        ),
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
@@ -1196,8 +1206,9 @@ class McpServer:
                 (wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5)
             )
             summary["note"] = (
-                "Codex worker started with live inline progress viewer. "
-                "Call wait_codex_task or get_codex_task_status to collect results."
+                "Codex worker started. Call open_codex_panel(tab='subagents', run_id=...) once "
+                "to open or update live progress in the right side pane, then call wait_codex_task "
+                "or get_codex_task_status."
             )
             return self._tool_ok(summary)
 

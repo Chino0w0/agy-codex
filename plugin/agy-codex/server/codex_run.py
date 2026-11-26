@@ -318,6 +318,69 @@ def is_structured_handoff_text(text: str) -> bool:
     return isinstance(obj, dict) and {"status", "summary", "changed_files"}.issubset(obj.keys())
 
 
+def extract_mcp_tool_call_event(
+    item: dict[str, Any],
+) -> tuple[dict[str, Any], str | None, str | None]:
+    """Build normalized timeline command event and optional observed identity from `mcp_tool_call`."""
+    item_id = str(item.get("id") or "")
+    server_name = str(item.get("server") or "mcp")
+    tool_name = str(item.get("tool") or "")
+    label = f"mcp:{server_name}.{tool_name}" if tool_name else f"mcp:{server_name}"
+    status = str(item.get("status") or "")
+    err_obj = item.get("error")
+    res_obj = item.get("result")
+
+    out_parts: list[str] = []
+    obs_model: str | None = None
+    obs_effort: str | None = None
+
+    if isinstance(err_obj, dict):
+        msg = err_obj.get("message") or json.dumps(err_obj, ensure_ascii=False)
+        out_parts.append(str(msg))
+    elif err_obj:
+        out_parts.append(str(err_obj))
+
+    if isinstance(res_obj, dict):
+        content_list = res_obj.get("content")
+        if isinstance(content_list, list):
+            for block in content_list:
+                if not isinstance(block, dict):
+                    continue
+                txt = block.get("text")
+                if not isinstance(txt, str) or not txt.strip():
+                    continue
+                out_parts.append(txt.strip())
+                if tool_name == "get_runtime_identity":
+                    try:
+                        parsed = json.loads(txt)
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        m_val = parsed.get("model")
+                        e_val = parsed.get("reasoning_effort") or parsed.get("effort")
+                        if isinstance(m_val, str) and m_val.strip():
+                            obs_model = m_val.strip()
+                        if isinstance(e_val, str) and e_val.strip():
+                            obs_effort = e_val.strip()
+        if not out_parts and res_obj.get("structured_content") is not None:
+            out_parts.append(json.dumps(res_obj["structured_content"], ensure_ascii=False))
+    elif res_obj is not None:
+        out_parts.append(str(res_obj))
+
+    is_done = status in ("completed", "failed", "error") or res_obj is not None or err_obj is not None
+    exit_code: int | None = None if not is_done else (1 if (err_obj or status == "failed") else 0)
+    ev = {
+        "kind": "command",
+        "item_id": item_id,
+        "command": label,
+        "display_command": label,
+        "status": status,
+        "exit_code": exit_code,
+        "output": "\n".join(out_parts)[:4000],
+    }
+    return ev, obs_model, obs_effort
+
+
 def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
     """Redact potential secret `-c` values and prompt text before storing/displaying."""
     redacted: list[str] = []
@@ -699,6 +762,22 @@ def run_codex(
                                         }
                                     )
                                     syncer.write()
+                        elif itype == "mcp_tool_call":
+                            mcp_ev, obs_m, obs_e = extract_mcp_tool_call_event(item)
+                            if obs_m:
+                                observed_model = obs_m
+                            if obs_e:
+                                observed_effort = obs_e
+                            if etype == "item.started":
+                                emit_progress(quiet, f"mcp: {mcp_ev['display_command']}")
+                            else:
+                                emit_progress(
+                                    quiet,
+                                    f"mcp done (exit={mcp_ev['exit_code']}): {mcp_ev['display_command']}",
+                                )
+                            if syncer is not None:
+                                syncer.append_event(mcp_ev)
+                                syncer.write()
                         elif etype == "item.completed" and itype:
                             emit_progress(quiet, itype)
                     elif etype == "turn.completed":
