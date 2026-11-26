@@ -372,6 +372,67 @@ class TestMcpServerAndRunner(unittest.TestCase):
             self.assertIn("features.multi_agent=false", joined)
             self.assertIn("SUBAGENT ROLE DECLARATION", joined)
 
+    def test_strip_shell_wrapper_windows_paths_and_blocked_handoff(self) -> None:
+        self.assertEqual(
+            codex_run.strip_shell_wrapper(
+                '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "python --version"'
+            ),
+            "python --version",
+        )
+        self.assertEqual(
+            codex_run.strip_shell_wrapper('"C:\\windows\\system32\\bash.exe" -lc \'ls -la\''),
+            "ls -la",
+        )
+
+        wt_root = codex_run.get_worktree_root(self.data_dir)
+        self.assertEqual(wt_root, (self.data_dir / "worktrees").resolve())
+
+        blocked_py = self.root / "fake_blocked.py"
+        blocked_py.write_text(
+            '\n'.join(
+                [
+                    "import json, sys",
+                    "from pathlib import Path",
+                    "args = sys.argv[1:]",
+                    "out_file = next((Path(args[i+1]) for i, a in enumerate(args) if a == '-o' and i + 1 < len(args)), None)",
+                    'payload = {"status": "blocked", "summary": "sandbox policy rejected shell", "changed_files": [], "verification": [], "risks": [], "next_steps": []}',
+                    "if out_file: out_file.write_text(json.dumps(payload), encoding='utf-8')",
+                    'print(json.dumps({"type": "thread.started", "thread_id": "0199-blocked-1"}), flush=True)',
+                    'print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": json.dumps(payload)}}), flush=True)',
+                ]
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        if os.name == "nt":
+            blocked_bin = self.root / "fake_blocked.cmd"
+            blocked_bin.write_text(f'@echo off\r\n"{sys.executable}" "{blocked_py}" %*\r\n', encoding="utf-8")
+        else:
+            blocked_bin = self.root / "fake_blocked.sh"
+            blocked_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{blocked_py}" "$@"\n', encoding="utf-8")
+            blocked_bin.chmod(0o755)
+        os.environ["CODEX_BIN"] = str(blocked_bin)
+
+        started = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 40,
+                "method": "tools/call",
+                "params": {"name": "start_codex_task", "arguments": {"prompt": "check", "cwd": str(self.workdir)}},
+            }
+        )["result"]["structuredContent"]
+        waited = self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 41,
+                "method": "tools/call",
+                "params": {"name": "wait_codex_task", "arguments": {"run_id": started["run_id"], "timeout": 10}},
+            }
+        )["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "blocked")
+        self.assertFalse(waited["ok"])
+        self.assertIn("sandbox policy rejected shell", waited["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

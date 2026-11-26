@@ -331,6 +331,58 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertEqual(ov_dict["sandbox_workspace_write.network_access"], False)
         self.assertEqual(meta["redacted_overrides"]["windows.sandbox"], "unelevated")
 
+    def test_forwarded_mcp_servers_and_secret_redaction(self) -> None:
+        (self.codex_home / "config.toml").write_text(
+            '\n'.join(
+                [
+                    'model = "gpt-5.2-codex"',
+                    "",
+                    "[mcp_servers.fastctx]",
+                    'command = "C:/bin/fastctx.exe"',
+                    'args = ["serve", "--enable-shell"]',
+                    "",
+                    "[mcp_servers.fastctx.env]",
+                    'FASTCTX_BASH = "D:/Git/bin/bash.exe"',
+                    'API_KEY = "super-secret-fastctx-key"',
+                    "",
+                    "[mcp_servers.node_repl]",
+                    'command = "C:/bin/node_repl.exe"',
+                    "args = []",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        # Default: no MCP servers forwarded in isolated mode, but discovery lists them without env secrets
+        disc = codex_catalog.discover_models_and_config(self.codex_home, self.data_dir)
+        mcp_ids = {m["id"] for m in disc["mcp_servers"]}
+        self.assertEqual(mcp_ids, {"fastctx", "node_repl"})
+        self.assertNotIn("super-secret-fastctx-key", json.dumps(disc))
+
+        ov_def, _ = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
+        self.assertFalse(any(k.startswith("mcp_servers.") for k, _ in ov_def))
+
+        # Opt-in forward fastctx only
+        codex_catalog.save_workbench_config(
+            {"mapping": {"forwarded_mcp_servers": ["fastctx"]}}, self.data_dir
+        )
+        ov_fwd, meta_fwd = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
+        ov_dict = dict(ov_fwd)
+        self.assertEqual(ov_dict["mcp_servers.fastctx.command"], "C:/bin/fastctx.exe")
+        self.assertEqual(ov_dict["mcp_servers.fastctx.args"], ["serve", "--enable-shell"])
+        self.assertEqual(
+            codex_catalog.to_toml_literal(ov_dict["mcp_servers.fastctx.args"]),
+            '["serve", "--enable-shell"]',
+        )
+        self.assertEqual(ov_dict["mcp_servers.fastctx.env.FASTCTX_BASH"], "D:/Git/bin/bash.exe")
+        self.assertEqual(ov_dict["mcp_servers.fastctx.env.API_KEY"], "super-secret-fastctx-key")
+        self.assertFalse(any(k.startswith("mcp_servers.node_repl") for k in ov_dict))
+        self.assertNotIn("super-secret-fastctx-key", json.dumps(meta_fwd))
+        self.assertEqual(
+            meta_fwd["redacted_overrides"]["mcp_servers.fastctx.env.API_KEY"], "<redacted>"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

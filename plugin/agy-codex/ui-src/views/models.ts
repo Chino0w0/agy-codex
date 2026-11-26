@@ -148,6 +148,30 @@ export function renderModelsTab(st: ModelsViewState): string {
     </div>
 
     ${
+      (d.mcp_servers || []).length > 0
+        ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--color-border-primary,rgba(128,128,128,0.16))">
+            <div style="font-size:11.5px;color:var(--color-text-secondary,#8b949e);margin-bottom:6px">
+              隔离模式透传的 Codex MCP 工具 (<code>forwarded_mcp_servers</code>，默认全关以防桌面 MCP 阻塞)
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:8px">
+              ${(d.mcp_servers || [])
+                .map((m) => {
+                  const fwdSet = new Set(cfg.mapping.forwarded_mcp_servers || []);
+                  const isChecked = fwdSet.has(m.id);
+                  const hint = m.command || m.url || m.type;
+                  return `<label class="badge" style="display:inline-flex;align-items:center;gap:5px;cursor:pointer;padding:4px 8px" title="${escapeHtml(String(hint))}">
+                    <input type="checkbox" data-forward-mcp="${escapeHtml(m.id)}" ${isChecked ? "checked" : ""}/>
+                    <code>${escapeHtml(m.id)}</code>
+                    <span class="trace-meta">${escapeHtml(m.type)}${m.enabled ? "" : ", disabled"}</span>
+                  </label>`;
+                })
+                .join("")}
+            </div>
+          </div>`
+        : ""
+    }
+
+    ${
       st.preview
         ? `<div style="margin-top:8px">
             <div class="trace-meta">命令预览 (已自动脱敏):</div>

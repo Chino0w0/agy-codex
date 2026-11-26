@@ -35,11 +35,12 @@ DEFAULT_LOG_ROOT = Path(tempfile.gettempdir()) / "agy-codex-runs"
 DEFAULT_WORKTREE_ROOT = Path(tempfile.gettempdir()) / "agy-codex-worktrees"
 
 SHELL_WRAPPER_RE = re.compile(
-    r"^(?:"
-    r"(?:/opt/homebrew/bin/bash|/bin/bash|/bin/zsh|/usr/bin/env\s+\w+|bash|zsh)\s+-(?:l?c)"
-    r"|(?:pwsh(?:\.exe)?|powershell(?:\.exe)?)(?:\s+-\w+)*\s+-(?:c|Command)"
-    r"|(?:cmd(?:\.exe)?)\s+/c"
-    r")\s+(.*)$",
+    r'^(?:'
+    r'"?[^"\r\n]*?(?:bash|zsh)(?:\.exe)?"?\s+-(?:l?c)'
+    r'|/usr/bin/env\s+\w+\s+-(?:l?c)'
+    r'|"?[^"\r\n]*?(?:pwsh|powershell)(?:\.exe)?"?(?:\s+-\w+)*\s+-(?:c|Command)'
+    r'|"?[^"\r\n]*?cmd(?:\.exe)?"?\s+/c'
+    r')\s+(.*)$',
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -195,8 +196,19 @@ def get_git_root(path: Path) -> Path:
     return Path(res.stdout.strip()).resolve()
 
 
-def create_isolated_worktree(cwd: Path, name: str | None, run_id: str) -> dict[str, str]:
-    """Create a fresh Git worktree under `$TMPDIR/agy-codex-worktrees` from HEAD."""
+def get_worktree_root(data_dir: Path | str | None = None) -> Path:
+    """Resolve isolated Git worktree directory outside TEMP to avoid Windows split writable root conflicts."""
+    return (codex_catalog.get_plugin_data_dir(data_dir) / "worktrees").resolve()
+
+
+def create_isolated_worktree(
+    cwd: Path,
+    name: str | None,
+    run_id: str,
+    *,
+    data_dir: Path | str | None = None,
+) -> dict[str, str]:
+    """Create a fresh Git worktree under plugin_data/worktrees from HEAD using a canonical long path."""
     base_repo = get_git_root(cwd)
     head_check = run_git(base_repo, ["rev-parse", "--verify", "HEAD"], timeout=5)
     if head_check.returncode != 0:
@@ -210,8 +222,9 @@ def create_isolated_worktree(cwd: Path, name: str | None, run_id: str) -> dict[s
             f"Invalid worktree name {slug!r}. Use only letters, digits, '.', '_', or '-'."
         )
 
-    DEFAULT_WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
-    wt_path = DEFAULT_WORKTREE_ROOT / slug
+    wt_root = get_worktree_root(data_dir)
+    wt_root.mkdir(parents=True, exist_ok=True)
+    wt_path = (wt_root / slug).resolve()
     branch = f"codex/{slug}"
 
     if wt_path.exists():
@@ -787,13 +800,39 @@ def run_codex(
     obs_effort = observed_effort or fallback["effort"]
     resolved_model = obs_model or fallback_model
 
+    handoff_status = parsed_result.get("status") if isinstance(parsed_result, dict) else None
+    handoff_summary = (
+        codex_catalog._clean_optional_str(parsed_result.get("summary"))
+        if isinstance(parsed_result, dict)
+        else None
+    )
+
     if syncer is not None:
         cancelled = syncer.was_cancelled_externally()
-        final_status = (
-            "cancelled"
-            if cancelled
-            else ("done" if (exit_code == 0 and not timed_out) else "error")
-        )
+        if cancelled:
+            final_status = "cancelled"
+        elif timed_out or exit_code != 0:
+            final_status = "error"
+        elif handoff_status == "blocked":
+            final_status = "blocked"
+        elif handoff_status == "failed":
+            final_status = "error"
+        else:
+            final_status = "done"
+
+        err_msg: str | None = None
+        if final_status == "cancelled":
+            err_msg = "Cancelled by user."
+        elif final_status == "blocked":
+            err_msg = syncer.state.get("error") or handoff_summary or "Worker reported status=blocked."
+        elif final_status == "error":
+            if timed_out:
+                err_msg = f"Timed out after {timeout}s"
+            elif exit_code != 0:
+                err_msg = syncer.state.get("error") or f"codex exited with code {exit_code}"
+            else:
+                err_msg = syncer.state.get("error") or handoff_summary or "Worker reported status=failed."
+
         syncer.state.update(
             {
                 "pid": None,
@@ -809,25 +848,23 @@ def run_codex(
                 "tokens_used": resolved_tokens,
                 "usage": dict(usage_totals) if saw_usage else None,
                 "result": parsed_result,
-                "error": (
-                    "Cancelled by user."
-                    if cancelled
-                    else (
-                        f"Timed out after {timeout}s"
-                        if timed_out
-                        else (
-                            None
-                            if exit_code == 0
-                            else (syncer.state.get("error") or f"codex exited with code {exit_code}")
-                        )
-                    )
-                ),
+                "error": err_msg,
             }
         )
         syncer.write()
+    else:
+        if timed_out or exit_code != 0:
+            final_status = "error"
+        elif handoff_status == "blocked":
+            final_status = "blocked"
+        elif handoff_status == "failed":
+            final_status = "error"
+        else:
+            final_status = "done"
 
     summary: dict[str, Any] = {
-        "ok": exit_code == 0 and not timed_out,
+        "ok": final_status == "done",
+        "status": final_status,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "duration_sec": duration_sec,
@@ -1170,7 +1207,7 @@ def main() -> int:
     cwd = initial_cwd
     if args.subcommand == "exec" and args.worktree is not None:
         worktree_info = create_isolated_worktree(
-            initial_cwd, args.worktree if args.worktree else None, run_id
+            initial_cwd, args.worktree if args.worktree else None, run_id, data_dir=data_dir
         )
         cwd = Path(worktree_info["path"])
         emit_progress(

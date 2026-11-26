@@ -31,7 +31,9 @@ SUBAGENT_ROLE_PREFIX = (
     "(`spawn_agent`, `multi_agent`), or delegate to child agents DO NOT APPLY to you. "
     "Execute this task directly yourself with zero nested subagent spawning. "
     "If an optional MCP tool referenced in AGENTS.md (such as `fastctx` or `runtime_identity`) is unavailable in this session, "
-    "silently use built-in tools without wasting turns searching for missing tools."
+    "silently use built-in tools without wasting turns searching for missing tools. "
+    "On Windows inside a restricted sandbox, if Git Bash or WSL bash.exe fails with signal-pipe or access errors, "
+    "use native PowerShell (pwsh) or Python directly (or any forwarded file/search MCP tools available in this session)."
 )
 
 NESTED_SUBAGENT_PREFIX = (
@@ -145,6 +147,7 @@ DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
         "effort_policy": "clamp_with_warning",  # clamp_with_warning | passthrough
         "context_window_policy": "same_model_only",  # same_model_only | always_forward | never_forward
         "extra_whitelist_keys": [],
+        "forwarded_mcp_servers": [],
         "allow_nested_subagents": False,
         "max_concurrent_runs": 5,
     },
@@ -208,14 +211,16 @@ def to_toml_key(key: str) -> str:
 
 
 def to_toml_literal(value: Any) -> str:
-    """Serialize a Python scalar into a valid TOML literal string."""
+    """Serialize a Python scalar or list into a valid TOML literal string."""
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
         return json.dumps(value, ensure_ascii=False)
-    raise TypeError(f"Unsupported TOML scalar type: {type(value).__name__}")
+    if isinstance(value, list):
+        return "[" + ", ".join(to_toml_literal(item) for item in value) + "]"
+    raise TypeError(f"Unsupported TOML literal type: {type(value).__name__}")
 
 
 def is_sensitive_key(key_path: str) -> bool:
@@ -302,15 +307,16 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
         cwp = _clean_optional_str(raw_mapping.get("context_window_policy"))
         if cwp in ("same_model_only", "always_forward", "never_forward"):
             cfg["mapping"]["context_window_policy"] = cwp
-        raw_extra = raw_mapping.get("extra_whitelist_keys")
-        if isinstance(raw_extra, list):
-            cleaned_extra: list[str] = []
-            for k in raw_extra:
-                if isinstance(k, str):
-                    ks = k.strip()
-                    if ks and EXTRA_KEY_RE.match(ks) and ks not in cleaned_extra:
-                        cleaned_extra.append(ks)
-            cfg["mapping"]["extra_whitelist_keys"] = cleaned_extra
+        for field_key in ("extra_whitelist_keys", "forwarded_mcp_servers"):
+            raw_list = raw_mapping.get(field_key)
+            if isinstance(raw_list, list):
+                cleaned_list: list[str] = []
+                for k in raw_list:
+                    if isinstance(k, str):
+                        ks = k.strip()
+                        if ks and EXTRA_KEY_RE.match(ks) and ks not in cleaned_list:
+                            cleaned_list.append(ks)
+                cfg["mapping"][field_key] = cleaned_list
         if "allow_nested_subagents" in raw_mapping:
             cfg["mapping"]["allow_nested_subagents"] = bool(raw_mapping.get("allow_nested_subagents"))
         if "max_concurrent_runs" in raw_mapping:
@@ -459,9 +465,13 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
         raise ValueError(
             f"Invalid context_window_policy: {raw_mapping.get('context_window_policy')!r}"
         )
-    for extra_k in raw_mapping.get("extra_whitelist_keys") or []:
-        if not isinstance(extra_k, str) or not EXTRA_KEY_RE.match(extra_k.strip()):
-            raise ValueError(f"Invalid extra whitelist key: {extra_k!r}")
+    for field_key, label in (
+        ("extra_whitelist_keys", "extra whitelist key"),
+        ("forwarded_mcp_servers", "forwarded_mcp_servers entry"),
+    ):
+        for item_k in raw_mapping.get(field_key) or []:
+            if not isinstance(item_k, str) or not EXTRA_KEY_RE.match(item_k.strip()):
+                raise ValueError(f"Invalid {label}: {item_k!r}")
 
     normalized = _normalize_workbench_config(merged)
     ddir = get_plugin_data_dir(data_dir)
@@ -616,6 +626,40 @@ def _collect_providers(
     return out
 
 
+def _collect_mcp_servers(
+    base_cfg: dict[str, Any],
+    worker_cfg: dict[str, Any],
+    forwarded_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Collect configured `[mcp_servers.*]` entries without exposing env/headers secrets."""
+    merged: dict[str, dict[str, Any]] = {}
+    for cfg in (base_cfg, worker_cfg):
+        mcps = cfg.get("mcp_servers")
+        if not isinstance(mcps, dict):
+            continue
+        for mid, mdata in mcps.items():
+            if not isinstance(mid, str) or not isinstance(mdata, dict):
+                continue
+            entry = merged.setdefault(mid, {})
+            entry.update(mdata)
+
+    forwarded_set = set(forwarded_ids or [])
+    out: list[dict[str, Any]] = []
+    for mid, mdata in merged.items():
+        url = _clean_optional_str(mdata.get("url"))
+        out.append(
+            {
+                "id": mid,
+                "type": _clean_optional_str(mdata.get("type")) or ("http" if url else "stdio"),
+                "command": _clean_optional_str(mdata.get("command")),
+                "url": url,
+                "enabled": bool(mdata.get("enabled", True)),
+                "forwarded": mid in forwarded_set,
+            }
+        )
+    return out
+
+
 def _collect_all_models(
     codex_home: Path,
     base_cfg: dict[str, Any],
@@ -721,6 +765,9 @@ def discover_models_and_config(
     resolved = resolve_effective_run_config(chome, ddir)
     effective_defaults = resolved["effective"]
     providers = _collect_providers(base_cfg, worker_cfg, effective_defaults.get("provider"))
+    mcp_servers = _collect_mcp_servers(
+        base_cfg, worker_cfg, (wb_cfg.get("mapping") or {}).get("forwarded_mcp_servers") or []
+    )
 
     visible_count = sum(1 for m in all_models if m.get("visibility") != "hide")
     hidden_count = len(all_models) - visible_count
@@ -747,6 +794,7 @@ def discover_models_and_config(
         "hidden_models_count": hidden_count,
         "excluded_models": wb_cfg.get("excluded_models", []),
         "providers": providers,
+        "mcp_servers": mcp_servers,
         "presets": wb_cfg.get("presets", {}),
         "max_concurrent_runs": (wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5),
         "catalog_mode": (wb_cfg.get("mapping") or {}).get("catalog_mode", "auto"),
@@ -1072,6 +1120,54 @@ def collect_isolated_overrides(
                     overrides[f"shell_environment_policy.set.{to_toml_key(e_key)}"] = e_val
                     if e_key not in env_policy_keys:
                         env_policy_keys.append(e_key)
+
+    # Selectively forwarded [mcp_servers.*] entries (opt-in; empty by default)
+    forwarded_mcps = mapping.get("forwarded_mcp_servers") or []
+    if forwarded_mcps:
+        merged_mcps: dict[str, dict[str, Any]] = {}
+        for src in (base_cfg, worker_cfg):
+            mcps = src.get("mcp_servers")
+            if isinstance(mcps, dict):
+                for mid, mdata in mcps.items():
+                    if isinstance(mid, str) and isinstance(mdata, dict):
+                        merged_mcps.setdefault(mid, {}).update(mdata)
+
+        for mid in forwarded_mcps:
+            mdata = merged_mcps.get(mid)
+            if not isinstance(mdata, dict):
+                warnings.append(f"forwarded_mcp_servers entry {mid!r} not found in config.toml")
+                continue
+            if mdata.get("enabled") is False:
+                continue
+            m_prefix = f"mcp_servers.{to_toml_key(mid)}"
+            for m_key in (
+                "command",
+                "url",
+                "type",
+                "cwd",
+                "enabled",
+                "startup_timeout_sec",
+                "tool_timeout_sec",
+                "bearer_token_env_var",
+                "default_tools_approval_mode",
+            ):
+                m_val = mdata.get(m_key)
+                if isinstance(m_val, (str, bool, int, float)):
+                    overrides[f"{m_prefix}.{to_toml_key(m_key)}"] = m_val
+            for m_list_key in ("args", "env_vars", "enabled_tools", "disabled_tools"):
+                m_list = mdata.get(m_list_key)
+                if isinstance(m_list, list) and all(
+                    isinstance(x, (str, bool, int, float)) for x in m_list
+                ):
+                    overrides[f"{m_prefix}.{to_toml_key(m_list_key)}"] = list(m_list)
+            for m_map_key in ("env", "http_headers", "env_http_headers"):
+                m_map = mdata.get(m_map_key)
+                if isinstance(m_map, dict):
+                    for sub_k, sub_v in m_map.items():
+                        if isinstance(sub_k, str) and isinstance(sub_v, (str, bool, int, float)):
+                            overrides[
+                                f"{m_prefix}.{to_toml_key(m_map_key)}.{to_toml_key(sub_k)}"
+                            ] = sub_v
 
     redacted_overrides = {
         k: redact_value_for_key(k, v)

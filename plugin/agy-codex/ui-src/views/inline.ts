@@ -147,9 +147,11 @@ export function renderRunTraceShell(
       ? `运行中 ${formatDuration(elapsedSec)}`
       : run.status === "done"
         ? `用时 ${formatDuration(elapsedSec)}`
-        : run.status === "cancelled"
-          ? `已取消 (${formatDuration(elapsedSec)})`
-          : `执行失败 (${formatDuration(elapsedSec)})`;
+        : run.status === "blocked"
+          ? `已阻塞 (${formatDuration(elapsedSec)})`
+          : run.status === "cancelled"
+            ? `已取消 (${formatDuration(elapsedSec)})`
+            : `执行失败 (${formatDuration(elapsedSec)})`;
 
   const statusDot =
     run.status === "running"
@@ -181,6 +183,11 @@ export function renderRunTraceShell(
       ? `<div class="banner-warn" style="margin-bottom:6px">${run.warnings.map((w) => escapeHtml(w)).join("<br/>")}</div>`
       : "";
 
+  const hasObserved = Boolean(run.observed?.model || run.observed?.effort);
+  const observedText = hasObserved
+    ? `${escapeHtml(run.observed?.model || "未知")}/${escapeHtml(run.observed?.effort || "未知")}`
+    : "CLI --json 未回传";
+
   const identityLine =
     run.requested || run.observed
       ? `<div class="trace-meta" style="margin-bottom:4px">
@@ -188,7 +195,7 @@ export function renderRunTraceShell(
           <span>·</span>
           <span>生效: ${escapeHtml(run.effective?.model || run.model || "默认")}/${escapeHtml(run.effective?.effort || run.effort || "默认")}</span>
           <span>·</span>
-          <span>实测: ${escapeHtml(run.observed?.model || "未知")}/${escapeHtml(run.observed?.effort || "未知")}</span>
+          <span>实测: ${observedText}</span>
         </div>`
       : "";
 

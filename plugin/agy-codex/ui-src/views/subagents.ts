@@ -29,7 +29,7 @@ export interface SubagentsViewState {
 function statusColor(status: string): string {
   if (status === "running") return "var(--color-text-info,#58a6ff)";
   if (status === "done") return "var(--color-text-success,#3fb950)";
-  if (status === "cancelled") return "var(--color-text-warning,#d29922)";
+  if (status === "cancelled" || status === "blocked") return "var(--color-text-warning,#d29922)";
   return "var(--color-text-danger,#f85149)";
 }
 
