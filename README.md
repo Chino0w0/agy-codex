@@ -4,28 +4,29 @@
 
 **Antigravity 2.0 ↔ OpenAI Codex CLI 原生多模型子 Agent 协同与监控工作台插件。**
 
-> 本项目 Fork 自 [Silhouette-my/codex-in-anti](https://github.com/Silhouette-my/codex-in-anti)（保留 MIT 协议与上游版权声明），在其白名单隔离与 MCP App 架构基础上，面向所有 Codex 用户升级为一体化 Antigravity 原生插件：**支持 `model_catalog_json` 与原生模型双模发现、全推理档位与多 Provider 委派、常驻子 Agent 编排规范、以及融合本机全量 Codex 数据的三视图原生工作台**。
+> 本项目 Fork 自 [Silhouette-my/codex-in-anti](https://github.com/Silhouette-my/codex-in-anti)（保留 MIT 协议与上游版权声明），在其白名单隔离与 MCP App 架构基础上，升级为**通用开箱即用**的一体化 Antigravity 原生插件：**四源灵活模型映射、全推理档位与多 Provider 委派、滚动并行子 Agent 编排、以及融合本机全量 Codex 数据的三视图原生工作台**。
 
 ---
 
-## 为什么做 Agy Codex？
+## 核心特性
 
-让 **Antigravity** 专注于架构规划、任务拆解、Code Review 与最终验收，把你本地 **Codex CLI** 里的任意指定模型变成高效、低开销、可观测的外部子 Agent：
+让 **Antigravity** 担任架构规划、任务拆解、Code Review 与最终验收者，将本机 **Codex CLI** 中任意指定模型作为高效、低开销、可观测的外部子 Agent：
 
-- **自定义目录与原生模型全兼容（开箱即用）**：
-  - 默认 `isolated` 白名单隔离模式（`--ignore-user-config`）跳过桌面端重型插件、MCP、Hooks 与 Memories，只精准透传当前模型、Provider、代理以及 `model_catalog_json`（自动解析相对路径）、上下文窗口等关键配置；
-  - **无需定制即可适用于所有用户**：有 `model_catalog_json` 时自动识别全部自定义模型与支持档位；没有 catalog 时自动平滑降级为原生 Codex 模式，直接兼容官方账号与任意第三方 OpenAI 兼容网关；
-  - 完整支持 `none / minimal / low / medium / high / xhigh / max / ultra` 及任意自定义推理档位，并支持单次任务动态切换 `model`、`provider` 或角色预设（`coding / review / debug / fast`）。
+- **四源灵活模型映射（通用兼容，不绑死 `model_catalog_json`）**：
+  - 按 `custom_models`（面板自定义） > `model_catalog_json`（自动/自定义/禁用可配） > `~/.codex/models_cache.json` > `config.toml` 自动合并模型，且全局支持手输任意模型名；
+  - 默认 `isolated` 白名单隔离模式（`--ignore-user-config`）跳过桌面端重型插件、MCP、Hooks 与 Memories，精准透传模型、Provider、代理、Windows 沙箱（`[windows]` / `[sandbox_workspace_write]` / `allow_login_shell`）以及用户指定的 `extra_whitelist_keys`；
+  - 面板与配置文件支持自由调整 **`catalog_mode`**（`auto`/`custom`/`off`）、**`effort_policy`**（`clamp_with_warning` 自动降级 / `passthrough` 原样透传）、**`context_window_policy`**（`same_model_only` / `always_forward` / `never_forward`）与 **`excluded_models`** 排除清单；
+  - 支持全范围推理档位（`none / minimal / low / medium / high / xhigh / max / ultra` 及任意自定义档位）与单次任务动态切换 `model`、`provider` 或角色预设。
+- **高效子 Agent 编排与跨模型协同**：
+  - 完整 MCP 工具集：`list_codex_models`、`start_codex_task`、`get_codex_task_status`、`wait_codex_task`（支持 `run_ids` + `wait_mode="any"|"all"` 滚动并行验收，等待超时不误判失败）、`stop_codex_task`（Windows `taskkill /T /F` 彻底清理进程树）与 `open_codex_panel`；
+  - 全程严格区分 `requested`（请求）/ `effective`（生效）/ `observed`（实测）三态模型身份；
+  - 内置精简常驻 `rules/AGENTS.md` + 3 个按需披露 Skill（`codex-dispatch`、`codex-parallel-worktree`、`codex-second-opinion`）与 6 套可定制角色预设（`explore` / `coding` / `frontend` / `review` / `debug` / `fast`）。
 - **类 Agy Powertools 的原生三视图工作台（零客户端注入、升级不失效）**：
-  - 基于 Antigravity 官方 **MCP App** 三大原生入口（**左侧边栏全屏页** + **右侧分屏面板** + **对话内联实时卡片**），**不做 Electron CDP 注入**，与 `agy-powertools` 完全和平共处、Antigravity 客户端怎么升级都不会失效；
-  - **子 Agent 监控台**：多任务与并行 Worktree 实时进度、可折叠过程树、一键停止（彻底清理子进程树）、点击文件在 Antigravity 侧栏直开 Review；
-  - **用量统计看板**：融合 Antigravity 派发任务与本机 `~/.codex` 全量会话（只读解析 SQLite + 增量缓存），展示任务/会话数、成功率、总 Token、缓存命中率、每日趋势、模型/Provider/档位分布与 Codex 子线程树（不做费用估算，专注研发效率数据）；
-  - **模型与配置中心**：可搜索浏览全部模型与支持档位，一键切换默认 Worker 模型、Provider、推理档位与角色预设，内置 `doctor` 环境体检，绝不修改 `~/.codex/config.toml`。
-- **内置高效率协同规则与 Skills**：
-  - 精简常驻 `rules/AGENTS.md` + 3 个按需披露的专业 Skill（`codex-dispatch`、`codex-parallel-worktree`、`codex-second-opinion`），规范模型发现、文件独占、并行 Worktree 编排与跨模型交叉审查。
-- **零门槛部署**：纯 Python 3.10+ 标准库 + 预打包单文件前端 UI，终端用户**无需安装 Node.js**、无需管理员权限。
-
-> **当前状态**：已完成仓库创建、中英文文档与完整设计规范（[设计文档](docs/superpowers/specs/2026-11-26-agy-codex-design.md)），核心代码改造待方案确认后立即实施。
+  - 基于 Antigravity 官方 **MCP App** 原生入口（左侧边栏全屏页 + 右侧分屏 + 对话内联实时卡片），不做 CDP 页面注入，与 `agy-powertools` 完全和平共处；
+  - **子 Agent 监控台**：活跃槽位指示（`max_concurrent_runs`）、实时可折叠过程树、Worktree 分支与一键清理命令、点击文件在侧栏直开、发送复核/挂载上下文，以及本机 Codex 会话上下文占比条与子线程派生树；
+  - **用量统计看板**：融合 Antigravity 派发任务与本机 `~/.codex` 全量会话（只读解析 `state_*.sqlite` + 尾部 JSONL 增量缓存），支持范围/时间筛选，展示总 Token、缓存命中率、每日趋势、模型/Provider/档位分布与报错复制（不做费用估算）；
+  - **模型与配置中心**：可视化调节全部映射策略、角色预设、自定义模型、排除列表，支持一键 **Dry-Run 命令行预览**（敏感凭据全脱敏）与 `doctor` 健康体检。
+- **零门槛部署**：纯 Python 3.10+ 标准库 + 预打包单文件 `assets/app.html`，终端用户**无需安装 Node.js**、无需管理员权限。
 
 ---
 
@@ -41,8 +42,6 @@
 
 ### 方式一：复制提示词交给 Agent 自动安装（推荐）
 
-直接把下面这段话发给 Antigravity 或其他可执行本地命令的 Agent：
-
 > 请帮我安装 Agy Codex：https://github.com/Chino0w0/agy-codex 。先阅读 README.md 和 docs/INSTALL_AGENT.md，使用项目自带的跨平台安装脚本完成安装并运行环境自检（doctor），保留我现有的其他插件、Codex 配置与聊天记录，不要强制退出当前客户端。安装完成后告诉我自检结果和生效方式。
 
 详细步骤见 [Agent 安装指南](docs/INSTALL_AGENT.md)。
@@ -55,7 +54,6 @@ git clone https://github.com/Chino0w0/agy-codex.git
 cd agy-codex
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 ```
-（本机已有 `python` 时也可直接运行 `python install.py`。）
 
 #### macOS / Linux
 ```bash
@@ -63,14 +61,24 @@ git clone https://github.com/Chino0w0/agy-codex.git
 cd agy-codex
 sh ./install.sh
 ```
-（或直接运行 `python3 install.py`。）
+
+### CLI 工具命令（安装后立即可用）
+
+```bash
+# 环境体检
+python ~/.gemini/config/plugins/agy-codex/server/codex_run.py doctor
+
+# 查看已发现的模型、Provider 与预设（加 --include-hidden 显示隐藏模型）
+python ~/.gemini/config/plugins/agy-codex/server/codex_run.py models
+
+# 干跑预览实际生成的脱敏命令行与告警
+python ~/.gemini/config/plugins/agy-codex/server/codex_run.py preview --preset debug
+```
 
 ### 卸载
 
-在项目目录执行对应卸载脚本即可移除插件目录（默认保留其他所有插件与 `~/.codex/config.toml`，加 `--keep-data` 可保留统计缓存与角色预设）：
-
 ```powershell
-# Windows
+# Windows（保留配置与历史可加 --keep-data）
 powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
@@ -81,11 +89,39 @@ sh ./uninstall.sh
 
 ---
 
-## 架构文档与路线图
+## 目录结构
 
-完整的模块设计、MCP 工具协议清单、双模目录解析策略、只读 SQLite 统计融合方案与前端工作台规划，请参阅：
-
-- [docs/superpowers/specs/2026-11-26-agy-codex-design.md](docs/superpowers/specs/2026-11-26-agy-codex-design.md)
+```text
+agy-codex/
+├── docs/
+│   ├── INSTALL_AGENT.md                        # Agent 自动安装指南
+│   └── superpowers/specs/                      # 架构设计文档
+├── install.py / install.ps1 / install.sh       # 跨平台统一安装器
+├── uninstall.py / uninstall.ps1 / uninstall.sh # 跨平台统一卸载器
+├── profiles/
+│   └── worker.config.toml                      # Codex CLI Worker 轻量配置模板
+├── plugin/
+│   └── agy-codex/                              # Antigravity 一体化原生插件
+│       ├── plugin.json                         # 插件元数据
+│       ├── mcp_config.json                     # MCP Server 配置
+│       ├── assets/
+│       │   ├── app.html                        # 预构建单文件 MCP App 前端 UI
+│       │   └── logo.svg                        # 插件图标
+│       ├── rules/
+│       │   └── AGENTS.md                       # 常驻路由与子 Agent 编排规范
+│       ├── skills/
+│       │   ├── codex-dispatch/SKILL.md         # 单任务精准委派与模型路由
+│       │   ├── codex-parallel-worktree/SKILL.md# 多分支并行 Worktree 滚动验收
+│       │   └── codex-second-opinion/SKILL.md   # 跨模型独立审查与会诊
+│       ├── server/
+│       │   ├── mcp_server.py                   # 零依赖 Python MCP App 服务端
+│       │   ├── codex_run.py                    # 封装执行器 + doctor/models/preview CLI
+│       │   ├── codex_catalog.py                # 四源模型目录、预设与安全白名单引擎
+│       │   ├── codex_telemetry.py              # 本地 SQLite/JSONL 只读统计融合引擎
+│       │   └── handoff_schema.json             # 结构化交付 JSON Schema
+│       └── ui-src/                             # 前端 TypeScript 源码（仅二次开发打包用）
+└── tests/                                      # Python unittest 自动化测试套件
+```
 
 ---
 

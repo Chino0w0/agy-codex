@@ -1,6 +1,6 @@
 {
-  "name": "codex-in-anti-ui",
-  "version": "0.2.0",
+  "name": "agy-codex-ui",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "scripts": {

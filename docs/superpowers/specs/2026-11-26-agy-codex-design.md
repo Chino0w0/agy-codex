@@ -3,7 +3,7 @@
 - **项目名称**：`Agy Codex`（插件 ID / 仓库名：`agy-codex`）
 - **仓库地址**：`https://github.com/Chino0w0/agy-codex`（Fork 自 `Silhouette-my/codex-in-anti`，MIT 协议）
 - **日期**：2026-11-26
-- **状态**：待用户审批（审批通过后再进入实施计划与编码阶段）
+- **状态**：已审批并按最新需求细化，实施中
 
 ---
 
@@ -98,29 +98,43 @@ flowchart LR
 4. 本次调用指定的 `preset`（角色预设中的非空字段）
 5. 本次调用显式传入的参数（`model`、`provider`、`effort`、`mode`、`config_mode`）
 
-> 关键说明：`worker.config.toml` 默认模板中**不再硬覆盖 `model_reasoning_effort = "medium"` 导致屏蔽用户原有习惯**——未在 `workbench-config.json` / `preset` / 单次参数指定 `effort` 时，遵循 `config.toml` 的 `model_reasoning_effort`（若均未配置再回退 `"medium"`）。
+> 关键说明：`worker.config.toml` 默认模板中**不再硬覆盖 `model_reasoning_effort = "medium"` 导致屏蔽用户原有习惯**——未在 `workbench-config.json` / `preset` / 单次参数指定 `effort` 时，遵循 `config.toml` 的 `model_reasoning_effort`（若均未配置再回退 `"medium"`）。每次任务均完整追踪 `requested`（入参）、`effective`（最终解析下发参数）与 `observed`（实际运行输出中观测到的模型/档位，无观测即留空不猜测）三态身份。
 
-#### 5.1.2 `isolated` 白名单完整字段
+#### 5.1.2 `isolated` 白名单完整字段与用户可控映射策略（`mapping`）
 - **标量字段**：`model`、`model_provider`、`model_reasoning_effort`、`model_reasoning_summary`、`model_context_window`、`model_auto_compact_token_limit`、`model_catalog_json`、`service_tier`、`personality`、`tool_output_token_limit`、`developer_instructions`。
 - **相对路径 `model_catalog_json` 自动绝对化**：如果 `model_catalog_json` 为相对路径（如 `"models-catelog.local.json"`），在注入 `-c model_catalog_json="..."` 前必须解析为 `(codex_home / raw_value).resolve()`，避免 `codex exec -C <repo>` 切换目录后相对路径失效。若解析后的文件不存在，则发出非致命告警并跳过注入该键，防止阻断执行。
+- **用户可编辑的映射策略（`${PLUGIN_DATA}/workbench-config.json` 的 `mapping` 字段及 Tab 3 面板）**：
+  - `catalog_mode`：`auto`（默认按 `config.toml` / `worker.config.toml` 透传存在的 `model_catalog_json`）| `custom`（使用用户指定的 `catalog_path_override`）| `off`（禁用 `model_catalog_json` 注入）。
+  - `catalog_path_override`：可选自定义 catalog JSON 路径（相对路径按 `CODEX_HOME` 解析）。
+  - `effort_policy`：`clamp_with_warning`（默认：仅当目标模型在目录/缓存/自定义模型中声明了非空 `supported_reasoning_levels` 且请求档位不在其中时，平滑收敛并告警）| `passthrough`（原样透传请求档位，不做收敛）。
+  - `context_window_policy`：`same_model_only`（默认：仅当有效模型与 `config.toml` 默认模型一致时透传 `model_context_window` 与 `model_auto_compact_token_limit`）| `always_forward` | `never_forward`。
+  - `extra_whitelist_keys`：用户自定义额外透传的 `config.toml` 顶层标量键列表（例如自定义网关/实验开关字段）。
+  - `allow_nested_subagents`：布尔值（默认 `false`；关闭时注入 `agents.enabled = false` 保持单层有界 Worker，开启时允许 Codex 内部使用其子线程能力）。
+  - `max_concurrent_runs`：并行并发槽位上限参考值（默认 `5`，范围 `1..20`）。
 - **Provider 表透传**：根据最终生效的 `model_provider` 合并 `config.toml` 与 `worker.config.toml` 中的 `model_providers.<provider>`：
   - 透传全部标量字段（`name`、`base_url`、`wire_api`、`requires_openai_auth`、`env_key`、`supports_websockets`、`experimental_bearer_token` 等）；
   - 透传安全的一层嵌套字符串映射表（`http_headers`、`env_http_headers`、`query_params`），序列化为 `-c model_providers.<p>.<table_key>.<entry_key>="..."`。
-- **安全脱敏**：`sanitize_command_for_meta()`、`doctor`、`list_codex_models`、`get_workbench_config` 对所有匹配凭据规则的字段统一脱敏为 `<redacted>`（白名单豁免非敏感数值/布尔字段如 `tool_output_token_limit`、`requires_openai_auth`）。
-- **推理档位校验**：支持标准集合 `none / minimal / low / medium / high / xhigh / max / ultra` 及任意合法自定义标识符（`^[a-zA-Z0-9_-]+$`），彻底解除原版 `low|medium|high` 限制。
+- **安全脱敏**：`sanitize_command_for_meta()`、`doctor`、`preview`、`list_codex_models`、`get_workbench_config` 对所有匹配凭据规则的字段统一脱敏为 `<redacted>`（白名单豁免非敏感字段如 `tool_output_token_limit`、`model_auto_compact_token_limit`、`requires_openai_auth`、`env_key`）。
+- **推理档位校验**：支持标准集合 `none / minimal / low / medium / high / xhigh / max / ultra` 及任意合法自定义标识符（`^[A-Za-z0-9_-]{1,32}$`），彻底解除原版 `low|medium|high` 限制。
 
-#### 5.1.3 双模模型发现（`discover_models_and_config`）
-- 若存在有效的 `model_catalog_json`（兼容 `{"models": [...]}` 与顶层列表 `[...]`），提取每条模型的：`slug`（回退 `id`）、`display_name`、`default_reasoning_level`、`supported_reasoning_levels`（兼容对象数组与字符串数组）、`context_window`、`provider`。
-- 若未配置 `model_catalog_json`，自动进入 `catalog_mode = "native"`：返回当前生效默认模型、全部已配置 Provider（脱敏后）、历史使用过的模型列表（可选来自近期运行记录）以及标准档位列表；允许传入任意 `model` 字符串。
+#### 5.1.3 四源自适应模型发现与排除清单（`discover_models_and_config`）
+按以下优先级合并去重（按 `slug`），任意源缺失均优雅降级，且全局支持手输任意模型名：
+1. **用户自定义模型（`custom_models`）**：在 `workbench-config.json` / Tab 3 面板手动登记的模型条目（适合无 `model_catalog_json` 的中转/自定义用户指定模型、Provider 与支持档位）。
+2. **`model_catalog_json`**：当前生效的本地目录文件（兼容 `{"models": [...]}` 与顶层数组 `[...]`）。
+3. **官方 CLI 模型缓存（`~/.codex/models_cache.json`）**：未配置自定义 catalog 的官方账号/普通用户也能直接获得完整模型列表、上下文窗口与支持档位。
+4. **`config.toml` / `worker.config.toml` 声明模型**：确保配置中的默认 `model` 始终可见。
+- **排除清单（`excluded_models`）**：用户可在面板配置保留在目录中但不作为默认/自动派发/重试/回退候选的模型列表；请求调用时发出非致命提醒而不强行阻断。
 
 #### 5.1.4 通用内置角色预设（`workbench-config.json`）
-首次启动自动初始化以下 4 套开箱预设（均可在「模型与配置」面板修改或新增自定义预设）：
-| Preset | 中文名 | 默认 `mode` | 默认 `effort` | 默认 `model` / `provider` | 适用场景 |
-| :--- | :--- | :---: | :---: | :---: | :--- |
-| `coding` | 编码实现 | `write` | `high` | 继承默认 | 模块实现、单元测试、功能开发 |
-| `review` | 只读审查 | `read-only` | `medium` | 继承默认 | 跨模型 Code Review、风险与边界检查 |
-| `debug` | 深度排查 | `read-only` | `xhigh` | 继承默认 | 复杂 Bug 根因定位、疑难架构诊断 |
-| `fast` | 快速轻量 | `write` | `low` | 继承默认 | 样板脚本、文档整理、小型明确修改 |
+首次启动自动初始化以下 6 套开箱预设（均默认继承用户当前模型，可在「模型与配置」面板修改或新增自定义预设，所有预设均含 `when_to_use` 选型指引）：
+| Preset | 中文名 | 默认 `mode` | 默认 `effort` | 适用场景（`when_to_use`） |
+| :--- | :--- | :---: | :---: | :--- |
+| `explore` | 只读探索 | `read-only` | `medium` | 代码库只读探索、调用方排查、局部信息提取与核查 |
+| `coding` | 编码实现 | `write` | `high` | 边界清晰的模块实现、功能开发与单元测试编写 |
+| `frontend` | 前端迭代 | `write` | `medium` | 前端页面布局、样式调整、交互组件快速迭代 |
+| `review` | 独立审查 | `read-only` | `medium` | 跨模型只读 Code Review、风险核查与边界条件复核 |
+| `debug` | 深度排障 | `read-only` | `xhigh` | 复杂跨模块推理、疑难 Bug 根因定位与架构诊断 |
+| `fast` | 轻量批量 | `write` | `low` | 样板脚本、文档整理、简单低风险重复改动 |
 
 ---
 
@@ -177,7 +191,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | `list_codex_models` | 无 | 可选 `query`、`provider`；返回生效默认值、可用 Provider（已脱敏）、模型目录（含支持档位与上下文窗口）、原生兜底说明及全部角色预设 |
 | `start_codex_task` | `inline` | 必填 `prompt`, `cwd`；可选 `model`, `provider`, `effort`, `preset`, `mode` (`write\|read-only`), `config_mode` (`isolated\|profile\|inherit`), `worktree`, `persist`, `session_id`, `search`, `add_dir`, `raw`, `timeout`；立即返回 `run_id` 与生效配置并在对话挂载实时卡片 |
-| `wait_codex_task` | 无 | 必填 `run_id`，可选 `timeout`；阻塞等待完成并返回结构化交付、变更文件、Token 用量、Worktree 与日志路径 |
+| `wait_codex_task` | 无 | 必填 `run_id` 或 `run_ids`，可选 `wait_mode` (`all\|any`)、`timeout`；阻塞等待一个或多个任务完成（支持滚动验收：`wait_mode="any"` 任一完成即返回），等待超时返回 `wait_timed_out=true` + `still_running_ids`（超时不等于任务失败，不重复派发） |
 | `get_codex_task_status` | 无 | 必填 `run_id`（或 `run_ids` 数组）；非阻塞返回当前状态、耗时、最新一步命令/文件变更摘要与实时 Token，方便并行监控 |
 | `stop_codex_task` | 无 | 必填 `run_id`；主动终止运行中的任务及其子进程树 |
 | `open_codex_panel` | `aux_pane` + `global`（标题 `Agy Codex`） | 可选 `tab` (`subagents\|stats\|models`), `run_id`；打开工作台面板（支持空参 `{}` 启动） |

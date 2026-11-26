@@ -1,0 +1,18 @@
+{
+  "name": "agy-codex",
+  "displayName": "Agy Codex",
+  "version": "1.0.0",
+  "description": "Native Antigravity 2.0 <-> Codex CLI multi-model subagent workbench: flexible model catalog & cache discovery, extended reasoning efforts, live subagent monitor, and unified local telemetry.",
+  "logo": "assets/logo.svg",
+  "author": {
+    "name": "Chino0w0",
+    "url": "https://github.com/Chino0w0"
+  },
+  "homepage": "https://github.com/Chino0w0/agy-codex",
+  "repository": "https://github.com/Chino0w0/agy-codex",
+  "suggestedPrompts": [
+    "List available Codex models and presets, then delegate implementing this module to Codex",
+    "Dispatch parallel Codex workers with git worktree isolation and rollingly review their diffs",
+    "Open the Agy Codex workbench to inspect subagent progress, token telemetry, and model mapping"
+  ]
+}

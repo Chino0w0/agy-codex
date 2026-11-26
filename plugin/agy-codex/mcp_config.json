@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "codex_worker": {
+    "codex": {
       "command": "python3",
       "args": [
         "${PLUGIN_ROOT}/server/mcp_server.py",
