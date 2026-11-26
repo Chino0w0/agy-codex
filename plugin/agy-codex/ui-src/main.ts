@@ -367,6 +367,17 @@ function syncDraftFromDom(): void {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
+    const mcpCheckboxes = document.querySelectorAll<HTMLInputElement>("[data-forward-mcp]");
+    if (mcpCheckboxes.length > 0) {
+      const fwdList: string[] = [];
+      mcpCheckboxes.forEach((cb) => {
+        const mid = cb.getAttribute("data-forward-mcp");
+        if (cb.checked && mid && !fwdList.includes(mid)) {
+          fwdList.push(mid);
+        }
+      });
+      workbenchDraft.mapping.forwarded_mcp_servers = fwdList;
+    }
     const mc = parseInt(val("cfg-map-max-conc"), 10);
     if (!Number.isNaN(mc) && mc >= 1 && mc <= 20) {
       workbenchDraft.mapping.max_concurrent_runs = mc;

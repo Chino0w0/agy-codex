@@ -702,14 +702,14 @@ def compute_stats(
                 running_count += 1
             elif st == "done":
                 done_count += 1
-            elif st == "error":
+            elif st in ("error", "blocked"):
                 error_count += 1
                 recent_errors.append(
                     {
                         "run_id": item["id"],
                         "model": item["model"],
                         "ts": item["ts"],
-                        "error": str(item.get("error") or "Unknown error"),
+                        "error": str(item.get("error") or ("Worker reported blocked" if st == "blocked" else "Unknown error")),
                     }
                 )
             elif st == "cancelled":
@@ -763,7 +763,7 @@ def compute_stats(
             dbucket["count"] += 1
             if is_plugin:
                 dbucket["plugin_count"] += 1
-                if item.get("status") == "error":
+                if item.get("status") in ("error", "blocked"):
                     dbucket["errors"] += 1
             else:
                 dbucket["local_count"] += 1
@@ -795,7 +795,7 @@ def compute_stats(
             b["input_tokens"] += in_t
             b["cached_tokens"] += c_t
             b["output_tokens"] += out_t
-            if is_plugin and item.get("status") == "error":
+            if is_plugin and item.get("status") in ("error", "blocked"):
                 b["errors"] += 1
             if is_plugin and isinstance(item.get("duration_sec"), (int, float)):
                 b["dur_sum"] += float(item["duration_sec"])

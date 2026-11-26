@@ -74,7 +74,7 @@ export interface IdentityInfo {
 export interface RunSnapshot {
   run_id: string;
   source?: "mcp" | "cli";
-  status: "running" | "done" | "error" | "cancelled";
+  status: "running" | "done" | "error" | "cancelled" | "blocked";
   cwd: string;
   mode: string;
   config_mode: string;
@@ -216,6 +216,15 @@ export interface ProviderInfo {
   is_builtin?: boolean;
 }
 
+export interface McpServerInfo {
+  id: string;
+  type: string;
+  command?: string | null;
+  url?: string | null;
+  enabled: boolean;
+  forwarded: boolean;
+}
+
 export interface PresetEntry {
   label: string;
   model?: string | null;
@@ -239,6 +248,7 @@ export interface WorkbenchConfig {
     effort_policy: "clamp_with_warning" | "passthrough";
     context_window_policy: "same_model_only" | "always_forward" | "never_forward";
     extra_whitelist_keys: string[];
+    forwarded_mcp_servers: string[];
     allow_nested_subagents: boolean;
     max_concurrent_runs: number;
   };
@@ -277,6 +287,7 @@ export interface WorkbenchPayload {
   hidden_models_count: number;
   excluded_models: string[];
   providers: ProviderInfo[];
+  mcp_servers?: McpServerInfo[];
   presets: Record<string, PresetEntry>;
   max_concurrent_runs: number;
   catalog_mode: string;

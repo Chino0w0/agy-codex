@@ -277,7 +277,9 @@ class RunManager:
                 if isinstance(worktree_arg, str) and str(worktree_arg).strip()
                 else None
             )
-            worktree_info = codex_run.create_isolated_worktree(initial_cwd, wt_name, run_id)
+            worktree_info = codex_run.create_isolated_worktree(
+                initial_cwd, wt_name, run_id, data_dir=self.data_dir
+            )
             cwd = Path(worktree_info["path"])
 
         cmd, meta = codex_run.build_codex_command(
@@ -490,13 +492,30 @@ class RunManager:
             elif fallback.get("tokens_used"):
                 state.tokens_used = fallback["tokens_used"]
 
+            handoff_status = (
+                parsed_result.get("status") if isinstance(parsed_result, dict) else None
+            )
+            handoff_summary = (
+                codex_catalog._clean_optional_str(parsed_result.get("summary"))
+                if isinstance(parsed_result, dict)
+                else None
+            )
             if state.status != "cancelled":
                 if timed_out:
                     state.status = "error"
                     state.error = f"Timed out after {timeout}s"
                     self._append_event(state, {"kind": "error", "message": state.error})
                 elif state.exit_code == 0:
-                    state.status = "done"
+                    if handoff_status == "blocked":
+                        state.status = "blocked"
+                        if not state.error:
+                            state.error = handoff_summary or "Worker reported status=blocked."
+                    elif handoff_status == "failed":
+                        state.status = "error"
+                        if not state.error:
+                            state.error = handoff_summary or "Worker reported status=failed."
+                    else:
+                        state.status = "done"
                 else:
                     state.status = "error"
                     if not state.error:
