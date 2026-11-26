@@ -308,9 +308,9 @@ class RunManager:
             quiet=True,
         )
         if resume_sid_str:
-            cmd.extend(["resume", resume_sid_str, prompt])
+            cmd.extend(["resume", resume_sid_str, "-"])
         else:
-            cmd.append(prompt)
+            cmd.append("-")
 
         eff = meta["effective"]
         warnings = list(meta.get("warnings") or [])
@@ -348,7 +348,7 @@ class RunManager:
 
         thread = threading.Thread(
             target=self._execute_worker,
-            args=(state, cmd, log_file, output_file, timeout),
+            args=(state, cmd, log_file, output_file, timeout, prompt),
             daemon=True,
         )
         thread.start()
@@ -372,13 +372,14 @@ class RunManager:
         log_file: Path,
         output_file: Path,
         timeout: int,
+        stdin_prompt: str | None = None,
     ) -> None:
         env = codex_run.build_exec_env()
         timed_out = False
         log_lines: list[str] = []
 
         popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.DEVNULL,
+            "stdin": subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.STDOUT,
             "text": True,
@@ -394,6 +395,7 @@ class RunManager:
 
         try:
             proc = subprocess.Popen(cmd, **popen_kwargs)
+            codex_run.write_prompt_to_stdin(proc, stdin_prompt)
         except Exception as exc:
             with state.lock:
                 state.status = "error"
@@ -457,6 +459,11 @@ class RunManager:
         finally:
             if timer is not None:
                 timer.cancel()
+            if proc.stdin is not None and not proc.stdin.closed:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             if proc.stdout is not None:
                 try:
                     proc.stdout.close()
