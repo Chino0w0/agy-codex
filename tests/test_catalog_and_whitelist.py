@@ -225,6 +225,8 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertEqual(ov_same_dict["model_context_window"], 922000)
         self.assertEqual(ov_same_dict["model_auto_compact_token_limit"], 750000)
         self.assertEqual(ov_same_dict["agents.enabled"], False)
+        self.assertEqual(ov_same_dict["features.multi_agent"], False)
+        self.assertIn("SUBAGENT ROLE DECLARATION", ov_same_dict["developer_instructions"])
         # Ensure TOML literal round-trip parses cleanly (important for Windows backslashes)
         toml_expr = f"model_catalog_json = {codex_catalog.to_toml_literal(ov_same_dict['model_catalog_json'])}"
         self.assertEqual(tomllib.loads(toml_expr)["model_catalog_json"], str(catalog_path.resolve()))
@@ -268,6 +270,8 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertEqual(ov_custom_dict["custom_extra_flag"], "enabled-val")
         self.assertNotIn("model_catalog_json", ov_custom_dict)
         self.assertNotIn("agents.enabled", ov_custom_dict)
+        self.assertNotIn("features.multi_agent", ov_custom_dict)
+        self.assertIn("SUBAGENT ROLE DECLARATION", ov_custom_dict["developer_instructions"])
         self.assertTrue(any("excluded_models" in w for w in meta_custom["warnings"]))
 
     def test_precedence_layers_and_custom_catalog_mode(self) -> None:

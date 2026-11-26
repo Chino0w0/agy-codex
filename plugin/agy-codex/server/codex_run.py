@@ -422,6 +422,18 @@ def build_codex_command(
         if eff.get("effort"):
             cmd.extend(["-c", f"model_reasoning_effort={codex_catalog.to_toml_literal(eff['effort'])}"])
 
+    if effective_config_mode in ("profile", "inherit"):
+        wb_cfg = resolved_cfg["wb_cfg"]
+        worker_cfg = resolved_cfg["worker_cfg"]
+        allow_nested = bool((wb_cfg.get("mapping") or {}).get("allow_nested_subagents", False))
+        if not allow_nested:
+            cmd.extend(["-c", "agents.enabled=false"])
+            cmd.extend(["-c", "features.multi_agent=false"])
+        dev_inst = codex_catalog.build_worker_developer_instructions(
+            worker_cfg, allow_nested=allow_nested
+        )
+        cmd.extend(["-c", f"developer_instructions={codex_catalog.to_toml_literal(dev_inst)}"])
+
     cmd.extend(["-s", sandbox])
     if allow_search and search:
         cmd.append("--search")
@@ -1101,10 +1113,9 @@ def main() -> int:
 
     subparsers.add_parser("doctor", help="Check local Codex CLI, auth, catalog, config, and SQLite health.")
 
-    p_models = subparsers.add_parser("models", help="List discovered Codex models, providers, and presets.")
+    p_models = subparsers.add_parser("models", help="List visible Codex models, providers, and presets.")
     p_models.add_argument("--query", default="", help="Filter models by slug/display name.")
     p_models.add_argument("--provider", default="", help="Filter models by provider.")
-    p_models.add_argument("--include-hidden", action="store_true", help="Include visibility=hide models.")
     p_models.add_argument("--exclude-filtered", action="store_true", help="Hide excluded_models entries.")
 
     p_preview = subparsers.add_parser("preview", help="Dry-run preview of resolved Codex flags (redacted).")
@@ -1119,12 +1130,16 @@ def main() -> int:
     if args.subcommand == "doctor":
         return run_doctor()
     if args.subcommand == "models":
-        res = codex_catalog.discover_models_and_config(
-            query=args.query,
-            provider=args.provider,
-            include_hidden=args.include_hidden,
-            include_excluded=not args.exclude_filtered,
+        res = dict(
+            codex_catalog.discover_models_and_config(
+                query=args.query,
+                provider=args.provider,
+                include_hidden=False,
+                include_excluded=not args.exclude_filtered,
+            )
         )
+        res.pop("hidden_models_count", None)
+        res["all_models_count"] = res["visible_models_count"]
         print(json.dumps(res, ensure_ascii=False, indent=2))
         return 0
     if args.subcommand == "preview":
