@@ -45,10 +45,10 @@ _DATA_DIRS = ("runs", "worktrees")
 def _safe_print(msg: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     try:
-        print(msg, file=stream)
+        print(msg, file=stream, flush=True)
     except UnicodeEncodeError:
         encoding = stream.encoding or "ascii"
-        print(msg.encode(encoding, errors="replace").decode(encoding), file=stream)
+        print(msg.encode(encoding, errors="replace").decode(encoding), file=stream, flush=True)
 
 
 def _is_link_or_reparse_point(path: Path) -> bool:

@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -360,6 +361,25 @@ class TestInstaller(unittest.TestCase):
         (self.data_dir / "worktrees").mkdir()
         self._assert_ok(self._uninstall())
         self.assertFalse(self.data_dir.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows directory CWD lock behavior only")
+    def test_upgrade_in_place_when_windows_dir_rename_locked(self) -> None:
+        self._assert_ok(self._install())
+        holder = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(15)"],
+            cwd=str(self.installed),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            time.sleep(0.2)
+            proc = self._install()
+            self._assert_ok(proc)
+            self.assertIn("atomically in place", proc.stdout)
+            self.assertTrue((self.installed / ".agy-codex-install.json").is_file())
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
 
 
 if __name__ == "__main__":

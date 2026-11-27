@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from typing import Any
 from codex_catalog import atomic_write_text, get_codex_home, get_plugin_data_dir
 
 LEDGER_FILENAME = "stats-ledger.jsonl"
+_LEDGER_LOCK = threading.Lock()
 _TERMINAL_STATUSES = frozenset({"done", "partial", "error", "blocked", "cancelled"})
 
 STATE_DB_RE = re.compile(r"^state_(\d+)\.sqlite$")
@@ -643,14 +645,14 @@ def _ledger_lock(path: Path) -> Iterator[None]:
     while True:
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
+        except (FileExistsError, PermissionError):
             try:
                 observed = path.stat()
                 if time.time() - observed.st_mtime > 15 and path.stat() == observed:
                     path.unlink()
                     continue
-            except FileNotFoundError:
-                continue
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
             if time.monotonic() >= deadline:
                 raise TimeoutError("Timed out acquiring the stats ledger lock.")
             time.sleep(0.03)
@@ -663,11 +665,15 @@ def _ledger_lock(path: Path) -> Iterator[None]:
     try:
         yield
     finally:
-        try:
-            if path.stat() == owned:
-                path.unlink()
-        except FileNotFoundError:
-            pass
+        for _ in range(5):
+            try:
+                if path.stat() == owned:
+                    path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                time.sleep(0.01)
 
 
 def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
@@ -681,7 +687,7 @@ def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
     ddir.mkdir(parents=True, exist_ok=True)
     ledger_path = ddir / LEDGER_FILENAME
     line_str = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-    with _ledger_lock(ddir / ".stats-ledger.lock"):
+    with _LEDGER_LOCK, _ledger_lock(ddir / ".stats-ledger.lock"):
         try:
             existing = ledger_path.read_text(encoding="utf-8")
         except FileNotFoundError:

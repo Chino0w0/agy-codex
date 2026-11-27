@@ -2,6 +2,16 @@
 
 All notable changes to **Agy Codex (`agy-codex`)** are documented in this file.
 
+## v1.4.0
+
+- **Unlimited Default Worker Timeout + Live Health Watchdog**: Changed default `start_codex_task.timeout` to `0` (unlimited wall-clock runtime; configurable via `mapping.worker_timeout_sec` and optional `mapping.idle_timeout_sec` in **Models & Config**), replacing stressful countdown kills with live `health` (`healthy` / `stalled` / `loop_warning` / `error`), `health_reason`, `in_flight_command`, and case-insensitive stderr `recent_errors` root-cause extraction.
+- **Narrow Side-Pane UX Redesign & Single Global Switch**: Removed duplicate inline Codex linkage switches across Monitor, History, Stats, and wide strips (keeping one persistent switch in the topbar plus the Models & Config setting row). Replaced cramped narrow-pane subagent tabs with a dedicated 100%-width capsule popover switcher (`#narrow-agent-picker-btn`), `< >` quick steppers, background alert indicator dots, and calm elapsed-time + health/error alert banners.
+- **Full Codebase Audit Hardening (P0/P1/P2)**:
+  - **Server & Runner**: Strict single-segment `run_id` boundary validation across all state/event/prompt operations; atomic start/cancel handoff; async stdin writer thread; unified `finally` state finalization and `RunManager.shutdown()` cleanup; single-snapshot `wait_runs()` eliminating contradictory `done + wait_timed_out=true`; Windows npm launcher native-entry resolution; `partial` parity across CLI `run_codex()` and `get_history(filter="issue")`.
+  - **Catalog, Hooks & Telemetry**: URL credential redaction on `base_url` / `url`; `extra_whitelist_keys` applied before protected worker policies with reserved-key rejection; `features.multi_agent_v2 = false` when nested subagents are disabled; implicit default skips `excluded_models`; `routing_hook.py` negation-safe override matching; cross-process file lock + physical-newline JSONL splitting + `session_id`/`source` retention + accurate dimension `success_rate` in `codex_telemetry.py`.
+  - **Installers & Uninstaller**: Staged swap + rollback upgrades in `install.py`; absolute `sys.executable` + absolute `routing_hook.py` binding in `mcp_config.json` and `hooks.json`; symlink/junction and source-overlap guards; safe `uninstall.py` path boundary validation and non-empty `worktrees/` preservation; consistent Python 3.10+ probing across `install.ps1`/`uninstall.ps1`/`install.sh`/`uninstall.sh`.
+  - **Frontend Race Fixes**: Fixed stop button target binding (`data-stop-run`), `selectRunSeq` generation guards and monotonic `latestSeq`, hidden-tab timeline resets, history `timelineRunId` isolation, `configMutationSeq` against stale poll overwrites, manual model exclusion draft visibility, malformed handoff guards, and `app.connect()` retry UI.
+
 ## v1.3.0
 
 - **Concise Model-Facing MCP Briefs**: Added `format_models_brief`, `format_start_brief`, `format_wait_or_status_brief`, and `format_stop_or_close_brief` in `mcp_server.py` so `list_codex_models` and task lifecycle tools return compact, human/LLM-readable plain-text dispatch briefs (~1–2 KB instead of raw 16 KB catalog JSON dumps) while keeping `structuredContent` backward-compatible for tests and app panels.

@@ -87,10 +87,10 @@ def copy_tree_clean(src: Path, dst: Path) -> list[dict[str, str]]:
 def _safe_print(msg: str, *, error: bool = False) -> None:
     stream = sys.stderr if error else sys.stdout
     try:
-        print(msg, file=stream)
+        print(msg, file=stream, flush=True)
     except UnicodeEncodeError:
         encoding = stream.encoding or "ascii"
-        print(msg.encode(encoding, errors="replace").decode(encoding), file=stream)
+        print(msg.encode(encoding, errors="replace").decode(encoding), file=stream, flush=True)
 
 
 def _is_link_or_reparse_point(path: Path) -> bool:
@@ -210,6 +210,64 @@ def _clean_temp_tree(path: Path) -> None:
         time.sleep(0.1)
 
 
+def _sync_staged_in_place(stage: Path, target_plugin: Path) -> None:
+    """Atomically sync verified staged files into an in-use target folder (e.g. Windows CWD lock)."""
+    old_managed: set[str] = set()
+    old_receipt_path = target_plugin / ".agy-codex-install.json"
+    if old_receipt_path.is_file():
+        try:
+            old_data = json.loads(old_receipt_path.read_text(encoding="utf-8"))
+            for item in old_data.get("files") or []:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    old_managed.add(item["path"])
+        except Exception:
+            pass
+
+    new_managed: set[str] = set()
+    staged_receipt = stage / ".agy-codex-install.json"
+    for root, _, files in os.walk(stage):
+        rel_root = Path(root).relative_to(stage)
+        dst_dir = target_plugin / rel_root
+        if _is_link_or_reparse_point(dst_dir):
+            raise ValueError(f"Refusing to sync into symlink or reparse point: {dst_dir}")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for fname in files:
+            src_file = Path(root) / fname
+            if src_file == staged_receipt:
+                continue
+            rel_posix = (rel_root / fname).as_posix()
+            new_managed.add(rel_posix)
+            dst_file = dst_dir / fname
+            if _is_link_or_reparse_point(dst_file):
+                raise ValueError(f"Refusing to overwrite symlink or reparse point: {dst_file}")
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}-", dir=dst_dir)
+            tmp_path = Path(tmp_name)
+            try:
+                os.close(fd)
+                shutil.copy2(src_file, tmp_path)
+                os.replace(tmp_path, dst_file)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+    for stale_rel in sorted(old_managed - new_managed):
+        stale_path = (target_plugin / stale_rel).resolve()
+        try:
+            if stale_path.is_relative_to(target_plugin.resolve()) and stale_path.is_file():
+                stale_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if staged_receipt.is_file():
+        fd, tmp_name = tempfile.mkstemp(prefix=".receipt-", dir=target_plugin)
+        tmp_path = Path(tmp_name)
+        try:
+            os.close(fd)
+            shutil.copy2(staged_receipt, tmp_path)
+            os.replace(tmp_path, old_receipt_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+
 def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
     src_plugin = (repo_root / "plugin" / "agy-codex").resolve()
     plugins_dir = plugins_dir.resolve()
@@ -235,25 +293,37 @@ def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
         _validate_plugin_target(target_plugin, src_plugin)
         # 暂存全部完成后才移动旧版本；切换失败时恢复原安装。
         had_old_plugin = target_plugin.exists()
+        synced_in_place = False
         if had_old_plugin:
             if os.path.lexists(backup):
                 raise FileExistsError(f"Plugin backup path is already occupied: {backup}")
-            os.replace(target_plugin, backup)
-        try:
-            os.replace(stage, target_plugin)
-        except OSError:
+            try:
+                os.replace(target_plugin, backup)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) in (5, 32):
+                    _sync_staged_in_place(stage, target_plugin)
+                    _safe_print(
+                        "  -> Target folder is in use by a running process; updated plugin files atomically in place."
+                    )
+                    synced_in_place = True
+                else:
+                    raise
+        if not synced_in_place:
+            try:
+                os.replace(stage, target_plugin)
+            except OSError:
+                if had_old_plugin:
+                    try:
+                        if os.path.lexists(target_plugin):
+                            raise FileExistsError(f"Plugin destination is already occupied: {target_plugin}")
+                        os.replace(backup, target_plugin)
+                    except OSError as exc:
+                        raise OSError(
+                            f"Plugin switch and rollback failed; old installation retained at {backup}: {exc}"
+                        ) from exc
+                raise
             if had_old_plugin:
-                try:
-                    if os.path.lexists(target_plugin):
-                        raise FileExistsError(f"Plugin destination is already occupied: {target_plugin}")
-                    os.replace(backup, target_plugin)
-                except OSError as exc:
-                    raise OSError(
-                        f"Plugin switch and rollback failed; old installation retained at {backup}: {exc}"
-                    ) from exc
-            raise
-        if had_old_plugin:
-            _clean_temp_tree(backup)
+                _clean_temp_tree(backup)
     finally:
         if stage.exists():
             _clean_temp_tree(stage)

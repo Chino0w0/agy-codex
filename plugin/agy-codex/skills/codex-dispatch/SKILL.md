@@ -45,9 +45,9 @@ description: >-
 ```
 
 ### 3. 启动、右侧监控与关闭归档
-1. 调用 `start_codex_task(prompt=..., cwd=..., preset=..., model=..., provider=..., effort=..., mode=..., title=..., role=..., conversation_id=..., conversation_title=..., context_files=[...], acceptance_criteria=[...], non_goals=[...])`（保持默认 `timeout=600`，多目录巡检与复杂编码不要随意调低）立即拿到 `run_id`、`requested`、`effective` 与可能的 `warnings`（如档位自动降级或缺少业务上下文提醒）。
+1. 调用 `start_codex_task(prompt=..., cwd=..., preset=..., model=..., provider=..., effort=..., mode=..., title=..., role=..., conversation_id=..., conversation_title=..., context_files=[...], acceptance_criteria=[...], non_goals=[...])`（保持默认 `timeout=0` 不限总时长，避免截断认真执行的长任务）立即拿到 `run_id`、`requested`、`effective` 与可能的 `warnings`（如档位自动降级或缺少业务上下文提醒）。
 2. 紧接着调用一次 `open_codex_panel(tab="subagents", run_id=<run_id>)`（`tab` 支持 `"subagents" | "history" | "stats" | "models"`），在右侧边栏打开或刷新实时进度标签页（不在对话流里渲染内联卡片）。
-3. 主 Agent 可先推进自己的只读分析或其他不冲突工作；在真正依赖结果时调用 `wait_codex_task(run_id=..., timeout=120)`（单次等待上限 120 秒以避开 MCP 传输超时，也可先用 `get_codex_task_status` 非阻塞探活）。
+3. 主 Agent 可先推进自己的只读分析或其他不冲突工作；在真正依赖结果时调用 `wait_codex_task(run_id=..., timeout=120)`（单次等待上限 120 秒以避开 MCP 传输超时，也可先用 `get_codex_task_status` 查看实时 `health` / `recent_errors` 探活）。
 4. **等待超时 ≠ 失败**：如果 `wait_codex_task` 返回 `wait_timed_out=true`，任务仍在运行中，请继续用 `get_codex_task_status` / `wait_codex_task` 跟踪，或确认跑偏时调用 `stop_codex_task(run_id)`，**禁止重复启动同一任务造成写冲突**。
 5. **用完即销毁与关闭归档**：主 Agent 验收完 Codex 子任务结论与 `git diff` 后，调用 `close_codex_task(run_id)` 将其从右侧活跃标签栏移出，保留 24 小时日志于「历史对话」中按 Antigravity 大会话分组追溯；不要留一堆已完结标签占满侧栏。
 

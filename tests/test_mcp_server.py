@@ -877,7 +877,9 @@ class TestMcpServerAndRunner(unittest.TestCase):
         history = self.manager.get_history(filter_mode="issue")
         self.assertIn(started["run_id"], [r["run_id"] for g in history["groups"] for r in g["runs"]])
         self.assertEqual(history["groups"][0]["issue_count"], 1)
-        for index, panel_meta in enumerate((None, {"cwd": str(self.workdir), "prompt": "partial"})):
+        for index, panel_meta in enumerate(
+            (None, {"run_id": "cli-partial-1", "cwd": str(self.workdir), "prompt": "partial"})
+        ):
             with self.subTest(panel_meta=panel_meta):
                 output = self.root / f"cli-output-{index}.json"
                 result = codex_run.run_codex(
@@ -1079,7 +1081,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.assertIsNone(default_res.get("wait_timeout_clamped_sec"))
 
     def test_invalid_run_ids_rejected_by_every_entry_point(self) -> None:
-        for rid in ("../evil", str(self.root.resolve()), "bad/id", "bad\id", "a..b"):
+        for rid in ("../evil", str(self.root.resolve()), "bad/id", "bad\\id", "a..b"):
             for operation in (
                 lambda: self.manager.get_run_events(rid),
                 lambda: self.manager.get_status([rid]),
