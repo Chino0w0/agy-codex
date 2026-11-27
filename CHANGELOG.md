@@ -2,6 +2,14 @@
 
 All notable changes to **Agy Codex (`agy-codex`)** are documented in this file.
 
+## v1.3.0
+
+- **Concise Model-Facing MCP Briefs**: Added `format_models_brief`, `format_start_brief`, `format_wait_or_status_brief`, and `format_stop_or_close_brief` in `mcp_server.py` so `list_codex_models` and task lifecycle tools return compact, human/LLM-readable plain-text dispatch briefs (~1–2 KB instead of raw 16 KB catalog JSON dumps) while keeping `structuredContent` backward-compatible for tests and app panels.
+- **1-Shot Hook Dispatch Cheat Sheet**: Updated `routing_hook.py` (`SessionStart` and `PreToolUse`) to surface the compliant default model, active slot cap, `start_codex_task` 600s default, and `wait_codex_task` 120s poll pattern directly so Antigravity can dispatch without redundant `list_codex_models` round-trips.
+- **Safe Split Timeouts (`600s` Worker vs `120s` Clamped Wait Poll)**: Capped `wait_codex_task.timeout` to `1..120` seconds (default `120`) to eliminate Antigravity's 180s MCP transport timeout errors while keeping `start_codex_task.timeout` at `600s` for multi-directory scans and complex subtasks.
+- **Accurate Timeout Command Diagnostics & Worker Efficiency**: Stopped overwriting empty timeout handoffs with opening preamble text; timeouts now preserve `completed_commands` count and `codex.log` guidance in `error` and `work_digest`. Updated `SUBAGENT_ROLE_PREFIX` / `NESTED_SUBAGENT_PREFIX` and `profiles/worker.config.toml` so workers skip unrelated global skills and write concise handoff JSON before timeout.
+- **Atomic `stats-ledger.jsonl` Upsert**: Updated `codex_telemetry.append_ledger_record()` to upsert by `run_id` atomically under `_LEDGER_LOCK` so closing/archiving a finished run never leaves duplicate lines on disk.
+
 ## v1.2.0
 
 - **Out-of-the-Box Default Codex Routing**: Bundled cross-platform `plugin/agy-codex/hooks.json` (`SessionStart` + `PreToolUse`) and `server/routing_hook.py` so general subagent delegations default to `agy-codex` MCP right after installation.

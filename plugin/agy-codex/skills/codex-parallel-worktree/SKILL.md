@@ -33,12 +33,12 @@ description: >-
 ### 2. 并发派发（强制写任务启用 `worktree`）
 - **写任务**：为每个分支传唯一的 `worktree` 名称（例如 `worktree="auth-fix"`、`worktree="cli-flags"`），每个子 Agent 会在独立 Git worktree（分支 `codex/<name>`）中工作，主工作区保持干净。
 - **只读任务**：可传 `mode="read-only"`，无需创建 `worktree`。
-- 调用 `start_codex_task` 时传入可选结构化参数 `title`、`role`、`conversation_id`、`conversation_title`、`context_files`、`acceptance_criteria`、`non_goals`，并按任务复杂度混搭模型与档位（例如轻量批量脚本用 `preset="fast"`，核心模块用 `preset="coding"`，避免常规编码滥用 `xhigh`）。
+- 调用 `start_codex_task`（保持默认 `timeout=600`）时传入可选结构化参数 `title`、`role`、`conversation_id`、`conversation_title`、`context_files`、`acceptance_criteria`、`non_goals`，并按任务复杂度混搭模型与档位（例如轻量批量脚本用 `preset="fast"`，核心模块用 `preset="coding"`，避免常规编码滥用 `xhigh`）。
 - 一批并发任务发出后，调用一次 `open_codex_panel(tab="subagents", run_id=<first_run_id>)`（`tab` 支持 `"subagents" | "history" | "stats" | "models"`）在右侧边栏集中查看所有活跃子代理实时进度。
 
 ### 3. 滚动验收（Rolling Verification）
 不要死等所有分支全部跑完才开始看结果：
-1. 调用 `wait_codex_task(run_ids=[id1, id2, ...], wait_mode="any", timeout=300)`：
+1. 调用 `wait_codex_task(run_ids=[id1, id2, ...], wait_mode="any", timeout=120)`（单次等待封顶 120s，若返回 `wait_timed_out=true` 则继续轮询等待而非重复派发）：
    - 只要任一分支先完成就会立即返回；
    - 或用 `get_codex_task_status(run_ids=[...])` 随时非阻塞查看全部槽位进展。
 2. 对已完成的 `codex/<name>` 分支立即做增量审查：

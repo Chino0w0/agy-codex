@@ -442,6 +442,8 @@ class TestTelemetry(unittest.TestCase):
                 "status": "done",
                 "started_at": now - 100,
                 "tokens_used": 2200,
+                "closed": True,
+                "closed_at": now,
                 "role": "coding",
             },
         )
@@ -456,10 +458,18 @@ class TestTelemetry(unittest.TestCase):
             },
         )
 
+        ledger_lines = [
+            ln
+            for ln in (self.data_dir / "stats-ledger.jsonl").read_text(encoding="utf-8").splitlines()
+            if ln.strip()
+        ]
+        self.assertEqual(len(ledger_lines), 2, f"Expected exact 2 upserted lines on disk, got: {ledger_lines!r}")
+
         records = codex_telemetry.read_ledger_records(self.data_dir)
         self.assertEqual(len(records), 2)
         by_id = {r["run_id"]: r for r in records}
         self.assertEqual(by_id["run-dup"]["tokens_used"], 2200)
+        self.assertTrue(by_id["run-dup"]["closed"])
         self.assertEqual(by_id["run-other"]["status"], "error")
 
     def test_prune_expired_runs_archives_to_ledger_and_compute_stats_includes_it(self) -> None:

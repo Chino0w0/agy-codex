@@ -21,8 +21,9 @@ Let **Antigravity** act as orchestrator, code reviewer, and final verifier while
   - Merges models from `custom_models` (UI-editable) > `model_catalog_json` (`auto`/`custom`/`off`) > `~/.codex/models_cache.json` > `config.toml`, plus freeform model strings anywhere;
   - Whitelist-isolated (`--ignore-user-config`) execution skips heavy desktop plugins, MCP servers, hooks, and memories while forwarding model, provider, proxy, Windows sandbox settings, subprocess-scoped `safe.directory=*`, and opted-in MCP namespaces;
   - Dual Orchestrator protection (`exclude_orchestrator_models`), extended reasoning efforts (`none / minimal / low / medium / high / xhigh / max / ultra` and custom catalog levels), and configurable **`catalog_mode`**, **`effort_policy`**, **`context_window_policy`**, **`native_passthrough_subagents`**, and **`excluded_models`**.
-- **Concurrent Subagent Orchestration & Contracted Dispatch (`v1.2.0`)**:
-  - Model-visible MCP tools: `list_codex_models`, `start_codex_task` (with `context_files`, `acceptance_criteria`, `non_goals`), `get_codex_task_status`, `wait_codex_task` (`run_ids` + `wait_mode="any"|"all"`), `stop_codex_task`, `close_codex_task`, and `open_codex_panel`;
+- **Concurrent Subagent Orchestration & Contracted Dispatch (`v1.3.0`)**:
+  - Model-visible MCP tools: `list_codex_models`, `start_codex_task` (with `context_files`, `acceptance_criteria`, `non_goals`, default 600s worker timeout), `get_codex_task_status`, `wait_codex_task` (`run_ids` + `wait_mode="any"|"all"`, safely capped at 120s per poll to avoid MCP transport timeouts), `stop_codex_task`, `close_codex_task`, and `open_codex_panel`;
+  - Concise model-facing dispatch briefs cut MCP text payload size by ~90%, timeout diagnostics accurately preserve completed command counts plus `codex.log` guidance instead of preamble text, and `stats-ledger.jsonl` performs atomic upserts by `run_id` with zero duplicate lines on disk;
   - Concurrent non-blocking `serve_stdio` JSON-RPC server, cross-process `pid` liveness checks, ephemeral `--ephemeral --thread-source subagent` execution, Windows stdio pipe deadlock fixes, and accurate `partial` handoff detection;
   - Ships a concise always-on `rules/AGENTS.md`, three progressive-disclosure skills (`codex-dispatch`, `codex-parallel-worktree`, `codex-second-opinion`), and 6 customizable role presets.
 - **Native 4-Tab MCP App Workbench (Zero Client Injection, Instant Toggle Everywhere)**:
@@ -149,7 +150,7 @@ agy-codex/
 │   └── worker.config.toml                      # Lightweight Codex worker config template
 ├── plugin/
 │   └── agy-codex/                              # Native Antigravity plugin bundle
-│       ├── plugin.json                         # Plugin manifest (v1.2.0)
+│       ├── plugin.json                         # Plugin manifest (v1.3.0)
 │       ├── mcp_config.json                     # MCP server entrypoint
 │       ├── hooks.json                          # SessionStart / PreToolUse default routing hooks
 │       ├── assets/

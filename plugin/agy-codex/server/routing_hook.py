@@ -168,9 +168,13 @@ def handle_session_start(
             ]
         }
 
+    max_conc = int((wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5))
     if default_model:
         model_hint = (
-            f"当前合规默认模型为 `{default_model}`，常规委派可直接调用 `start_codex_task` 无需打断询问用户。"
+            f"当前合规默认模型为 `{default_model}`（并发槽位上限 {max_conc}），"
+            "常规委派可直接调用 `start_codex_task(prompt=..., cwd=..., preset='coding|explore|frontend|review|debug|fast')`，"
+            "无需先调 `list_codex_models` 或打断询问用户；`start_codex_task` 保持默认 `timeout=600`，"
+            "轮询等待用 `wait_codex_task(..., timeout=120)`（超时返回 `wait_timed_out=true` 时继续等待，勿重复派发）。"
         )
     else:
         model_hint = (
@@ -257,9 +261,9 @@ def handle_pre_tool_use(
         "decision": "deny",
         "reason": (
             f"当前「Codex 联动」处于开启状态，通用子代理 `{sub_label}` 已由 Agy Codex 默认接管。"
-            f"请改用 `agy-codex` MCP 的 `start_codex_task` 派发{model_guidance}，并在紧接着调用 "
+            f"请改用 `agy-codex` MCP 的 `start_codex_task` 派发（保持默认 `timeout=600`）{model_guidance}，并在紧接着调用 "
             "`open_codex_panel(tab=\"subagents\", run_id=...)` 展示进度，完成后通过 "
-            "`wait_codex_task` 验收并在结束时调用 `close_codex_task`。"
+            "`wait_codex_task(..., timeout=120)` 验收并在结束时调用 `close_codex_task`。"
             "若用户需要改回原生子代理，可在插件顶部随时关闭「Codex 联动」开关。"
         ),
     }

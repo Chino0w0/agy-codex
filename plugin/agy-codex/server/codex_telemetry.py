@@ -636,7 +636,7 @@ def _normalize_ledger_record(run_summary: dict[str, Any]) -> dict[str, Any]:
 
 
 def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
-    """Append a compact terminal/archive record for a run to `stats-ledger.jsonl`."""
+    """Upsert a compact terminal/archive record by `run_id` into `stats-ledger.jsonl`."""
     ddir = Path(data_dir)
     record = _normalize_ledger_record(run_summary)
     run_id = record["run_id"]
@@ -652,12 +652,47 @@ def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
         record["finished_at"],
     )
     cache_key = (str(ledger_path), run_id)
+    line_str = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
     with _LEDGER_LOCK:
         if _LEDGER_LAST_SIG.get(cache_key) == sig and ledger_path.is_file():
             return
         ddir.mkdir(parents=True, exist_ok=True)
-        with ledger_path.open("a", encoding="utf-8", newline="\n") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        replaced = False
+        if ledger_path.is_file():
+            try:
+                existing_lines = ledger_path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                existing_lines = []
+            last_match_idx = -1
+            parsed_ids: list[str | None] = []
+            for idx, raw_line in enumerate(existing_lines):
+                s = raw_line.strip()
+                if not s:
+                    parsed_ids.append(None)
+                    continue
+                try:
+                    obj = json.loads(s)
+                    rid = str(obj.get("run_id") or "").strip() if isinstance(obj, dict) else ""
+                except json.JSONDecodeError:
+                    rid = ""
+                parsed_ids.append(rid)
+                if rid == run_id:
+                    last_match_idx = idx
+            if last_match_idx >= 0:
+                new_lines: list[str] = []
+                for idx, raw_line in enumerate(existing_lines):
+                    if not raw_line.strip():
+                        continue
+                    if parsed_ids[idx] == run_id:
+                        if idx == last_match_idx:
+                            new_lines.append(line_str)
+                        continue
+                    new_lines.append(raw_line)
+                atomic_write_text(ledger_path, "\n".join(new_lines) + "\n")
+                replaced = True
+        if not replaced:
+            with ledger_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(line_str + "\n")
         _LEDGER_LAST_SIG[cache_key] = sig
 
 

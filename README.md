@@ -21,8 +21,9 @@
   - 按 `custom_models`（面板自定义） > `model_catalog_json`（自动/自定义/禁用可配） > `~/.codex/models_cache.json` > `config.toml` 自动合并模型，且全局支持手输任意模型名；
   - 默认 `isolated` 白名单隔离模式（`--ignore-user-config`）跳过桌面端重型插件、MCP、Hooks 与 Memories，按需透传模型、Provider、代理、Windows 沙箱、`safe.directory=*`（仅子进程环境）与指定 MCP 命名空间；
   - 支持 **`exclude_orchestrator_models`** 双重防嵌套保护、全范围推理档位（`none / minimal / low / medium / high / xhigh / max / ultra` 及自定义档位）与可配置 `catalog_mode` / `effort_policy` / `context_window_policy` / `native_passthrough_subagents` / `excluded_models`。
-- **高效并行子 Agent 编排与契约式委派（`v1.2.0`）**：
-  - 模型可见 MCP 工具：`list_codex_models`、`start_codex_task`（支持 `context_files`、`acceptance_criteria`、`non_goals`）、`get_codex_task_status`、`wait_codex_task`（支持 `run_ids` + `wait_mode="any"|"all"` 滚动验收）、`stop_codex_task`、`close_codex_task` 与 `open_codex_panel`；
+- **高效并行子 Agent 编排与契约式委派（`v1.3.0`）**：
+  - 模型可见 MCP 工具：`list_codex_models`、`start_codex_task`（支持 `context_files`、`acceptance_criteria`、`non_goals`，默认执行超时 600s）、`get_codex_task_status`、`wait_codex_task`（支持 `run_ids` + `wait_mode="any"|"all"` 滚动验收，单次轮询封顶 120s 规避 MCP 传输超时）、`stop_codex_task`、`close_codex_task` 与 `open_codex_panel`；
+  - `list_codex_models` 与任务生命周期工具返回精简可读的模型调度简报（体积缩减约 90%），超时中断保留已完成命令数统计与 `codex.log` 追溯指引，且 `stats-ledger.jsonl` 按 `run_id` 原位去重更新不产生冗余行；
   - 并发无阻塞 `serve_stdio` JSON-RPC 调度与跨进程 `pid` 存活识别，`--ephemeral --thread-source subagent` 用后即销毁不污染 Codex Desktop，并修复 Windows 下子进程管道死锁与 `partial` 交接状态识别；
   - 内置精简常驻 `rules/AGENTS.md` + 3 个按需披露 Skill（`codex-dispatch`、`codex-parallel-worktree`、`codex-second-opinion`）与 6 套可定制角色预设。
 - **4 视图原生 MCP App 工作台（零客户端注入、各界面可即时开关）**：
@@ -155,7 +156,7 @@ agy-codex/
 │   └── worker.config.toml                      # Codex CLI Worker 轻量配置模板
 ├── plugin/
 │   └── agy-codex/                              # Antigravity 一体化原生插件
-│       ├── plugin.json                         # 插件元数据 (v1.2.0)
+│       ├── plugin.json                         # 插件元数据 (v1.3.0)
 │       ├── mcp_config.json                     # MCP Server 配置
 │       ├── hooks.json                          # SessionStart / PreToolUse 默认路由钩子
 │       ├── assets/

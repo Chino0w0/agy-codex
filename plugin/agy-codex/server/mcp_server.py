@@ -97,6 +97,251 @@ def safe_parse_handoff(raw_text: str) -> Any:
         return stripped
 
 
+def _fmt_ctx_window(ctx: Any) -> str:
+    if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) and ctx > 0:
+        if ctx >= 1000:
+            return f"{int(round(ctx / 1000))}k"
+        return str(int(ctx))
+    return ""
+
+
+def format_models_brief(payload: dict[str, Any], *, active_runs: int = 0) -> str:
+    """Format a compact ~25-line plain-text dispatch brief for Antigravity."""
+    enabled = bool(payload.get("enabled", True))
+    intercept = bool(payload.get("intercept_native_subagents", True))
+    max_conc = int(payload.get("max_concurrent_runs", 5))
+    eff = payload.get("effective_defaults") or {}
+    eff_model = codex_catalog._clean_optional_str(eff.get("model"))
+    eff_prov = codex_catalog._clean_optional_str(eff.get("provider")) or "auto"
+    eff_effort = codex_catalog._clean_optional_str(eff.get("effort")) or "default"
+    cfg_mode = codex_catalog._clean_optional_str(eff.get("config_mode")) or "isolated"
+
+    excluded_set = {str(m).strip() for m in (payload.get("excluded_models") or []) if str(m).strip()}
+    excl_orch = bool(payload.get("exclude_orchestrator_models", True))
+    compliant_default: str | None = None
+    if eff_model and eff_model not in excluded_set:
+        if not (excl_orch and codex_catalog.is_orchestrator_model(eff_model)):
+            compliant_default = eff_model
+
+    lines = [
+        "# Agy Codex Dispatch Brief",
+        (
+            f"Status: enabled={str(enabled).lower()} | intercept_native={str(intercept).lower()} "
+            f"| slots={active_runs}/{max_conc} | worker_timeout=600s | wait_timeout<=120s"
+        ),
+        (
+            f"Default: {compliant_default or '(none - ask user to pick from Available Models below)'} "
+            f"(provider={eff_prov}, effort={eff_effort}, config_mode={cfg_mode})"
+        ),
+        (
+            'Quick call: start_codex_task(prompt=..., cwd=..., preset="coding|explore|frontend|review|debug|fast") '
+            '-> open_codex_panel(tab="subagents", run_id=...) -> wait_codex_task(run_id=..., timeout=120) '
+            "-> close_codex_task(run_id=...)"
+        ),
+        "",
+        "Presets (omit model to inherit compliant default):",
+    ]
+
+    presets = payload.get("presets") or {}
+    for pname, pobj in presets.items():
+        if not isinstance(pobj, dict):
+            continue
+        pmode = pobj.get("mode") or "write"
+        peff = pobj.get("effort") or "default"
+        pmodel = codex_catalog._clean_optional_str(pobj.get("model"))
+        plabel = codex_catalog._clean_optional_str(pobj.get("label")) or pname
+        pwhen = codex_catalog._clean_optional_str(pobj.get("when_to_use")) or ""
+        pmeta = f"{pmode}, effort={peff}" + (f", model={pmodel}" if pmodel else "")
+        desc = f"{plabel} - {pwhen}" if pwhen else plabel
+        lines.append(f"- {pname} [{pmeta}]: {desc}")
+
+    all_models = [m for m in (payload.get("models") or []) if isinstance(m, dict)]
+    available = [m for m in all_models if not m.get("excluded")]
+    guarded = [m for m in all_models if m.get("excluded")]
+
+    lines.append("")
+    lines.append(f"Available Models ({len(available)}):")
+    if not available:
+        lines.append("- (none discovered - pass an explicit model slug or configure ~/.codex/config.toml)")
+    else:
+        for m in available:
+            slug = str(m.get("slug") or "")
+            efforts = m.get("supported_reasoning_levels") or []
+            eff_str = ",".join(str(x) for x in efforts) if efforts else (
+                codex_catalog._clean_optional_str(m.get("default_reasoning_level")) or "default"
+            )
+            tags = [f"efforts: {eff_str}"]
+            ctx_str = _fmt_ctx_window(m.get("context_window"))
+            if ctx_str:
+                tags.append(f"ctx: {ctx_str}")
+            if m.get("tool_mode") == "direct":
+                tags.append("direct-only")
+            if m.get("supports_search_tool") is False:
+                tags.append("no-search")
+            default_mark = " (default)" if compliant_default and slug == compliant_default else ""
+            lines.append(f"- {slug} [{', '.join(tags)}]{default_mark}")
+
+    if guarded:
+        g_items = [
+            f"{m.get('slug')} [{'orchestrator-guarded' if m.get('orchestrator_excluded') else 'excluded'}]"
+            for m in guarded
+        ]
+        lines.append("")
+        lines.append("Excluded / Guarded (do not select): " + ", ".join(g_items))
+
+    warnings = [str(w).strip() for w in (payload.get("warnings") or []) if str(w).strip()]
+    if warnings:
+        lines.append("")
+        lines.append("Warnings: " + " | ".join(warnings))
+
+    return "\n".join(lines)
+
+
+def format_start_brief(summary: dict[str, Any]) -> str:
+    """Format a compact launch confirmation for start_codex_task."""
+    run_id = summary.get("run_id") or ""
+    title = summary.get("title") or run_id
+    eff = summary.get("effective") or {}
+    eff_model = eff.get("model") or summary.get("model") or "auto"
+    eff_prov = eff.get("provider") or summary.get("provider") or "auto"
+    eff_effort = eff.get("effort") or summary.get("effort") or "default"
+    mode = summary.get("mode") or "write"
+    timeout_sec = summary.get("timeout_sec")
+    active = summary.get("active_runs", 1)
+    max_conc = summary.get("max_concurrent_runs", 5)
+
+    lines = [
+        f"Started Codex task: {run_id} ({title})",
+        (
+            f"Config: model={eff_model} | provider={eff_prov} | effort={eff_effort} "
+            f"| mode={mode} | timeout={timeout_sec}s | slots={active}/{max_conc}"
+        ),
+    ]
+    wt = summary.get("worktree")
+    if isinstance(wt, dict) and wt.get("branch"):
+        lines.append(f"Worktree: {wt.get('branch')} ({wt.get('path') or ''})")
+    warnings = [str(w).strip() for w in (summary.get("warnings") or []) if str(w).strip()]
+    if warnings:
+        lines.append("Warnings: " + "; ".join(warnings))
+    lines.append(
+        f'Next: call open_codex_panel(tab="subagents", run_id="{run_id}") once, '
+        f'then wait_codex_task(run_id="{run_id}", timeout=120) or get_codex_task_status.'
+    )
+    return "\n".join(lines)
+
+
+def _format_single_run_digest(r: dict[str, Any]) -> list[str]:
+    rid = r.get("run_id") or ""
+    status = r.get("status") or "unknown"
+    title = r.get("title") or rid
+    model = r.get("model") or "auto"
+    effort = r.get("effort") or "default"
+    elapsed = r.get("elapsed_sec")
+    if elapsed is None:
+        elapsed = r.get("duration_sec")
+    elapsed_str = f"{elapsed}s" if elapsed is not None else "n/a"
+    cmds = r.get("completed_commands")
+    cmd_part = f" | cmds={cmds}" if isinstance(cmds, int) else ""
+    tok = r.get("tokens_used")
+    tok_str = str(tok) if tok is not None else "n/a"
+
+    out = [f"- {rid} [{status}] {title} | model={model} ({effort}) | {elapsed_str}{cmd_part} | tokens={tok_str}"]
+
+    res = r.get("result")
+    if isinstance(res, dict):
+        summary_txt = codex_catalog._clean_optional_str(res.get("summary"))
+        if summary_txt:
+            out.append(f"  summary: {codex_run.truncate_text(summary_txt, 300)}")
+        changed = [str(p) for p in (res.get("changed_files") or []) if str(p).strip()]
+        if changed:
+            shown = changed[:15]
+            suffix = f" (+{len(changed) - 15} more)" if len(changed) > 15 else ""
+            out.append("  changed_files: " + ", ".join(shown) + suffix)
+        verifs = [v for v in (res.get("verification") or []) if isinstance(v, dict)]
+        if verifs:
+            passed_cnt = sum(1 for v in verifs if v.get("passed"))
+            failed_cmds = [str(v.get("command") or "") for v in verifs if not v.get("passed") and v.get("command")]
+            fail_note = f" (failed: {', '.join(failed_cmds[:3])})" if failed_cmds else ""
+            out.append(f"  verification: {passed_cnt}/{len(verifs)} passed{fail_note}")
+        risks = [str(rk).strip() for rk in (res.get("risks") or []) if str(rk).strip()]
+        if risks:
+            out.append("  risks: " + "; ".join(risks[:5]))
+    elif isinstance(res, str) and res.strip():
+        out.append(f"  output: {codex_run.truncate_text(res.strip(), 240)}")
+
+    err = codex_catalog._clean_optional_str(r.get("error"))
+    if err:
+        out.append(f"  error: {err}")
+        log_file = codex_catalog._clean_optional_str(r.get("log_file"))
+        if log_file:
+            out.append(f"  log_file: {log_file}")
+
+    if status == "running":
+        latest = r.get("latest_event")
+        if isinstance(latest, dict):
+            kind = latest.get("kind") or "event"
+            detail = (
+                latest.get("display_command")
+                or latest.get("text")
+                or latest.get("message")
+                or latest.get("command")
+                or ""
+            )
+            detail_str = codex_run.truncate_text(str(detail).strip(), 140) if detail else ""
+            out.append(f"  latest_step: [{kind}] {detail_str}".rstrip())
+
+    return out
+
+
+def format_wait_or_status_brief(payload: dict[str, Any], *, is_wait: bool = False) -> str:
+    """Format a compact human/LLM digest for wait_codex_task and get_codex_task_status."""
+    if "runs" in payload and isinstance(payload["runs"], list):
+        runs = payload["runs"]
+    elif "run_id" in payload:
+        runs = [payload]
+    else:
+        runs = []
+
+    wait_timed_out = bool(payload.get("wait_timed_out"))
+    lines: list[str] = []
+    if is_wait:
+        mode = payload.get("wait_mode") or "single"
+        lines.append(f"Codex Wait Result (mode={mode}, wait_timed_out={str(wait_timed_out).lower()})")
+        if payload.get("wait_timeout_clamped_sec"):
+            lines.append("Note: wait timeout clamped to 120s to avoid MCP transport timeout.")
+        if wait_timed_out:
+            running_ids = [str(x) for x in (payload.get("still_running_ids") or [])]
+            lines.append(
+                "WAIT TIMED OUT (NOT A TASK FAILURE): still running "
+                f"[{', '.join(running_ids)}]. Call wait_codex_task again (timeout<=120) instead of re-spawning."
+            )
+    else:
+        active = payload.get("active_runs", 0)
+        max_conc = payload.get("max_concurrent_runs", 5)
+        lines.append(f"Codex Status (slots={active}/{max_conc}, tracked={len(runs)})")
+
+    for r in runs:
+        if isinstance(r, dict):
+            lines.extend(_format_single_run_digest(r))
+
+    return "\n".join(lines)
+
+
+def format_stop_or_close_brief(payload: dict[str, Any], *, action: str) -> str:
+    """Format a concise one-line confirmation for stop_codex_task / close_codex_task."""
+    if action == "stop":
+        rid = payload.get("run_id") or ""
+        status = payload.get("status") or "cancelled"
+        return f"Stopped Codex task {rid} (status={status})."
+    closed_ids = [str(x) for x in (payload.get("closed_ids") or [])]
+    skipped = [str(x) for x in (payload.get("skipped_running_ids") or [])]
+    closed_str = ", ".join(closed_ids) if closed_ids else "none"
+    msg = f"Closed Codex task(s): {closed_str}."
+    if skipped:
+        msg += f" Skipped still-running: {', '.join(skipped)}."
+    return msg
+
+
 @dataclass
 class RunState:
     run_id: str
@@ -176,6 +421,11 @@ class RunState:
         if not digest_src:
             digest_src = preview or self.prompt
         work_digest = codex_run.truncate_text(digest_src, 120)
+        completed_cmds = sum(
+            1
+            for ev in self.events
+            if ev.get("kind") == "command" and ev.get("status") == "completed"
+        )
 
         return {
             "run_id": self.run_id,
@@ -186,6 +436,7 @@ class RunState:
             "title": self.title or codex_run.derive_short_title(preview or self.prompt, 16),
             "role": self.role or ("只读探索" if self.mode == "read-only" else "代码实现"),
             "work_digest": work_digest,
+            "completed_commands": completed_cmds,
             "parent_session_id": self.parent_session_id or "default",
             "parent_session_title": self.parent_session_title or Path(self.cwd).name,
             "closed": self.closed,
@@ -681,9 +932,11 @@ class RunManager:
             return
 
         raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
-        if not raw_output and state.last_agent_message:
-            raw_output = state.last_agent_message.strip()
         parsed_result = safe_parse_handoff(raw_output) if raw_output else None
+        if parsed_result is None and state.last_agent_message:
+            candidate = safe_parse_handoff(state.last_agent_message.strip())
+            if not timed_out or (isinstance(candidate, dict) and "status" in candidate):
+                parsed_result = candidate
 
         fallback = codex_run.parse_telemetry(combined_log)
 
@@ -724,8 +977,19 @@ class RunManager:
             )
             if state.status != "cancelled":
                 if timed_out:
+                    completed_cmds = sum(
+                        1
+                        for ev in state.events
+                        if ev.get("kind") == "command" and ev.get("status") == "completed"
+                    )
                     state.status = "error"
-                    state.error = f"Timed out after {timeout}s"
+                    if completed_cmds > 0:
+                        state.error = (
+                            f"执行超时 ({timeout}s)，中止前已完成 {completed_cmds} 条命令"
+                            "（完整过程日志已保存在 codex.log，可展开步骤查看）"
+                        )
+                    else:
+                        state.error = f"Timed out after {timeout}s"
                     self._append_event(state, {"kind": "error", "message": state.error})
                 elif state.exit_code == 0:
                     if handoff_status == "blocked":
@@ -948,7 +1212,7 @@ class RunManager:
         run_ids: list[str],
         *,
         wait_mode: str = "all",
-        timeout: int = 600,
+        timeout: int = 120,
     ) -> dict[str, Any]:
         """Wait for one or multiple runs (`all` or `any`), treating wait timeout as non-fatal."""
         if not run_ids:
@@ -1553,7 +1817,11 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "search": {"type": "boolean", "default": False, "description": "Enable live web search."},
                 "add_dir": {"type": "array", "items": {"type": "string"}, "description": "Additional writable directories."},
                 "raw": {"type": "boolean", "default": False, "description": "Disable JSON output schema."},
-                "timeout": {"type": "integer", "default": 600, "description": "Execution timeout in seconds."},
+                "timeout": {
+                    "type": "integer",
+                    "default": 600,
+                    "description": "Worker execution timeout in seconds (default 600; keep >=600 for multi-directory scans, parallel workloads, or complex coding tasks).",
+                },
                 "title": {"type": "string", "description": "Optional short task title for panel/history display."},
                 "role": {"type": "string", "description": "Optional subagent role label (e.g. '只读探索', '代码实现', '独立审查')."},
                 "conversation_id": {"type": "string", "description": "Optional parent Antigravity conversation ID for history grouping."},
@@ -1575,7 +1843,13 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "run_id": {"type": "string", "description": "Single run_id to wait on."},
                 "run_ids": {"type": "array", "items": {"type": "string"}, "description": "Multiple run_ids for parallel rolling wait."},
                 "wait_mode": {"type": "string", "enum": ["all", "any"], "default": "all"},
-                "timeout": {"type": "integer", "default": 600, "description": "Max wait seconds."},
+                "timeout": {
+                    "type": "integer",
+                    "default": 120,
+                    "minimum": 1,
+                    "maximum": 120,
+                    "description": "Max wait seconds per poll call (default 120, capped at 120s to avoid MCP transport timeout; if wait_timed_out=true, call wait_codex_task again instead of re-spawning).",
+                },
             },
         },
     },
@@ -1890,7 +2164,7 @@ class McpServer:
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
                     },
-                    "serverInfo": {"name": "agy-codex", "version": "1.2.0"},
+                    "serverInfo": {"name": "agy-codex", "version": "1.3.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -1949,7 +2223,10 @@ class McpServer:
             )
             payload.pop("hidden_models_count", None)
             payload["all_models_count"] = payload["visible_models_count"]
-            return self._tool_ok(payload)
+            active_runs = self.manager.active_count()
+            payload["active_runs"] = active_runs
+            payload["recommended_wait_timeout_sec"] = 120
+            return self._tool_ok(payload, text=format_models_brief(payload, active_runs=active_runs))
 
         if name == "start_codex_task":
             state = self.manager.start_run(arguments)
@@ -1962,17 +2239,21 @@ class McpServer:
             )
             summary["note"] = (
                 "Codex worker started. Call open_codex_panel(tab='subagents', run_id=...) once "
-                "to open or update live progress in the right side pane, then call wait_codex_task "
+                "to open or update live progress in the right side pane, then call wait_codex_task(..., timeout=120) "
                 "or get_codex_task_status."
             )
-            return self._tool_ok(summary)
+            return self._tool_ok(summary, text=format_start_brief(summary))
 
         if name == "wait_codex_task":
             run_ids = self._collect_run_ids(arguments)
             wait_mode = str(arguments.get("wait_mode") or "all")
-            timeout = int(arguments.get("timeout") or 600)
-            payload = self.manager.wait_runs(run_ids, wait_mode=wait_mode, timeout=timeout)
-            return self._tool_ok(payload)
+            raw_timeout = arguments.get("timeout")
+            req_timeout = 120 if raw_timeout is None else int(raw_timeout)
+            clamped = max(1, min(120, req_timeout))
+            payload = self.manager.wait_runs(run_ids, wait_mode=wait_mode, timeout=clamped)
+            if req_timeout > 120:
+                payload["wait_timeout_clamped_sec"] = 120
+            return self._tool_ok(payload, text=format_wait_or_status_brief(payload, is_wait=True))
 
         if name == "get_codex_task_status":
             run_ids = self._collect_run_ids(arguments)
@@ -1980,13 +2261,14 @@ class McpServer:
                 all_runs = self.manager.list_runs(limit=10)
                 run_ids = [r["run_id"] for r in all_runs if r.get("status") == "running"]
             payload = self.manager.get_status(run_ids)
-            return self._tool_ok(payload)
+            return self._tool_ok(payload, text=format_wait_or_status_brief(payload, is_wait=False))
 
         if name == "stop_codex_task":
             run_id = str(arguments.get("run_id") or "").strip()
             if not run_id:
                 raise ValueError("'run_id' is required.")
-            return self._tool_ok(self.manager.cancel_run(run_id))
+            res = self.manager.cancel_run(run_id)
+            return self._tool_ok(res, text=format_stop_or_close_brief(res, action="stop"))
 
         if name == "close_codex_task":
             run_ids = self._collect_run_ids(arguments)
@@ -1994,7 +2276,7 @@ class McpServer:
             res = self.manager.close_runs(
                 run_ids, closed_by="agent", close_all_finished=close_all
             )
-            return self._tool_ok(res)
+            return self._tool_ok(res, text=format_stop_or_close_brief(res, action="close"))
 
         if name == "open_codex_panel":
             tab = str(arguments.get("tab") or "subagents").strip()
@@ -2201,9 +2483,10 @@ class McpServer:
 
         raise ValueError(f"Unknown tool: {name}")
 
-    def _tool_ok(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _tool_ok(self, payload: dict[str, Any], *, text: str | None = None) -> dict[str, Any]:
+        body_text = text if text is not None else json.dumps(payload, ensure_ascii=False, indent=2)
         return {
-            "content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False, indent=2)}],
+            "content": [{"type": "text", "text": body_text}],
             "structuredContent": payload,
         }
 
