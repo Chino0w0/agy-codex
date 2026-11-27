@@ -10,6 +10,7 @@ export interface ModelsViewState {
   loadError?: string | null;
   saving: boolean;
   enabled: boolean;
+  interceptNativeSubagents: boolean;
   excludeOrchestratorModels: boolean;
   retentionHours: number;
   statusMsg: string | null;
@@ -75,6 +76,21 @@ export function renderModelsView(st: ModelsViewState): string {
       <div class="switch-row-card">
         <div class="switch-row-info">
           <div class="label-with-tip">
+            <label for="cfg-intercept-switch" class="switch-row-label">默认接管原生子代理路由</label>
+            ${renderHelpTip(
+              "intercept-native",
+              "默认接管原生子代理路由",
+              "开启后通过 Antigravity 官方 `PreToolUse` 钩子自动把通用子代理（编码、排障、审查、调研等）重定向给 Codex 联动；`browser`、`image-generator` 等专有能力自动放行，若本机尚未安装或登录 Codex CLI 也会自动降级放行原生不阻塞。",
+            )}
+          </div>
+          <div class="switch-row-desc">${st.interceptNativeSubagents ? "已激活：通用子任务默认自动走 Codex" : "仅按需：需在对话中显式指定或通过规则触发 Codex"}</div>
+        </div>
+        <input id="cfg-intercept-switch" type="checkbox" switch ${st.interceptNativeSubagents ? "checked" : ""} aria-label="默认接管原生子代理路由" />
+      </div>
+
+      <div class="switch-row-card">
+        <div class="switch-row-info">
+          <div class="label-with-tip">
             <label for="cfg-orch-switch" class="switch-row-label">排除 Orchestrator 模型派发</label>
             ${renderHelpTip(
               "orch-guard",
@@ -108,8 +124,8 @@ export function renderModelsView(st: ModelsViewState): string {
     <div class="section-title"><span>派发默认值与留存策略</span></div>
     <div class="form-stack">
       <div class="field">
-        <label for="cfg-def-model">默认派发模型 (留空则派发前先让用户选定)</label>
-        <input type="text" id="cfg-def-model" list="known-models-datalist" value="${escapeHtml(cfg.defaults.model || "")}" placeholder="派发前先让用户选定 (推荐留空)" />
+        <label for="cfg-def-model">默认派发模型 (留空则沿用 config.toml 合规默认模型)</label>
+        <input type="text" id="cfg-def-model" list="known-models-datalist" value="${escapeHtml(cfg.defaults.model || "")}" placeholder="沿用 config.toml 合规默认模型 (推荐留空)" />
         <datalist id="known-models-datalist">
           ${d.models
             .filter((m) => !(m.orchestrator_excluded && st.excludeOrchestratorModels))
@@ -213,6 +229,10 @@ export function renderModelsView(st: ModelsViewState): string {
             <label for="cfg-map-extra-keys">额外白名单键 (逗号分隔)</label>
             <input type="text" id="cfg-map-extra-keys" value="${escapeHtml((cfg.mapping.extra_whitelist_keys || []).join(", "))}" placeholder="如 web_search, allow_login_shell" />
           </div>
+          <div class="field">
+            <label for="cfg-map-passthrough-subagents">原生放行子代理白名单 (逗号分隔)</label>
+            <input type="text" id="cfg-map-passthrough-subagents" value="${escapeHtml((cfg.mapping.native_passthrough_subagents || ["browser", "image-generator"]).join(", "))}" placeholder="如 browser, image-generator" />
+          </div>
           <label class="checkbox-inline">
             <input type="checkbox" id="cfg-map-allow-nested" ${cfg.mapping.allow_nested_subagents ? "checked" : ""} />
             <span>允许 Codex 内部派生子线程 (allow_nested_subagents)</span>
@@ -279,7 +299,7 @@ export function renderModelsView(st: ModelsViewState): string {
         ${renderHelpTip(
           "direct-mode",
           "tool_mode: direct 受限与目录过滤",
-          "列表已过滤 `visibility=hide` 隐藏模型。标记为 `受限: direct` 的条目（`tool_mode: direct` 或 `supports_search_tool=false`）不会加载 `fastctx` 等透传 MCP 与原生搜索工具。",
+          "列表已过滤 `visibility=hide` 隐藏模型。标记为 `受限: direct` 的条目（`tool_mode: direct` 或 `supports_search_tool=false`）不会加载透传 MCP 与原生搜索工具。",
         )}
       </div>
       <input type="search" id="model-search-input" class="compact-search" value="${escapeHtml(st.searchQuery)}" placeholder="搜索模型 slug / 名称..." />

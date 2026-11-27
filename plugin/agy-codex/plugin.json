@@ -1,8 +1,8 @@
 {
   "name": "agy-codex",
   "displayName": "Agy Codex",
-  "version": "1.1.2",
-  "description": "Antigravity <-> Codex ephemeral subagent orchestration with instant enable/disable toggle, Orchestrator guard, 24h traceable history, live subagent monitor, and clean workbench UI.",
+  "version": "1.2.0",
+  "description": "Out-of-the-box Antigravity <-> Codex default subagent routing via lifecycle hooks, instant native/Codex toggle, Orchestrator guard, 24h traceable history, and clean 4-tab workbench UI.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Chino0w0",

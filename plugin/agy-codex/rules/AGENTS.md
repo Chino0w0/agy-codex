@@ -1,8 +1,8 @@
 # Agy Codex 子 Agent 编排规范
 
-1. **统一路由与结构化传参**：将代码实现、重构、排障或跨模型核查委派给 Codex / GPT / 指定 Codex 模型时，优先调用 `agy-codex` MCP 工具（`list_codex_models` → `start_codex_task` → `open_codex_panel` → `get_codex_task_status` / `wait_codex_task` → `stop_codex_task` → `close_codex_task`），不要直接在终端裸跑 `codex exec`。调用 `start_codex_task` 时传入可选结构化参数 `title`、`role`、`conversation_id`、`conversation_title`、`context_files`、`acceptance_criteria`、`non_goals`，以便分组展示与精确约束执行。
-2. **可随时开关尊重用户**：当用户或工具返回 Codex 子代理已暂停（`enabled=false`）时，立刻改用 Antigravity 原生子 Agent 完成任务，不得强行绕过开关。
-3. **先发现、未指定先问用户与 Orchestrator 防嵌套排除**：不认识模型 slug、不确定其支持哪些推理档位或需要使用角色预设时，先调用 `list_codex_models` 查询；当用户在当前对话未明确指定具体模型、且所用 `preset` 与工作台 `defaults.model` 均未绑定具体模型时，先将可见候选模型与支持档位列给用户选定，再调用 `start_codex_task`。遵循用户在配置中设置的 `presets`、`excluded_models` 与 `exclude_orchestrator_models=true`（绝不选择 Orchestrator 编排类模型或已排除模型作为 Codex 子代理目标），并如实区分 `requested` / `effective` / `observed` 身份，缺失即报未知，禁止猜值。
+1. **默认路由与结构化传参（开箱即走 Codex）**：只要「Codex 联动」开关开启（`enabled=true`，安装即默认开启）且本地 Codex CLI 已就绪，凡通用子 Agent 委派（编码实现、重构、排障、代码审查、只读调研、并行拆分）默认一律走 `agy-codex` MCP（`list_codex_models` -> `start_codex_task` -> `open_codex_panel` -> `get_codex_task_status` / `wait_codex_task` -> `stop_codex_task` -> `close_codex_task`），不再调用原生 `invoke_subagent`，也禁止直接在终端裸跑 `codex exec`。仅 Antigravity 专有子代理（`browser`、`image-generator`、`flutter_a11y_agent` 等）、用户当轮明确要求使用原生子代理、或「Codex 联动」处于暂停状态时使用原生 `invoke_subagent`。调用 `start_codex_task` 时传入可选结构化参数 `title`、`role`、`conversation_id`、`conversation_title`、`context_files`、`acceptance_criteria`、`non_goals`。
+2. **可随时开关尊重用户**：当用户或工具返回 Codex 子代理已暂停（`enabled=false`）或 `intercept_native_subagents=false` 且用户未指定 Codex 时，立刻改用 Antigravity 原生子 Agent 完成任务，不得强行绕过开关。
+3. **合规默认模型优先沿用与 Orchestrator 防嵌套排除**：模型选择优先级依次为：用户当轮显式指定模型 -> `preset.model` -> 工作台 `defaults.model` -> 用户 `~/.codex/config.toml` 中的合规默认模型（未在 `excluded_models` 且通过 Orchestrator 排除保护）。只要上述优先级能解析出合规模型，直接派发 `start_codex_task` 无需中断询问；仅当四层均未指定合规模型（或需要确认特殊推理档位/未知模型 slug）时，先调用 `list_codex_models` 列给用户选定再派发。绝不选择 Orchestrator 编排类模型或已排除模型，并如实区分 `requested` / `effective` / `observed` 身份，缺失即报未知，禁止猜值。
 4. **单任务粒度、档位纪律与六段式自包含业务上下文**：
    - **单任务聚焦**：每个写子任务聚焦 1 个有界交付物（预计 2–5 分钟完成）；常规编码默认用 `medium` 或 `high`，仅将 `xhigh` 留给复杂跨模块排障与根因分析。
    - **严禁转述空洞口号**：禁止把 `"大厂级升级"`、`"全链路优化"` 等缺乏具体 UI/API 规格的模糊口号原样丢给 Codex。每个写任务 `prompt` 必须交付自包含的六段式业务上下文包：

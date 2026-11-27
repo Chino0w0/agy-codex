@@ -1,0 +1,24 @@
+{
+  "agy-codex-router": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 server/routing_hook.py SessionStart",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "invoke_subagent|subagent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 server/routing_hook.py PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

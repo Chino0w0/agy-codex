@@ -9,6 +9,7 @@ import type {
   StatsPayload,
   TimelineEvent,
   ToggleExcludeOrchestratorPayload,
+  ToggleInterceptNativePayload,
   WorkbenchConfig,
   WorkbenchPayload,
 } from "./types";
@@ -21,7 +22,7 @@ import { renderTraceView, type TraceViewState } from "./views/trace";
 
 const AuxPaneResponseSchema = z.object({ isError: z.boolean().optional() }).passthrough();
 
-const app = new App({ name: "Agy Codex", version: "1.1.2" }, {});
+const app = new App({ name: "Agy Codex", version: "1.2.0" }, {});
 
 if (typeof HTMLInputElement !== "undefined" && !("switch" in HTMLInputElement.prototype)) {
   document.documentElement.classList.add("no-native-switch");
@@ -32,6 +33,7 @@ type PanelTab = "subagents" | "history" | "stats" | "models";
 let viewMode: "inline" | "panel" = "inline";
 let activeTab: PanelTab = "subagents";
 let codexEnabled = true;
+let interceptNativeSubagents = true;
 let excludeOrchestratorModels = true;
 let retentionHours = 24;
 let activeRunsCount = 0;
@@ -388,6 +390,12 @@ function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload): void {
     codexEnabled = data.enabled;
   }
   if (
+    "intercept_native_subagents" in data &&
+    typeof data.intercept_native_subagents === "boolean"
+  ) {
+    interceptNativeSubagents = data.intercept_native_subagents;
+  }
+  if (
     "exclude_orchestrator_models" in data &&
     typeof data.exclude_orchestrator_models === "boolean"
   ) {
@@ -619,8 +627,8 @@ async function handleToggleCodexEnabled(nextVal: boolean): Promise<void> {
     render();
     showToast(
       codexEnabled
-        ? "已开启 Codex 子代理联动，可正常派发新任务"
-        : "已暂停 Codex 子代理联动，新子任务将交由 Antigravity 原生子代理执行",
+        ? "已开启 Codex 子代理联动，通用子任务将默认走 Codex"
+        : "已暂停 Codex 子代理联动，新子任务已全部交由 Antigravity 原生子代理执行",
     );
   } catch (err) {
     codexEnabled = prevVal;
@@ -671,6 +679,46 @@ async function handleToggleExcludeOrchestrator(nextVal: boolean): Promise<void> 
     }
     render();
     showToast(`切换保护开关失败: ${String(err)}`);
+  }
+}
+
+async function handleToggleInterceptNative(nextVal: boolean): Promise<void> {
+  if (activeTab === "models") syncDraftFromDom();
+  const prevVal = interceptNativeSubagents;
+  interceptNativeSubagents = nextVal;
+  if (workbenchDraft) {
+    workbenchDraft.intercept_native_subagents = nextVal;
+  }
+  render();
+  try {
+    const res = await app.callServerTool({
+      name: "toggle_intercept_native_subagents",
+      arguments: { enabled: nextVal },
+    });
+    const data = res?.structuredContent as ToggleInterceptNativePayload | undefined;
+    if (data) {
+      if (typeof data.intercept_native_subagents === "boolean") {
+        interceptNativeSubagents = data.intercept_native_subagents;
+      } else if (typeof data.enabled === "boolean") {
+        interceptNativeSubagents = data.enabled;
+      }
+      if (workbenchDraft) {
+        workbenchDraft.intercept_native_subagents = interceptNativeSubagents;
+      }
+    }
+    render();
+    showToast(
+      interceptNativeSubagents
+        ? "已启用默认接管原生子代理路由"
+        : "已改为仅按需使用 Codex（不自动拦截原生子代理）",
+    );
+  } catch (err) {
+    interceptNativeSubagents = prevVal;
+    if (workbenchDraft) {
+      workbenchDraft.intercept_native_subagents = prevVal;
+    }
+    render();
+    showToast(`切换路由接管开关失败: ${String(err)}`);
   }
 }
 
@@ -872,6 +920,9 @@ async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
       maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
       if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
       if (typeof data.enabled === "boolean") codexEnabled = data.enabled;
+      if (typeof data.intercept_native_subagents === "boolean") {
+        interceptNativeSubagents = data.intercept_native_subagents;
+      }
       if (typeof data.exclude_orchestrator_models === "boolean") {
         excludeOrchestratorModels = data.exclude_orchestrator_models;
       }
@@ -920,6 +971,10 @@ function syncDraftFromDom(): void {
       workbenchDraft.mapping.context_window_policy = cwp;
     }
     workbenchDraft.mapping.extra_whitelist_keys = val("cfg-map-extra-keys")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    workbenchDraft.mapping.native_passthrough_subagents = val("cfg-map-passthrough-subagents")
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean);
@@ -1384,6 +1439,7 @@ function render(): void {
       loadError: modelsLoadError,
       saving: savingConfig,
       enabled: codexEnabled,
+      interceptNativeSubagents,
       excludeOrchestratorModels,
       retentionHours,
       statusMsg: configStatusMsg,
@@ -1808,6 +1864,10 @@ function bindInteractions(): void {
     if (configRoot) wireHelpTips(configRoot);
   }
 
+  document.getElementById("cfg-intercept-switch")?.addEventListener("change", (ev) => {
+    void handleToggleInterceptNative(Boolean((ev.target as HTMLInputElement).checked));
+  });
+
   document.getElementById("cfg-orch-switch")?.addEventListener("change", (ev) => {
     void handleToggleExcludeOrchestrator(Boolean((ev.target as HTMLInputElement).checked));
   });
@@ -1837,6 +1897,7 @@ function bindInteractions(): void {
         name: "save_workbench_config",
         arguments: {
           enabled: codexEnabled,
+          intercept_native_subagents: interceptNativeSubagents,
           exclude_orchestrator_models: excludeOrchestratorModels,
           defaults: workbenchDraft.defaults,
           mapping: workbenchDraft.mapping,
@@ -1852,6 +1913,9 @@ function bindInteractions(): void {
         maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
         if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
         if (typeof data.enabled === "boolean") codexEnabled = data.enabled;
+        if (typeof data.intercept_native_subagents === "boolean") {
+          interceptNativeSubagents = data.intercept_native_subagents;
+        }
         if (typeof data.exclude_orchestrator_models === "boolean") {
           excludeOrchestratorModels = data.exclude_orchestrator_models;
         }
@@ -2015,6 +2079,9 @@ app.ontoolresult = (result) => {
     closed24hCount = Number(sc.closed_24h_count ?? closed24hCount);
     maxConcurrentRuns = Number(sc.max_concurrent_runs ?? 5);
     if (typeof sc.enabled === "boolean") codexEnabled = sc.enabled;
+    if (typeof sc.intercept_native_subagents === "boolean") {
+      interceptNativeSubagents = sc.intercept_native_subagents;
+    }
     if (typeof sc.exclude_orchestrator_models === "boolean") {
       excludeOrchestratorModels = sc.exclude_orchestrator_models;
     }
