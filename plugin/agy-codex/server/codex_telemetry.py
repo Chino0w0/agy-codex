@@ -641,39 +641,57 @@ def _normalize_ledger_record(run_summary: dict[str, Any]) -> dict[str, Any]:
 
 @contextmanager
 def _ledger_lock(path: Path) -> Iterator[None]:
-    deadline = time.monotonic() + 3.0
-    while True:
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except (FileExistsError, PermissionError):
-            try:
-                observed = path.stat()
-                if time.time() - observed.st_mtime > 15 and path.stat() == observed:
-                    path.unlink()
-                    continue
-            except (FileNotFoundError, PermissionError, OSError):
-                pass
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out acquiring the stats ledger lock.")
-            time.sleep(0.03)
-        else:
-            try:
-                owned = os.fstat(fd)
-            finally:
-                os.close(fd)
-            break
+    """Cross-process OS kernel lock (safe across concurrent Windows/POSIX MCP servers)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 5.0
+    fh = path.open("a+b")
+    locked = False
     try:
+        if os.name == "nt":
+            import msvcrt
+
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                fh.write(b"\0")
+                fh.flush()
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    locked = True
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out acquiring the stats ledger lock.")
+                    time.sleep(0.015)
+        else:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    locked = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Timed out acquiring the stats ledger lock.")
+                    time.sleep(0.015)
         yield
     finally:
-        for _ in range(5):
+        if locked:
             try:
-                if path.stat() == owned:
-                    path.unlink()
-                break
-            except FileNotFoundError:
-                break
-            except PermissionError:
-                time.sleep(0.01)
+                if os.name == "nt":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
 
 
 def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:

@@ -81,6 +81,8 @@ export interface WorktreeInfo {
 export interface RunSnapshot {
   run_id: string;
   source?: "mcp" | "cli";
+  origin?: "agent" | "user";
+  raw?: boolean;
   status: "running" | "done" | "partial" | "error" | "cancelled" | "blocked";
   cwd: string;
   mode: string;
@@ -149,7 +151,14 @@ export interface HistoryPayload {
 }
 
 export interface ListRunsPayload {
+  default_cwd?: string;
   runs: RunSnapshot[];
+  scope_session_id?: string | null;
+  scope_session_title?: string | null;
+  scope_mode?: "session" | "all";
+  total_unclosed_runs?: number;
+  other_sessions_runs?: number;
+  global_active_runs?: number;
   active_runs: number;
   closed_24h_count?: number;
   max_concurrent_runs: number;
@@ -162,6 +171,10 @@ export interface ListRunsPayload {
 export interface CloseRunPayload {
   closed_ids?: string[];
   runs?: RunSnapshot[];
+  scope_session_id?: string | null;
+  total_unclosed_runs?: number;
+  other_sessions_runs?: number;
+  global_active_runs?: number;
   active_runs?: number;
   closed_24h_count?: number;
 }
@@ -321,6 +334,8 @@ export interface DoctorReport {
 }
 
 export interface WorkbenchPayload {
+  default_cwd?: string;
+  plugin_version?: string;
   models: CatalogModel[];
   all_models_count: number;
   visible_models_count: number;
@@ -368,7 +383,63 @@ export interface ToggleInterceptNativePayload {
   workbench_config?: WorkbenchConfig;
 }
 
+export type StartUserTaskPayload = RunSnapshot & {
+  scope_session_id?: string | null;
+  total_unclosed_runs?: number;
+  other_sessions_runs?: number;
+  global_active_runs?: number;
+  active_runs: number;
+  max_concurrent_runs: number;
+  runs?: RunSnapshot[];
+};
+
+export interface UpdateCheckPayload {
+  ok: boolean;
+  repo: string;
+  channel: "release" | "main";
+  current_version: string;
+  current_commit?: string | null;
+  remote_version?: string | null;
+  remote_commit?: string | null;
+  remote_short_commit?: string | null;
+  latest_id?: string | null;
+  update_available: boolean;
+  dismissed_version?: string | null;
+  is_dismissed: boolean;
+  release_url?: string | null;
+  notes?: string | null;
+  published_at?: string | null;
+  checked_at?: number | null;
+  from_cache: boolean;
+  can_self_update: boolean;
+  self_update_blocked_reason?: string | null;
+  error?: string | null;
+}
+
+export interface UpdateStatusPayload {
+  status: "idle" | "checking" | "downloading" | "verifying" | "installing" | "completed" | "failed";
+  phase_label: string;
+  current_version: string;
+  current_commit?: string | null;
+  target_version?: string | null;
+  target_commit?: string | null;
+  channel?: "release" | "main" | null;
+  started_at?: number | null;
+  updated_at?: number | null;
+  completed_at?: number | null;
+  restart_required: boolean;
+  message?: string | null;
+  error?: string | null;
+  can_self_update: boolean;
+  self_update_blocked_reason?: string | null;
+  check?: UpdateCheckPayload | null;
+}
+
 export type ServerToolName =
+  | "start_user_task"
+  | "check_for_updates"
+  | "start_plugin_update"
+  | "get_update_status"
   | "get_run_events"
   | "list_runs"
   | "get_history"

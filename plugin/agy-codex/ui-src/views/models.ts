@@ -1,5 +1,83 @@
-import type { CommandPreviewPayload, WorkbenchConfig, WorkbenchPayload } from "../types";
-import { escapeHtml, formatNumber, renderCodexToggleButton, renderHelpTip } from "../utils";
+import type { CommandPreviewPayload, UpdateCheckPayload, UpdateStatusPayload, WorkbenchConfig, WorkbenchPayload } from "../types";
+import { escapeHtml, formatNumber, formatTimestamp, renderCodexToggleButton, renderHelpTip } from "../utils";
+
+export interface PluginUpdateViewState {
+  check: UpdateCheckPayload | null;
+  status: UpdateStatusPayload | null;
+  pluginVersion?: string;
+  checking: boolean;
+  starting: boolean;
+  error: string | null;
+}
+
+export function isUpdateRunning(status: UpdateStatusPayload | null): boolean {
+  return status?.status === "checking" || status?.status === "downloading" ||
+    status?.status === "verifying" || status?.status === "installing";
+}
+
+export function updateBlockReason(st: PluginUpdateViewState): string | null {
+  if (st.status?.can_self_update === false || st.check?.can_self_update === false) {
+    return st.status?.self_update_blocked_reason || st.check?.self_update_blocked_reason || "当前安装方式不支持在线更新";
+  }
+  if (!st.status && !st.check) return "等待获取在线更新状态";
+  if (st.status?.restart_required) return "请先刷新 MCP 服务以应用已安装的更新";
+  return null;
+}
+
+export function versionLabel(version?: string | null): string {
+  return version ? `v${version.replace(/^v/i, "")}` : "";
+}
+
+export function remoteUpdateLabel(check: UpdateCheckPayload): string {
+  const commit = check.channel === "main" ? (check.remote_short_commit || check.remote_commit?.slice(0, 8)) : null;
+  return [versionLabel(check.remote_version), commit].filter(Boolean).join(" / ");
+}
+
+export const MCP_REFRESH_GUIDANCE = "请在 Antigravity 设置 -> MCP Servers 中刷新 agy-codex（或重启客户端）生效。";
+
+export function renderUpdateCard(st: PluginUpdateViewState): string {
+  const { check, status, checking, starting } = st;
+  const running = isUpdateRunning(status);
+  const blocked = updateBlockReason(st);
+  const busy = starting || running;
+  const currentVersion = versionLabel(status?.current_version || check?.current_version || st.pluginVersion || "1.5.0");
+  const currentCommit = (status?.current_commit || check?.current_commit)?.slice(0, 8);
+  const channel = check?.channel || status?.channel;
+  const repo = check?.repo.replace(/^https:\/\/github\.com\//i, "").replace(/\/$/, "") || "";
+  const repoLink = /^[\w.-]+\/[\w.-]+$/.test(repo)
+    ? `<a id="plugin-update-repo-link" href="https://github.com/${escapeHtml(repo)}" target="_blank" rel="noopener noreferrer">${escapeHtml(repo)}</a>` : "—";
+  const target = versionLabel(status?.target_version) || status?.target_commit?.slice(0, 8);
+  const completedText = status?.message
+    ? (status.message.includes("MCP Servers") ? status.message : `${status.message} ${MCP_REFRESH_GUIDANCE}`)
+    : `${target ? `已同步至 ${target}。` : "插件已更新。"} ${MCP_REFRESH_GUIDANCE}`;
+  const completion = status?.status === "completed"
+    ? `<div class="banner-ok">${escapeHtml(completedText)}</div>` : "";
+  const failure = status?.status === "failed"
+    ? `<div class="banner-warn">更新失败: ${escapeHtml(status.error || status.message || status.phase_label)}</div>` : "";
+  const error = st.error || check?.error;
+  return `<section id="plugin-update-card" class="section-card plugin-update-card" aria-labelledby="plugin-update-title">
+    <div class="section-title"><span id="plugin-update-title">插件版本与在线更新同步</span></div>
+    <dl class="update-version-grid">
+      <div><dt>当前版本</dt><dd>${escapeHtml(currentVersion)}${currentCommit ? ` / <code>${escapeHtml(currentCommit)}</code>` : ""}</dd></div>
+      <div><dt>远端最新</dt><dd>${escapeHtml(check ? remoteUpdateLabel(check) || "—" : "—")}</dd></div>
+      <div><dt>检测渠道</dt><dd>${channel === "release" ? "GitHub Release" : channel === "main" ? "main 分支" : "自动"}</dd></div>
+      <div><dt>上次检查</dt><dd>${escapeHtml(formatTimestamp(check?.checked_at))}${check?.from_cache ? "（缓存）" : ""}</dd></div>
+      <div><dt>GitHub 仓库</dt><dd>${repoLink}</dd></div>
+    </dl>
+    <div class="section-actions update-actions">
+      <button type="button" class="btn btn-sm" id="check-updates-btn"${busy || checking ? " disabled" : ""}>${checking ? "检查中…" : "检查更新"}</button>
+      <button type="button" class="btn btn-sm" id="check-main-updates-btn"${busy || checking ? " disabled" : ""}>检查 main 最新提交</button>
+      <button type="button" class="btn btn-primary btn-sm" id="start-update-btn"${busy || checking || blocked ? " disabled" : ""}>一键在线更新同步</button>
+    </div>
+    <div class="plugin-update-feedback" role="status"${busy || completion || failure || blocked || error ? "" : " hidden"}>
+      ${busy ? `<div class="update-progress"><span class="status-dot is-running" aria-hidden="true"></span>${escapeHtml(starting ? "正在启动更新…" : (status?.phase_label || "正在更新…"))}</div>` : ""}
+      ${completion}${failure}
+      ${blocked ? `<div class="banner-warn">${escapeHtml(blocked)}</div>` : ""}
+      ${error ? `<div class="banner-warn">${escapeHtml(error)}</div>` : ""}
+    </div>
+    ${check?.notes?.trim() ? `<details id="plugin-update-notes" class="update-notes"><summary>查看更新说明</summary><div>${escapeHtml(check.notes)}</div></details>` : ""}
+  </section>`;
+}
 
 export interface ModelsViewState {
   data: WorkbenchPayload | null;
@@ -15,23 +93,23 @@ export interface ModelsViewState {
   retentionHours: number;
   statusMsg: string | null;
   errorMsg: string | null;
+  update: PluginUpdateViewState;
 }
 
 export function renderModelsView(st: ModelsViewState): string {
+  const updateCard = renderUpdateCard(st.update);
   if (!st.data || !st.draft) {
-    if (st.loadError) {
-      return `<div class="scroll-y custom-scroll config-view-root">
-        <div class="page-stack">
-          <div class="load-error-card">
-            <div>加载模型目录与配置中心失败: ${escapeHtml(st.loadError)}</div>
-            <div class="load-error-actions">
-              <button type="button" id="retry-models-btn" class="btn btn-primary btn-sm">重试加载</button>
-            </div>
+    return `<div class="scroll-y custom-scroll config-view-root">
+      <div class="page-stack">
+        ${updateCard}
+        ${st.loadError ? `<div class="load-error-card">
+          <div>加载模型目录与配置中心失败: ${escapeHtml(st.loadError)}</div>
+          <div class="load-error-actions">
+            <button type="button" id="retry-models-btn" class="btn btn-primary btn-sm">重试加载</button>
           </div>
-        </div>
-      </div>`;
-    }
-    return `<div class="empty-hint">正在加载模型目录与配置中心...</div>`;
+        </div>` : `<div class="empty-hint">正在加载模型目录与配置中心...</div>`}
+      </div>
+    </div>`;
   }
 
   const d = st.data;
@@ -473,6 +551,7 @@ export function renderModelsView(st: ModelsViewState): string {
 
   return `<div class="scroll-y custom-scroll config-view-root">
     <div class="page-stack">
+      ${updateCard}
       ${feedbackHtml}
       ${switchCardHtml}
       <div class="config-grid">

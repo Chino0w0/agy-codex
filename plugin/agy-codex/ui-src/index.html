@@ -2763,6 +2763,148 @@
         }
       }
     }
+    /* 刷新状态、直连抽屉与在线更新 */
+    #panel-refresh-btn.is-spinning {
+      color: var(--color-text-info, #58a6ff);
+    }
+
+    #panel-refresh-btn.is-spinning svg {
+      transform-origin: center;
+      animation: agy-spin 640ms linear infinite;
+    }
+
+    @keyframes agy-spin {
+      to { transform: rotate(360deg); }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #panel-refresh-btn.is-spinning svg { animation: none; }
+      #panel-refresh-btn.is-spinning { background: var(--color-background-info, rgba(56, 139, 253, 0.15)); }
+      .update-progress .status-dot { animation: none; }
+    }
+
+    .switcher-new-chat { flex: none; font-size: 17px; }
+    .empty-state-actions { flex-wrap: wrap; justify-content: center; }
+    .empty-state-center.is-under-composer { min-height: 0; overflow: auto; justify-content: safe center; }
+
+    .user-task-drawer {
+      flex: 0 0 auto;
+      min-width: 0;
+      max-height: min(440px, 68vh);
+      margin: 8px 8px 0;
+      padding: 10px;
+      overflow: auto;
+      border: 1px solid var(--color-border-primary, rgba(128, 128, 128, 0.24));
+      border-radius: 8px;
+      background: var(--color-background-secondary, rgba(128, 128, 128, 0.08));
+    }
+
+    #user-task-form, #user-task-form fieldset {
+      display: grid;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    #user-task-form fieldset { margin: 0; padding: 0; border: 0; }
+    .composer-head, .composer-actions, .composer-persist {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .composer-actions { justify-content: flex-end; }
+    .composer-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 8px; }
+    .composer-field { display: grid; gap: 3px; min-width: 0; font-size: 12px; }
+    .composer-field :is(input, select, textarea) { width: 100%; min-width: 0; }
+    .composer-field textarea { resize: vertical; min-height: 54px; }
+    .composer-persist { font-size: 12px; }
+    .user-task-drawer .banner-warn { overflow-wrap: anywhere; }
+
+    .trace-footer-form { flex-wrap: wrap; }
+    .trace-footer-form input { flex: 1 1 180px; max-width: 100%; }
+    .trace-footer-form .trace-footer-actions { margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+
+    .badge-dot.is-update { background: var(--color-text-warning, #d29922); }
+    .wide-view-tab .badge-dot.is-update { position: static; flex: none; }
+
+    .update-banner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 4px 8px;
+      padding: 5px 8px;
+      font-size: 12px;
+      background: var(--color-background-info, rgba(56, 139, 253, 0.15));
+      border-bottom: 1px solid var(--color-border-primary, rgba(128, 128, 128, 0.24));
+    }
+
+    .update-banner > span { min-width: 0; overflow-wrap: anywhere; }
+    .update-banner-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .update-version-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 132px), 1fr));
+      gap: 8px;
+      margin: 0;
+    }
+
+    .update-version-grid dt { color: var(--color-text-secondary, #8b949e); font-size: 12px; }
+    .update-version-grid dd { margin: 2px 0 0; overflow-wrap: anywhere; }
+    .update-version-grid a { color: var(--color-text-info, #58a6ff); }
+    .update-actions { flex-wrap: wrap; }
+    .plugin-update-feedback { display: grid; gap: 6px; overflow-wrap: anywhere; }
+    .plugin-update-feedback[hidden] { display: none; }
+    .update-progress { display: flex; align-items: center; gap: 7px; }
+    .update-notes summary { cursor: pointer; color: var(--color-text-info, #58a6ff); }
+    .update-notes > div { margin-top: 5px; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+    .scope-pill-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 2px 7px;
+      border-radius: 999px;
+      border: 1px solid var(--color-border-primary, rgba(128, 128, 128, 0.32));
+      background: var(--color-background-primary, #111318);
+      color: var(--color-text-secondary, #8b949e);
+      font-size: 11px;
+      line-height: 1.4;
+      cursor: pointer;
+      white-space: nowrap;
+      flex: 0 0 auto;
+    }
+
+    .scope-pill-btn:hover {
+      color: var(--color-text-primary, #e6edf3);
+      border-color: var(--color-ring-primary, #58a6ff);
+    }
+
+    .scope-pill-btn.is-scoped {
+      color: var(--color-text-info, #58a6ff);
+      border-color: color-mix(in srgb, var(--color-ring-primary, #58a6ff) 48%, transparent);
+      background: var(--color-background-info, rgba(56, 139, 253, 0.12));
+    }
+
+    .scope-other-badge {
+      font-size: 10.5px;
+      padding: 0 4px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--color-text-secondary, #8b949e) 22%, transparent);
+      color: var(--color-text-primary, #e6edf3);
+    }
+
+    .switcher-popover-actions {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+
+    @container plugin-shell (min-width: 720px) {
+      .composer-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    }
+
   </style>
 </head>
 <body>

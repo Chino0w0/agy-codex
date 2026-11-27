@@ -1,4 +1,4 @@
-import type { RunSnapshot } from "../types";
+import type { CatalogModel, RunSnapshot } from "../types";
 import {
   ICONS,
   escapeHtml,
@@ -11,12 +11,37 @@ import {
 } from "../utils";
 import { renderTraceView, type TraceViewState } from "./trace";
 
+export interface UserTaskDraft {
+  prompt: string;
+  cwd: string;
+  model: string;
+  effort: string;
+  mode: "write" | "read-only";
+  worktree: string;
+  persist: boolean;
+}
+
+export interface MonitorScopeInfo {
+  sessionId: string | null;
+  sessionTitle: string | null;
+  mode: "session" | "all";
+  otherSessionsRuns: number;
+  totalUnclosedRuns: number;
+}
+
 export interface MonitorViewState {
   runs: RunSnapshot[];
   activeRunId: string | null;
   currentRun: RunSnapshot | null;
   traceState: TraceViewState;
   retentionHours: number;
+  scope?: MonitorScopeInfo;
+  composer: {
+    draft: UserTaskDraft;
+    models: CatalogModel[];
+    sending: boolean;
+    error: string | null;
+  } | null;
 }
 
 export function renderMonitorTablist(
@@ -26,7 +51,7 @@ export function renderMonitorTablist(
   retentionHours = 24,
 ): string {
   if (runs.length === 0) {
-    return `<span class="tablist-empty">当前无活跃子 Agent</span>`;
+    return `<span class="tablist-empty">当前无活跃会话</span>`;
   }
   return runs
     .map((run) => {
@@ -61,6 +86,7 @@ export function renderNarrowAgentSwitcher(
   runs: RunSnapshot[],
   activeRunId: string | null,
   open: boolean,
+  scope?: MonitorScopeInfo,
 ): string {
   const activeRun = runs.find((run) => run.run_id === activeRunId) ?? runs[0];
   if (!activeRun) return "";
@@ -71,6 +97,16 @@ export function renderNarrowAgentSwitcher(
   const hasError = otherAlerts.some((alert) => alert?.badgeClass === "badge-err");
   const alertDot = otherAlerts.some(Boolean)
     ? `<span class="switcher-alert-dot${hasError ? " is-error" : ""}" role="img" aria-label="其他任务有异常" title="其他任务有异常"></span>`
+    : "";
+  const scopeLabel = scope?.sessionId
+    ? (scope.mode === "session" ? "当前对话子 Agent" : "全部对话子 Agent")
+    : "活跃子 Agent";
+  const scopeActionBtn = scope?.sessionId
+    ? (scope.mode === "session" && scope.otherSessionsRuns > 0
+      ? `<button type="button" data-toggle-scope class="link-btn">查看全部 (+${scope.otherSessionsRuns})</button>`
+      : scope.mode === "all"
+        ? `<button type="button" data-toggle-scope class="link-btn">仅看本对话</button>`
+        : "")
     : "";
 
   return `<div class="narrow-agent-switcher-bar">
@@ -84,10 +120,14 @@ export function renderNarrowAgentSwitcher(
       <button type="button" id="narrow-agent-prev" class="icon-btn switcher-step" aria-label="上一子任务" title="上一子任务">&lt;</button>
       <button type="button" id="narrow-agent-next" class="icon-btn switcher-step" aria-label="下一子任务" title="下一子任务">&gt;</button>
     ` : ""}
+    <button type="button" id="open-new-chat-btn" data-open-composer class="icon-btn switcher-new-chat" aria-label="直接新建 Codex 对话" title="直接新建 Codex 对话">+</button>
     <div id="narrow-agent-popover" class="custom-scroll"${open ? "" : " hidden"}>
       <div class="switcher-popover-head">
-        <span id="narrow-agent-options-label">活跃子 Agent (共 ${counts})</span>
-        ${runningCount < runs.length ? `<button type="button" id="narrow-archive-finished" class="btn btn-sm">清空已完成</button>` : ""}
+        <span id="narrow-agent-options-label">${scopeLabel} (共 ${counts})</span>
+        <div class="switcher-popover-actions">
+          ${scopeActionBtn}
+          ${runningCount < runs.length ? `<button type="button" id="narrow-archive-finished" class="btn btn-sm">清空已完成</button>` : ""}
+        </div>
       </div>
       <div id="narrow-agent-options" role="listbox" aria-labelledby="narrow-agent-options-label">
         ${runs.map((run) => {
@@ -119,18 +159,75 @@ export function renderNarrowAgentSwitcher(
   </div>`;
 }
 
+function renderComposer({ draft, models, sending, error }: NonNullable<MonitorViewState["composer"]>): string {
+  const option = (value: string, label: string, selected: string) =>
+    `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(label)}</option>`;
+  return `<section id="user-task-drawer" class="user-task-drawer custom-scroll" aria-labelledby="composer-title">
+    <form id="user-task-form">
+      <div class="composer-head">
+        <strong id="composer-title">直接发起 Codex 对话</strong>
+        <span class="trace-muted">不经过主 Agent</span>
+      </div>
+      <fieldset${sending ? " disabled" : ""}>
+        <label class="composer-field" for="composer-prompt">任务指令
+          <textarea id="composer-prompt" rows="2" placeholder="告诉 Codex 要做什么…">${escapeHtml(draft.prompt)}</textarea>
+        </label>
+        <label class="composer-field" for="composer-cwd">工作目录
+          <input id="composer-cwd" type="text" value="${escapeHtml(draft.cwd)}" placeholder="工作区的绝对路径" spellcheck="false" />
+        </label>
+        <div class="composer-grid">
+          <label class="composer-field" for="composer-model">模型
+            <select id="composer-model">
+              ${option("", "继承默认", draft.model)}
+              ${draft.model && !models.some((model) => model.slug === draft.model) ? `<option value="${escapeHtml(draft.model)}" selected disabled>${escapeHtml(draft.model)}（已不可用）</option>` : ""}
+              ${models.map((model) => option(model.slug, model.display_name || model.slug, draft.model)).join("")}
+            </select>
+          </label>
+          <label class="composer-field" for="composer-effort">思考强度
+            <select id="composer-effort">
+              ${option("", "默认", draft.effort)}
+              ${["low", "medium", "high", "xhigh"].map((level) => option(level, level, draft.effort)).join("")}
+            </select>
+          </label>
+          <label class="composer-field" for="composer-mode">运行模式
+            <select id="composer-mode">${option("write", "可写", draft.mode)}${option("read-only", "只读", draft.mode)}</select>
+          </label>
+          <label class="composer-field" for="composer-worktree">Worktree（可选）
+            <input id="composer-worktree" type="text" value="${escapeHtml(draft.worktree)}" placeholder="分支名称" spellcheck="false" />
+          </label>
+        </div>
+        <label class="composer-persist"><input id="composer-persist" type="checkbox"${draft.persist ? " checked" : ""} /> 多轮续聊 (persist=true)</label>
+      </fieldset>
+      ${error ? `<div class="banner-warn" role="alert">${escapeHtml(error)}</div>` : ""}
+      <div class="composer-actions">
+        <button type="button" id="cancel-user-task-btn" class="btn btn-sm"${sending ? " disabled" : ""}>取消</button>
+        <button type="submit" class="btn btn-primary btn-sm" title="Ctrl+Enter / Cmd+Enter"${sending ? " disabled" : ""}>${sending ? "正在发起…" : "发起对话"}</button>
+      </div>
+    </form>
+  </section>`;
+}
+
 export function renderMonitorView(st: MonitorViewState): string {
+  const composerHtml = st.composer ? renderComposer(st.composer) : "";
   if (st.runs.length === 0) {
-    return `<div class="empty-state-center">
+    const isolatedOther = Boolean(st.scope?.sessionId && st.scope.mode === "session" && st.scope.otherSessionsRuns > 0);
+    const otherCount = st.scope?.otherSessionsRuns ?? 0;
+    return `${composerHtml}<div class="empty-state-center${st.composer ? " is-under-composer" : ""}">
       <div class="empty-state-icon" aria-hidden="true">
         <svg width="20" height="20" viewBox="0 0 16 16" fill="none">
           <path d="M3 8l3.2 3.2L13 4.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </div>
-      <div class="empty-state-title">当前无活跃 Codex 子 Agent</div>
-      <p class="empty-state-desc">所有已关闭的任务均按 Antigravity 大会话归档保存在「历史对话」中（日志留存 ${st.retentionHours} 小时），方便后续 Agent 追溯排查。</p>
+      <div class="empty-state-title">${isolatedOther ? "当前对话暂无活跃 Codex 会话" : "当前无活跃 Codex 会话"}</div>
+      <p class="empty-state-desc">${
+        isolatedOther
+          ? `其他并行 Antigravity 对话中另有 ${otherCount} 个活跃任务已自动隔离；你也可以随时点击下方切换查看全部对话。`
+          : `所有已关闭的任务均按 Antigravity 大会话归档保存在「历史对话」中（日志留存 ${st.retentionHours} 小时），方便后续 Agent 追溯排查。`
+      }</p>
       <div class="empty-state-actions">
-        <button type="button" id="empty-to-history" class="btn btn-primary">查看历史对话</button>
+        <button type="button" id="empty-new-chat-btn" data-open-composer class="btn btn-primary">+ 直接发起 Codex 对话</button>
+        ${isolatedOther ? `<button type="button" id="empty-show-all-scope" data-toggle-scope class="btn">查看全部对话 (${otherCount})</button>` : ""}
+        <button type="button" id="empty-to-history" class="btn">查看历史对话</button>
       </div>
     </div>`;
   }
@@ -141,10 +238,10 @@ export function renderMonitorView(st: MonitorViewState): string {
       : st.runs.find((r) => r.run_id === st.activeRunId) || st.runs[0];
 
   if (!targetRun) {
-    return `<div class="empty-hint">正在加载子 Agent 运行日志...</div>`;
+    return `${composerHtml}<div class="empty-hint">正在加载子 Agent 运行日志...</div>`;
   }
 
-  return `<div role="tabpanel" id="panel-${escapeHtml(targetRun.run_id)}" class="monitor-tabpanel">
+  return `${composerHtml}<div role="tabpanel" id="panel-${escapeHtml(targetRun.run_id)}" class="monitor-tabpanel">
     ${renderTraceView(targetRun, st.traceState, { readOnly: false })}
   </div>`;
 }

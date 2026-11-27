@@ -293,7 +293,7 @@ export function renderTraceView(
   const promptCardHtml = promptBodyText
     ? `<div class="prompt-card">
         <div class="prompt-card-head">
-          <span class="prompt-card-title">派发任务指令</span>
+          <span class="prompt-card-title">${run.origin === "user" ? "用户消息" : "派发任务指令"}</span>
           <button type="button" class="link-btn" data-toggle-prompt="${escapeHtml(run.run_id)}">${promptOpen ? "收起" : "展开全文"}</button>
         </div>
         <div class="prompt-card-body${promptOpen ? " is-expanded" : ""}">${escapeHtml(promptBodyText)}</div>
@@ -380,6 +380,10 @@ export function renderTraceView(
     ? `<div class="banner-ok">${escapeHtml(st.actionFeedback)}</div>`
     : "";
 
+  const reviewButton = st.canSendMessage
+    ? `<button type="button" class="btn btn-sm" id="send-review-msg-btn">发给主 Agent 复核</button>`
+    : "";
+
   // Footer
   let footerHtml = "";
   if (readOnly) {
@@ -408,20 +412,22 @@ export function renderTraceView(
     </div>`;
   } else if (run.persist && run.session_id) {
     const draft = st.composerDrafts.get(run.run_id) || "";
+    const placeholder = run.origin === "user"
+      ? "继续与 Codex 对话 (Enter 发送)..."
+      : "向此长驻子 Agent 发送追问 (persist=true)...";
     footerHtml = `<form class="trace-footer-form" data-followup-form="${escapeHtml(run.run_id)}">
-      <input type="text" data-followup-input="${escapeHtml(run.run_id)}" value="${escapeHtml(draft)}" placeholder="向此长驻子 Agent 发送追问 (persist=true)..." ${st.followupSending ? "disabled" : ""} />
-      <button type="submit" class="btn btn-primary btn-sm" ${st.followupSending ? "disabled" : ""}>${st.followupSending ? "发送中..." : "发送"}</button>
-      <button type="button" class="btn btn-sm" data-close-run="${escapeHtml(run.run_id)}">归档</button>
+      <input type="text" data-followup-input="${escapeHtml(run.run_id)}" value="${escapeHtml(draft)}" aria-label="续聊消息" placeholder="${placeholder}" ${st.followupSending ? "disabled" : ""} />
+      <div class="trace-footer-actions">
+        <button type="submit" class="btn btn-primary btn-sm" ${st.followupSending ? "disabled" : ""}>${st.followupSending ? "发送中..." : "发送"}</button>
+        ${reviewButton}
+        <button type="button" class="btn btn-sm" data-close-run="${escapeHtml(run.run_id)}">归档</button>
+      </div>
     </form>`;
   } else {
     footerHtml = `<div class="trace-footer">
       <span class="trace-muted">用完即销毁 (关闭留存${st.retentionHours}h)</span>
       <div class="trace-footer-actions">
-        ${
-          st.canSendMessage
-            ? `<button type="button" class="btn btn-sm" id="send-review-msg-btn">发给主 Agent 复核</button>`
-            : ""
-        }
+        ${reviewButton}
         <button type="button" class="btn btn-sm" data-close-run="${escapeHtml(run.run_id)}">关闭归档</button>
       </div>
     </div>`;

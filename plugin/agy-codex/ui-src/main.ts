@@ -6,21 +6,24 @@ import type {
   HistoryPayload,
   ListRunsPayload,
   RunSnapshot,
+  StartUserTaskPayload,
   StatsPayload,
   TimelineEvent,
+  UpdateCheckPayload,
+  UpdateStatusPayload,
   WorkbenchConfig,
   WorkbenchPayload,
 } from "./types";
 import { escapeHtml, formatDuration, getRunShortTitle, renderCodexToggleButton } from "./utils";
 import { renderHistoryView, type HistoryFilter } from "./views/history";
-import { renderModelsView } from "./views/models";
-import { renderMonitorTablist, renderMonitorView, renderNarrowAgentSwitcher } from "./views/monitor";
+import { isUpdateRunning, MCP_REFRESH_GUIDANCE, remoteUpdateLabel, renderModelsView, renderUpdateCard, updateBlockReason } from "./views/models";
+import { renderMonitorTablist, renderMonitorView, renderNarrowAgentSwitcher, type UserTaskDraft } from "./views/monitor";
 import { renderStatsView } from "./views/stats";
 import { renderTraceView, type TraceViewState } from "./views/trace";
 
 const AuxPaneResponseSchema = z.object({ isError: z.boolean().optional() }).passthrough();
 
-const app = new App({ name: "Agy Codex", version: "1.4.0" }, {}, { autoResize: false });
+const app = new App({ name: "Agy Codex", version: "1.5.0" }, {}, { autoResize: false });
 
 if (typeof HTMLInputElement !== "undefined" && !("switch" in HTMLInputElement.prototype)) {
   document.documentElement.classList.add("no-native-switch");
@@ -35,6 +38,12 @@ let interceptNativeSubagents = true;
 let excludeOrchestratorModels = true;
 let retentionHours = 24;
 let activeRunsCount = 0;
+let globalActiveRuns = 0;
+let totalUnclosedRuns = 0;
+let otherSessionsRuns = 0;
+let scopeSessionId: string | null = null;
+let scopeSessionTitle: string | null = null;
+let scopeMode: "session" | "all" = "all";
 let closed24hCount = 0;
 let newArchiveBadge = false;
 let maxConcurrentRuns = 5;
@@ -59,6 +68,15 @@ let latestSeq = 0;
 let localStartedMs = Date.now();
 let localTimeoutDeadlineMs: number | null = null;
 let actionFeedback: string | null = null;
+let defaultCwd = "";
+let manualRefreshing = false;
+let monitorRunMutationSeq = 0;
+let composerOpen = false;
+let composerSending = false;
+let composerError: string | null = null;
+let composerCwdEdited = false;
+let composerDraft = blankUserTaskDraft();
+let composerTriggerId = "";
 
 // Timers & strict per-endpoint in-flight guards (zero polling when hidden!)
 let pollTimer: number | null = null;
@@ -66,17 +84,16 @@ let tickTimer: number | null = null;
 let panelRefreshTimer: number | null = null;
 let pollInFlight = false;
 let listInFlight = false;
-let historyInFlight = false;
-let statsInFlight = false;
-let modelsInFlight = false;
 let selectRunSeq = 0;
 let monitorSelectionPending = false;
 let resourcesActive = true;
 let appConnected = false;
 let disconnectSizeObserver: (() => void) | null = null;
 let historyDetailSeq = 0;
-let historyPendingRefresh: { focusRunId?: string } | null = null;
-let statsPendingReload = false;
+const monitorRefresh = createRefreshQueue();
+const historyRefresh = createRefreshQueue();
+const statsRefresh = createRefreshQueue();
+const configRefresh = createRefreshQueue();
 let lastWakeupMs = 0;
 
 // History tab state (strictly isolated from Monitor!)
@@ -117,6 +134,21 @@ let savingConfig = false;
 let configStatusMsg: string | null = null;
 let configErrorMsg: string | null = null;
 
+// 插件更新状态独立于配置草稿与各标签的数据加载。
+let updateCheck: UpdateCheckPayload | null = null;
+let updateStatus: UpdateStatusPayload | null = null;
+let updateChecking = false;
+let updateStarting = false;
+let updatePollTimer: number | null = null;
+let updateStatusRequest: Promise<void> | null = null;
+let updateStatusSeq = 0;
+let updateCheckSeq = 0;
+let updateLifecycleSeq = 0;
+let updateInitialized = false;
+let updateCheckError: string | null = null;
+let updateStatusError: string | null = null;
+let updateStartError: string | null = null;
+
 // Toast, Toggletip & Observer cleanup state
 let toastTimer: number | null = null;
 let popoverHintFallbackBound = false;
@@ -124,6 +156,39 @@ let interestPolyfillActiveTip: HTMLElement | null = null;
 let interestCloseTimer: number | null = null;
 let interestOpenTimer: number | null = null;
 const tablistObservers = new Map<string, IntersectionObserver>();
+
+// 后台调用可跳过或复用在途请求；强制刷新排在其后，并等待新请求真正结束。
+function createRefreshQueue() {
+  type Job = () => Promise<void>;
+  let active: Promise<void> | null = null;
+  let queued: { job: Job; result: Promise<void> } | null = null;
+  function run(job: Job, whenBusy: "skip" | "join" | "queue" = "skip"): Promise<void> {
+    if (active) {
+      if (whenBusy === "skip") return Promise.resolve();
+      if (whenBusy === "join") return active;
+      if (queued) {
+        queued.job = job;
+        return queued.result;
+      }
+      const next = { job, result: Promise.resolve() };
+      const flush = () => {
+        if (queued !== next) return;
+        queued = null;
+        return run(next.job, "queue");
+      };
+      next.result = active.then(flush, flush);
+      queued = next;
+      return next.result;
+    }
+    active = Promise.resolve().then(job).finally(() => { active = null; });
+    return active;
+  }
+  return { run, cancelPending: () => { queued = null; } };
+}
+
+function errorText(err: unknown): string {
+  return (err instanceof Error ? err.message : String(err)) || "未知错误";
+}
 
 function canSendMessage(): boolean {
   const caps = app.getHostCapabilities() as Record<string, unknown> | undefined;
@@ -327,6 +392,20 @@ function runAlertSignature(run: RunSnapshot | null): string {
   return JSON.stringify([run?.health, run?.health_reason, run?.in_flight_command, run?.recent_errors]);
 }
 
+function activeScopeParentSessionId(): string | undefined {
+  return scopeMode === "session" && scopeSessionId ? scopeSessionId : undefined;
+}
+
+function getMonitorScopeInfo() {
+  return {
+    sessionId: scopeSessionId,
+    sessionTitle: scopeSessionTitle,
+    mode: scopeMode,
+    otherSessionsRuns,
+    totalUnclosedRuns,
+  };
+}
+
 function computeMonitorSnapshotSig(): string {
   const runsSig = panelRuns
     .map((r) => {
@@ -337,7 +416,7 @@ function computeMonitorSnapshotSig(): string {
       return `${r.run_id}:${r.status}:${r.closed ? 1 : 0}:${r.tokens_used ?? 0}:${seqOrBucket}:${runAlertSignature(r)}`;
     })
     .join(",");
-  return `${runsSig}|a=${activeRunsCount}|c=${closed24hCount}|m=${maxConcurrentRuns}|en=${codexEnabled ? 1 : 0}|eo=${excludeOrchestratorModels ? 1 : 0}|rh=${retentionHours}|act=${activeRunId ?? ""}`;
+  return `${runsSig}|a=${activeRunsCount}|ga=${globalActiveRuns}|tu=${totalUnclosedRuns}|os=${otherSessionsRuns}|sm=${scopeMode}|sid=${scopeSessionId ?? ""}|c=${closed24hCount}|m=${maxConcurrentRuns}|en=${codexEnabled ? 1 : 0}|eo=${excludeOrchestratorModels ? 1 : 0}|rh=${retentionHours}|act=${activeRunId ?? ""}|cwd=${defaultCwd}`;
 }
 
 async function fetchIncrementalEvents(): Promise<void> {
@@ -364,7 +443,7 @@ async function fetchIncrementalEvents(): Promise<void> {
     const prevSeq = latestSeq;
     const incomingEvents = Array.isArray(data.events) ? data.events : [];
 
-    currentRun = data;
+    currentRun = { ...currentRun, ...data };
     updateLocalTiming(data);
     if (incomingEvents.length > 0) applyIncomingEvents(incomingEvents);
     if (typeof data.latest_seq === "number") latestSeq = Math.max(latestSeq, data.latest_seq);
@@ -401,6 +480,21 @@ function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload, configRea
   } else if (Array.isArray(data.runs)) {
     activeRunsCount = data.runs.filter((r) => r.status === "running").length;
   }
+  if (typeof data.global_active_runs === "number") {
+    globalActiveRuns = data.global_active_runs;
+  } else if (scopeMode === "all") {
+    globalActiveRuns = activeRunsCount;
+  }
+  if (typeof data.total_unclosed_runs === "number") {
+    totalUnclosedRuns = data.total_unclosed_runs;
+  } else if (scopeMode === "all") {
+    totalUnclosedRuns = panelRuns.length;
+  }
+  if (typeof data.other_sessions_runs === "number") {
+    otherSessionsRuns = data.other_sessions_runs;
+  } else if (scopeMode === "all") {
+    otherSessionsRuns = 0;
+  }
   if (typeof data.closed_24h_count === "number") {
     closed24hCount = data.closed_24h_count;
   }
@@ -410,26 +504,41 @@ function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload, configRea
   if (configReadSeq === configMutationSeq && !configWritePending) {
     applyConfigFlags(data as Partial<ConfigFlags>);
   }
+  if ("default_cwd" in data && data.default_cwd?.trim()) defaultCwd = data.default_cwd.trim();
   if ("retention_hours" in data && typeof data.retention_hours === "number") {
     retentionHours = data.retention_hours;
   }
 }
 
-async function refreshMonitorRuns(): Promise<void> {
-  if (!resourcesActive || listInFlight) return;
+function refreshMonitorRuns(force = false): Promise<void> {
+  return monitorRefresh.run(() => loadMonitorRuns(force), force ? "queue" : "skip");
+}
+
+async function loadMonitorRuns(force: boolean): Promise<void> {
+  if (!resourcesActive) return;
   listInFlight = true;
   const configReadSeq = configMutationSeq;
   try {
     const prevSig = computeMonitorSnapshotSig();
     const prevActiveId = activeRunId;
+    const listReadSeq = monitorRunMutationSeq;
+    const parentSid = activeScopeParentSessionId();
     const res = await app.callServerTool({
       name: "list_runs",
-      arguments: { status: "all", limit: 40, include_closed: false },
+      arguments: {
+        status: "all",
+        limit: 40,
+        include_closed: false,
+        ...(parentSid ? { parent_session_id: parentSid } : {}),
+      },
     });
     const data = res?.structuredContent as ListRunsPayload | undefined;
-    if (!data || !resourcesActive || viewMode !== "panel") return;
-
-    applyRunListMetadata(data, configReadSeq);
+    if (!resourcesActive || viewMode !== "panel") return;
+    if (res?.isError || !Array.isArray(data?.runs)) {
+      throw new Error(extractToolErrorMessage(res, "任务列表接口返回空数据"));
+    }
+    // 新建或追问已返回更新的列表时，不让旧的列表请求覆盖它。
+    if (listReadSeq === monitorRunMutationSeq) applyRunListMetadata(data, configReadSeq);
 
     let focusedChanged = false;
     if (panelRuns.length === 0) {
@@ -439,12 +548,15 @@ async function refreshMonitorRuns(): Promise<void> {
       if (focusedChanged) resetMonitorSelection(null, null);
       narrowPickerOpen = false;
     } else if (!activeRunId || !panelRuns.some((r) => r.run_id === activeRunId)) {
-      if (viewMode === "panel" && activeTab === "subagents") {
-        await selectRun(panelRuns[0].run_id);
+      if (force || activeTab === "subagents") {
+        await selectRun(panelRuns[0].run_id, force);
         return;
       }
       resetMonitorSelection(panelRuns[0].run_id, panelRuns[0]);
       focusedChanged = true;
+    } else if (force) {
+      await selectRun(activeRunId, true);
+      return;
     } else if (currentRun && currentRun.run_id === activeRunId) {
       const fresh = panelRuns.find((r) => r.run_id === activeRunId);
       if (
@@ -461,11 +573,11 @@ async function refreshMonitorRuns(): Promise<void> {
 
     const nextSig = computeMonitorSnapshotSig();
     const sigChanged = nextSig !== prevSig || activeRunId !== prevActiveId || focusedChanged;
-    if (sigChanged && viewMode === "panel" && activeTab === "subagents") {
+    if ((force || sigChanged) && viewMode === "panel" && activeTab === "subagents") {
       render();
     }
-  } catch {
-    // Ignore
+  } catch (err) {
+    if (force) throw err;
   } finally {
     listInFlight = false;
     syncTickTimer();
@@ -474,10 +586,11 @@ async function refreshMonitorRuns(): Promise<void> {
   }
 }
 
-async function selectRun(runId: string): Promise<void> {
+async function selectRun(runId: string, force = false): Promise<void> {
   if (!resourcesActive) return;
   const listRun = panelRuns.find((r) => r.run_id === runId) ?? null;
-  const token = resetMonitorSelection(runId, listRun);
+  const keepVisibleTrace = force && activeRunId === runId && currentRun?.run_id === runId;
+  const token = keepVisibleTrace ? ++selectRunSeq : resetMonitorSelection(runId, listRun);
   monitorSelectionPending = true;
   syncPollingTimers();
   if (viewMode === "inline" || activeTab === "subagents") render();
@@ -486,14 +599,18 @@ async function selectRun(runId: string): Promise<void> {
       name: "get_run_events",
       arguments: { run_id: runId, since_seq: 0 },
     });
+    if (force && (res?.isError || (res?.structuredContent as RunSnapshot | undefined)?.run_id !== runId)) {
+      throw new Error(extractToolErrorMessage(res, "任务事件接口返回空数据"));
+    }
     if (token !== selectRunSeq || activeRunId !== runId) return;
     const data = res?.structuredContent as RunSnapshot | undefined;
-    if (data?.run_id === runId) {
-      resetRunTimeline(data);
+    if (!res?.isError && data?.run_id === runId) {
+      resetRunTimeline({ ...(keepVisibleTrace ? currentRun : listRun), ...data });
       const idx = panelRuns.findIndex((r) => r.run_id === runId);
       if (idx >= 0) panelRuns[idx] = { ...panelRuns[idx], ...data };
     }
-  } catch {
+  } catch (err) {
+    if (force) throw err;
     // 保留列表摘要；下一次轮询从 0 重新取日志。
   } finally {
     if (token === selectRunSeq && activeRunId === runId) {
@@ -514,10 +631,11 @@ function applyArchiveResult(data: CloseRunPayload, closedIds: string[]): void {
 
 async function handleCloseRun(runId: string): Promise<void> {
   const closingRun = panelRuns.find((r) => r.run_id === runId);
+  const parentSid = activeScopeParentSessionId();
   try {
     const res = await app.callServerTool({
       name: "close_run",
-      arguments: { run_id: runId },
+      arguments: { run_id: runId, ...(parentSid ? { parent_session_id: parentSid } : {}) },
     });
     const data = res?.structuredContent as CloseRunPayload | undefined;
     if (res?.isError || !Array.isArray(data?.closed_ids) || !data.closed_ids.includes(runId)) {
@@ -551,10 +669,11 @@ async function handleCloseAllFinished(): Promise<void> {
     showToast("当前没有已完成的子 Agent 需要归档");
     return;
   }
+  const parentSid = activeScopeParentSessionId();
   try {
     const res = await app.callServerTool({
       name: "close_run",
-      arguments: { close_all_finished: true },
+      arguments: { close_all_finished: true, ...(parentSid ? { parent_session_id: parentSid } : {}) },
     });
     const data = res?.structuredContent as CloseRunPayload | undefined;
     if (res?.isError || !Array.isArray(data?.closed_ids) || data.closed_ids.length === 0) {
@@ -678,23 +797,18 @@ function populateHistoryTimelineFromRun(run: RunSnapshot | null): void {
 }
 
 function extractToolErrorMessage(res: unknown, fallback: string): string {
-  const r = res as { isError?: boolean; content?: Array<{ text?: string }> } | undefined;
-  const text = r?.content?.[0]?.text;
-  if (typeof text === "string" && text.trim()) {
-    return text.trim();
-  }
-  return fallback;
+  const r = res as { structuredContent?: { error?: unknown }; content?: Array<{ text?: string }> } | undefined;
+  const detail = r?.structuredContent?.error;
+  if (typeof detail === "string" && detail.trim()) return detail.trim();
+  return r?.content?.find((item) => typeof item.text === "string" && item.text.trim())?.text?.trim() || fallback;
 }
 
-async function refreshHistory(focusRunId?: string, queueIfBusy = false): Promise<void> {
+function refreshHistory(focusRunId?: string, queueIfBusy = false): Promise<void> {
+  return historyRefresh.run(() => loadHistory(focusRunId), queueIfBusy ? "queue" : "skip");
+}
+
+async function loadHistory(focusRunId?: string): Promise<void> {
   if (!resourcesActive) return;
-  if (historyInFlight) {
-    if (queueIfBusy) {
-      historyPendingRefresh = { focusRunId };
-    }
-    return;
-  }
-  historyInFlight = true;
   historyLoading = true;
   historyLoadError = null;
   if (!historyPayload && activeTab === "history") {
@@ -747,15 +861,9 @@ async function refreshHistory(focusRunId?: string, queueIfBusy = false): Promise
   } catch (err) {
     historyLoadError = err instanceof Error ? err.message : String(err);
   } finally {
-    historyInFlight = false;
     historyLoading = false;
     if (activeTab === "history" && viewMode === "panel") {
       render();
-    }
-    const pending = historyPendingRefresh;
-    historyPendingRefresh = null;
-    if (pending) {
-      void refreshHistory(pending.focusRunId, true);
     }
   }
 }
@@ -802,15 +910,12 @@ async function loadHistoryRunDetail(runId: string): Promise<void> {
   }
 }
 
-async function refreshStats(queueIfBusy = false): Promise<void> {
+function refreshStats(queueIfBusy = false): Promise<void> {
+  return statsRefresh.run(loadStats, queueIfBusy ? "queue" : "skip");
+}
+
+async function loadStats(): Promise<void> {
   if (!resourcesActive) return;
-  if (statsInFlight) {
-    if (queueIfBusy) {
-      statsPendingReload = true;
-    }
-    return;
-  }
-  statsInFlight = true;
   statsLoading = true;
   statsLoadError = null;
   if (!statsPayload && activeTab === "stats") {
@@ -830,22 +935,20 @@ async function refreshStats(queueIfBusy = false): Promise<void> {
   } catch (err) {
     statsLoadError = err instanceof Error ? err.message : String(err);
   } finally {
-    statsInFlight = false;
     statsLoading = false;
     if (activeTab === "stats" && viewMode === "panel") {
       render();
     }
-    if (statsPendingReload) {
-      statsPendingReload = false;
-      void refreshStats(true);
-    }
   }
 }
 
-async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
-  if (!resourcesActive || modelsInFlight) return;
+function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
+  return configRefresh.run(() => loadWorkbenchConfig(keepDraft), keepDraft ? "queue" : "join");
+}
+
+async function loadWorkbenchConfig(keepDraft: boolean): Promise<void> {
+  if (!resourcesActive) return;
   const configReadSeq = configMutationSeq;
-  modelsInFlight = true;
   modelsLoading = true;
   modelsLoadError = null;
   if (!workbenchData && activeTab === "models" && viewMode === "panel") {
@@ -860,6 +963,7 @@ async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
     if ((res as { isError?: boolean } | undefined)?.isError || !data || !data.workbench_config) {
       modelsLoadError = extractToolErrorMessage(res, "配置服务返回空数据");
     } else {
+      if (data.default_cwd?.trim()) defaultCwd = data.default_cwd.trim();
       const freshConfig = configReadSeq === configMutationSeq && !configWritePending;
       if (freshConfig || !workbenchData) workbenchData = data;
       if (freshConfig) {
@@ -876,12 +980,427 @@ async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
   } catch (err) {
     modelsLoadError = err instanceof Error ? err.message : String(err);
   } finally {
-    modelsInFlight = false;
     modelsLoading = false;
     if (activeTab === "models" && viewMode === "panel") {
       render();
     }
   }
+}
+
+function paintManualRefreshButton(): void {
+  const button = document.querySelector<HTMLButtonElement>("#panel-refresh-btn");
+  if (!button) return;
+  button.disabled = manualRefreshing;
+  button.classList.toggle("is-spinning", manualRefreshing);
+  button.setAttribute("aria-busy", String(manualRefreshing));
+}
+
+async function handleManualRefresh(): Promise<void> {
+  if (manualRefreshing || !resourcesActive) return;
+  manualRefreshing = true;
+  paintManualRefreshButton();
+  const minFeedback = new Promise<void>((resolve) => window.setTimeout(resolve, 260));
+  const tab = activeTab;
+  const failurePrefix = { subagents: "刷新活跃监控失败", history: "刷新历史对话失败", stats: "刷新统计面板失败", models: "刷新配置失败" }[tab];
+  let message: string;
+  try {
+    if (tab === "subagents") {
+      await refreshMonitorRuns(true);
+      message = `已刷新活跃监控 (${panelRuns.length} 个任务 | ${activeRunsCount} 运行中)`;
+    } else if (tab === "history") {
+      await refreshHistory(undefined, true);
+      if (historyLoadError) throw new Error(historyLoadError);
+      message = `已刷新历史对话 (${historyPayload?.total_runs ?? 0} 条记录)`;
+    } else if (tab === "stats") {
+      await refreshStats(true);
+      if (statsLoadError) throw new Error(statsLoadError);
+      message = `已刷新统计面板 (${statsPayload?.range ?? statsRange})`;
+    } else {
+      const [configResult, statusResult] = await Promise.allSettled([refreshWorkbenchConfig(true), refreshUpdateStatus()]);
+      if (modelsLoadError) throw new Error(modelsLoadError);
+      if (configResult.status === "rejected") throw configResult.reason;
+      if (statusResult.status === "rejected") throw statusResult.reason;
+      message = `已刷新模型与配置 (${workbenchData?.visible_models_count ?? 0} 个可用模型)`;
+    }
+  } catch (err) {
+    message = `${failurePrefix}: ${errorText(err)}`;
+  } finally {
+    await minFeedback;
+    manualRefreshing = false;
+    paintManualRefreshButton();
+  }
+  showToast(message);
+}
+
+function blankUserTaskDraft(): UserTaskDraft {
+  return { prompt: "", cwd: "", model: "", effort: "", mode: "write", worktree: "", persist: true };
+}
+
+function getComposerDraft(): UserTaskDraft {
+  return composerCwdEdited ? composerDraft : { ...composerDraft, cwd: defaultCwd || panelRuns[0]?.cwd || "" };
+}
+
+function getComposerModels() {
+  return (workbenchData?.models ?? []).filter((model) => !model.excluded && !model.orchestrator_excluded);
+}
+
+function openComposer(trigger: HTMLElement): void {
+  if (composerOpen) {
+    document.getElementById("composer-prompt")?.focus();
+    return;
+  }
+  narrowPickerOpen = false;
+  composerOpen = true;
+  composerTriggerId = trigger.id;
+  render();
+  document.getElementById("composer-prompt")?.focus();
+  if (!workbenchData) {
+    void refreshWorkbenchConfig().then(() => {
+      if (composerOpen && viewMode === "panel" && activeTab === "subagents") render();
+    });
+  }
+}
+
+function closeComposer(): void {
+  if (!composerOpen || composerSending) return;
+  composerOpen = false;
+  composerError = null;
+  render();
+  const trigger = document.getElementById(composerTriggerId);
+  const visibleTrigger = trigger?.getClientRects().length ? trigger :
+    Array.from(document.querySelectorAll<HTMLElement>("[data-open-composer]")).find((button) => button.getClientRects().length);
+  visibleTrigger?.focus({ preventScroll: true });
+}
+
+async function submitUserTask(): Promise<void> {
+  if (composerSending || !composerOpen) return;
+  const draft = getComposerDraft();
+  const prompt = draft.prompt.trim();
+  const cwd = draft.cwd.trim();
+  const normalizedCwd = cwd.replace(/\\/g, "/");
+  const isAbsolute = cwd.startsWith("/") || /^[A-Za-z]:[/]/.test(normalizedCwd) || /^[/]{2}[^/]+[/][^/]+/.test(normalizedCwd);
+  const unavailableModel = Boolean(draft.model) && !getComposerModels().some((model) => model.slug === draft.model);
+  if (!prompt || !isAbsolute || unavailableModel) {
+    composerError = !prompt ? "请输入任务指令。" : !isAbsolute ? "请输入有效的工作目录绝对路径。" : "当前模型已不可用，请重新选择。";
+    render();
+    document.getElementById(!prompt ? "composer-prompt" : !isAbsolute ? "composer-cwd" : "composer-model")?.focus();
+    return;
+  }
+
+  composerSending = true;
+  composerError = null;
+  render();
+  let started = false;
+  try {
+    const parentSid = activeScopeParentSessionId();
+    const res = await app.callServerTool({
+      name: "start_user_task",
+      arguments: {
+        prompt, cwd, mode: draft.mode, persist: draft.persist, raw: true,
+        ...(parentSid ? { conversation_id: parentSid, ...(scopeSessionTitle ? { conversation_title: scopeSessionTitle } : {}) } : {}),
+        ...(draft.model ? { model: draft.model } : {}),
+        ...(draft.effort ? { effort: draft.effort } : {}),
+        ...(draft.worktree.trim() ? { worktree: draft.worktree.trim() } : {}),
+      },
+    });
+    const data = res?.structuredContent as StartUserTaskPayload | undefined;
+    if (res?.isError || !data?.run_id) throw new Error(extractToolErrorMessage(res, "服务端未返回新任务"));
+    if (!resourcesActive || viewMode !== "panel") return;
+    const {
+      active_runs,
+      max_concurrent_runs,
+      runs,
+      global_active_runs,
+      total_unclosed_runs,
+      other_sessions_runs,
+      scope_session_id: _scopeSid,
+      ...newRun
+    } = data;
+    composerOpen = false;
+    composerCwdEdited = false;
+    composerDraft = blankUserTaskDraft();
+    activeTab = "subagents";
+    monitorRunMutationSeq++;
+    panelRuns = Array.isArray(runs) && runs.some((run) => run.run_id === newRun.run_id)
+      ? runs.map((run) => run.run_id === newRun.run_id ? { ...run, ...newRun } : run)
+      : [newRun, ...(runs ?? panelRuns).filter((run) => run.run_id !== newRun.run_id)];
+    activeRunsCount = active_runs;
+    if (typeof global_active_runs === "number") globalActiveRuns = global_active_runs;
+    else globalActiveRuns = Math.max(globalActiveRuns, active_runs);
+    if (typeof total_unclosed_runs === "number") totalUnclosedRuns = total_unclosed_runs;
+    if (typeof other_sessions_runs === "number") otherSessionsRuns = other_sessions_runs;
+    maxConcurrentRuns = max_concurrent_runs;
+    resetMonitorSelection(newRun.run_id, newRun);
+    resetRunTimeline(newRun);
+    syncPollingTimers();
+    started = true;
+  } catch (err) {
+    composerError = errorText(err);
+  } finally {
+    composerSending = false;
+    render();
+    if (started) showToast("已发起 Codex 直连会话");
+  }
+}
+
+function bindComposer(): void {
+  document.querySelectorAll<HTMLElement>("[data-open-composer]").forEach((trigger) => {
+    trigger.setAttribute("aria-expanded", String(composerOpen));
+    if (composerOpen) trigger.setAttribute("aria-controls", "user-task-drawer");
+    trigger.addEventListener("click", () => openComposer(trigger));
+  });
+  const form = document.querySelector<HTMLFormElement>("#user-task-form");
+  if (!form) return;
+  const read = <T extends HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>(id: string) => form.querySelector<T>(`#composer-${id}`)!;
+  const prompt = read<HTMLTextAreaElement>("prompt");
+  const cwd = read<HTMLInputElement>("cwd");
+  for (const eventType of ["input", "change"]) {
+    form.addEventListener(eventType, (event) => {
+      if (event.target === cwd) composerCwdEdited = true;
+      composerDraft = {
+        prompt: prompt.value, cwd: cwd.value, model: read("model").value,
+        effort: read("effort").value, worktree: read("worktree").value,
+        mode: read("mode").value === "read-only" ? "read-only" : "write",
+        persist: read<HTMLInputElement>("persist").checked,
+      };
+    });
+  }
+  prompt.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+      event.preventDefault();
+      void submitUserTask();
+    }
+  });
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void submitUserTask();
+  });
+  document.getElementById("cancel-user-task-btn")?.addEventListener("click", closeComposer);
+}
+
+type UpdateCheckArgs = {
+  force?: boolean;
+  channel?: "auto" | "release" | "main";
+  dismiss_version?: string;
+};
+
+function getUpdateViewState() {
+  return {
+    check: updateCheck,
+    status: updateStatus,
+    pluginVersion: workbenchData?.plugin_version,
+    checking: updateChecking,
+    starting: updateStarting,
+    error: updateStartError || updateCheckError || updateStatusError,
+  };
+}
+
+async function checkForUpdates(args: UpdateCheckArgs, announce = false): Promise<void> {
+  if (!resourcesActive || viewMode !== "panel") return;
+  const seq = ++updateCheckSeq;
+  updateChecking = true;
+  updateCheckError = null;
+  renderUpdateUi();
+  try {
+    const res = await app.callServerTool({ name: "check_for_updates", arguments: args });
+    if (seq !== updateCheckSeq || !resourcesActive || viewMode !== "panel") return;
+    const data = res?.structuredContent as UpdateCheckPayload | undefined;
+    if (res?.isError || !data?.ok) throw new Error(data?.error || extractToolErrorMessage(res, "更新检查未返回有效结果"));
+    updateCheck = data;
+    if (announce) {
+      const label = remoteUpdateLabel(data);
+      showToast(args.dismiss_version ? "已忽略此版本" : data.update_available
+        ? `发现更新${label ? `: ${label}` : ""}` : "当前已是最新版本");
+    }
+  } catch (err) {
+    if (seq !== updateCheckSeq || !resourcesActive || viewMode !== "panel") return;
+    updateCheckError = `${args.dismiss_version ? "忽略版本失败" : "检查更新失败"}: ${errorText(err)}`;
+    if (announce) showToast(updateCheckError);
+  } finally {
+    if (seq === updateCheckSeq) {
+      updateChecking = false;
+      renderUpdateUi();
+    }
+  }
+}
+
+function stopUpdatePolling(): void {
+  if (updatePollTimer !== null) window.clearTimeout(updatePollTimer);
+  updatePollTimer = null;
+}
+
+function scheduleUpdatePolling(): void {
+  if (!resourcesActive || viewMode !== "panel" || document.hidden || !isUpdateRunning(updateStatus)) {
+    stopUpdatePolling();
+    return;
+  }
+  if (updatePollTimer !== null || updateStarting || updateStatusRequest) return;
+  updatePollTimer = window.setTimeout(() => {
+    updatePollTimer = null;
+    if (!resourcesActive || viewMode !== "panel" || document.hidden || !isUpdateRunning(updateStatus)) return;
+    void refreshUpdateStatus().catch(() => { /* 状态卡显示错误，下一次轮询重试。 */ });
+  }, 1500);
+}
+
+function applyUpdateStatus(status: UpdateStatusPayload, fromStart = false): void {
+  const wasRunning = isUpdateRunning(updateStatus);
+  updateStatus = status;
+  if (status.check?.ok && (fromStart || !updateCheck)) updateCheck = status.check;
+  if (!isUpdateRunning(status)) stopUpdatePolling();
+  if ((wasRunning || fromStart) && (status.status === "completed" || status.status === "failed")) {
+    showToast(status.status === "completed"
+      ? `插件更新完成。${MCP_REFRESH_GUIDANCE}`
+      : `插件更新失败: ${status.error || status.message || status.phase_label}`);
+    void checkForUpdates({ force: true, channel: status.channel ?? updateCheck?.channel ?? "auto" });
+  }
+  renderUpdateUi();
+}
+
+function refreshUpdateStatus(): Promise<void> {
+  if (!resourcesActive || viewMode !== "panel") return Promise.resolve();
+  if (updateStatusRequest) return updateStatusRequest;
+  const seq = updateStatusSeq;
+  const request = Promise.resolve().then(async () => {
+    const res = await app.callServerTool({ name: "get_update_status", arguments: {} });
+    const data = res?.structuredContent as UpdateStatusPayload | undefined;
+    if (res?.isError || !data?.status) throw new Error(extractToolErrorMessage(res, "更新状态接口返回空数据"));
+    if (seq !== updateStatusSeq || !resourcesActive || viewMode !== "panel" || updateStarting) return;
+    updateStatusError = null;
+    applyUpdateStatus(data);
+  }).catch((err) => {
+    if (seq === updateStatusSeq && resourcesActive && viewMode === "panel" && !updateStarting) {
+      updateStatusError = `获取更新状态失败: ${errorText(err)}`;
+      renderUpdateUi();
+    }
+    throw err;
+  }).finally(() => {
+    if (updateStatusRequest === request) updateStatusRequest = null;
+    scheduleUpdatePolling();
+  });
+  updateStatusRequest = request;
+  return request;
+}
+
+async function startPluginUpdate(): Promise<void> {
+  if (!resourcesActive || updateStarting || updateChecking || isUpdateRunning(updateStatus) || updateBlockReason(getUpdateViewState())) return;
+  const lifecycle = updateLifecycleSeq;
+  updateStarting = true;
+  updateStatusSeq++;
+  stopUpdatePolling();
+  updateStartError = updateStatusError = null;
+  renderUpdateUi();
+  try {
+    const channel = updateCheck?.channel ?? "auto";
+    const expectedVersion = updateCheck?.latest_id || updateCheck?.remote_version;
+    const res = await app.callServerTool({
+      name: "start_plugin_update",
+      arguments: { channel, ...(expectedVersion ? { expected_version: expectedVersion } : {}) },
+    });
+    if (lifecycle !== updateLifecycleSeq || !resourcesActive || viewMode !== "panel") return;
+    const data = res?.structuredContent as UpdateStatusPayload | undefined;
+    if (res?.isError || !data?.status) throw new Error(data?.error || extractToolErrorMessage(res, "服务端未返回更新阶段"));
+    applyUpdateStatus(data, true);
+  } catch (err) {
+    if (lifecycle !== updateLifecycleSeq || !resourcesActive || viewMode !== "panel") return;
+    updateStartError = `启动更新失败: ${errorText(err)}`;
+    showToast(updateStartError);
+  } finally {
+    if (lifecycle === updateLifecycleSeq) {
+      updateStarting = false;
+      updateStatusSeq++;
+      renderUpdateUi();
+      scheduleUpdatePolling();
+    }
+  }
+}
+
+function hasUpdateNotice(): boolean {
+  return Boolean(updateCheck?.update_available && !updateCheck.is_dismissed && updateStatus?.status !== "completed");
+}
+
+function renderUpdateBanner(): string {
+  if (!hasUpdateNotice() || !updateCheck) return "";
+  const label = remoteUpdateLabel(updateCheck);
+  const blocked = updateBlockReason(getUpdateViewState());
+  const busy = updateChecking || updateStarting || isUpdateRunning(updateStatus);
+  return `<div class="update-banner">
+    <span>发现新版本${label ? ` ${escapeHtml(label)}` : ""}</span>
+    <div class="update-banner-actions">
+      <button type="button" id="banner-update-now-btn" class="btn btn-primary btn-sm"${busy || blocked ? " disabled" : ""}${blocked ? ` title="${escapeHtml(blocked)}"` : ""}>立即更新</button>
+      <button type="button" id="banner-update-detail-btn" class="btn btn-sm">查看详情</button>
+      <button type="button" id="banner-update-dismiss-btn" class="link-btn"${!updateCheck.latest_id || busy ? " disabled" : ""}>忽略</button>
+    </div>
+  </div>`;
+}
+
+function bindUpdateActions(container: ParentNode): void {
+  const repoLink = container.querySelector<HTMLAnchorElement>("#plugin-update-repo-link");
+  repoLink?.addEventListener("click", (event) => {
+    if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+    if (!app.getHostCapabilities()?.openLinks) return;
+    event.preventDefault();
+    void app.openLink({ url: repoLink.href }).then((result) => {
+      if (result?.isError) showToast("主机未能打开 GitHub 仓库");
+    }).catch((err) => showToast(`打开 GitHub 仓库失败: ${errorText(err)}`));
+  });
+  container.querySelector("#check-updates-btn")?.addEventListener("click", () => {
+    void checkForUpdates({ force: true, channel: "auto" }, true);
+  });
+  container.querySelector("#check-main-updates-btn")?.addEventListener("click", () => {
+    void checkForUpdates({ force: true, channel: "main" }, true);
+  });
+  for (const button of container.querySelectorAll("#start-update-btn, #banner-update-now-btn")) {
+    button.addEventListener("click", () => void startPluginUpdate());
+  }
+  container.querySelector("#banner-update-detail-btn")?.addEventListener("click", () => {
+    if (activeTab !== "models") switchTab("models");
+    document.getElementById("plugin-update-card")?.scrollIntoView({ block: "nearest" });
+  });
+  container.querySelector("#banner-update-dismiss-btn")?.addEventListener("click", () => {
+    const latestId = updateCheck?.latest_id;
+    if (latestId) void checkForUpdates({ dismiss_version: latestId }, true);
+  });
+}
+
+const updateMarkup = new WeakMap<Element, string>();
+
+function renderUpdateUi(): void {
+  if (!resourcesActive || viewMode !== "panel") return;
+  // 仅替换更新区域，不打断正在编辑的配置或对话草稿。
+  const focused = document.activeElement as HTMLElement | null;
+  const notice = hasUpdateNotice();
+  document.querySelectorAll<HTMLElement>(".badge-dot.is-update").forEach((dot) => { dot.hidden = !notice; });
+  const bannerRegion = document.getElementById("panel-update-region");
+  if (bannerRegion) {
+    const html = renderUpdateBanner();
+    if (html !== updateMarkup.get(bannerRegion)) {
+      bannerRegion.innerHTML = html;
+      updateMarkup.set(bannerRegion, html);
+      bindUpdateActions(bannerRegion);
+    }
+  }
+  const card = document.getElementById("plugin-update-card");
+  if (card) {
+    const html = renderUpdateCard(getUpdateViewState());
+    if (html !== updateMarkup.get(card)) {
+      const previousNotes = card.querySelector<HTMLDetailsElement>("#plugin-update-notes");
+      const notesOpen = Boolean(previousNotes?.open);
+      const notesScrollTop = previousNotes?.querySelector("div")?.scrollTop ?? 0;
+      card.outerHTML = html;
+      const newCard = document.getElementById("plugin-update-card");
+      if (newCard) {
+        updateMarkup.set(newCard, html);
+        bindUpdateActions(newCard);
+        const notes = newCard.querySelector<HTMLDetailsElement>("#plugin-update-notes");
+        if (notes && notesOpen) {
+          notes.open = true;
+          const body = notes.querySelector("div");
+          if (body) body.scrollTop = notesScrollTop;
+        }
+      }
+    }
+  }
+  if (focused?.id && !focused.isConnected) document.getElementById(focused.id)?.focus({ preventScroll: true });
 }
 
 function syncDraftFromDom(): void {
@@ -1248,6 +1767,11 @@ function render(): void {
   if (!root) return;
 
   const wasFocused = document.activeElement as HTMLElement | null;
+  const composerBox = document.getElementById("user-task-drawer");
+  const composerScrollTop = composerBox?.scrollTop ?? 0;
+  const composerFocus = wasFocused && composerBox?.contains(wasFocused) ? wasFocused.id : "";
+  const composerSelection = composerFocus && (wasFocused instanceof HTMLInputElement || wasFocused instanceof HTMLTextAreaElement)
+    ? [wasFocused.selectionStart, wasFocused.selectionEnd] : null;
   const switcherFocusId = wasFocused?.closest(".narrow-agent-switcher-bar") ? wasFocused.id : "";
   const wideTabFocusId = wasFocused?.closest("#wide-agent-tablist") ? wasFocused.id : "";
   const pickerScroll = document.getElementById("narrow-agent-popover")?.scrollTop ?? 0;
@@ -1289,10 +1813,32 @@ function render(): void {
 
   const wideTablistHtml = renderMonitorTablist(panelRuns, activeRunId, "wide", retentionHours);
 
+  const scopeInfo = getMonitorScopeInfo();
+  const narrowScopePillHtml = isMonitor && scopeSessionId
+    ? `<button type="button" id="narrow-scope-toggle" data-toggle-scope class="scope-pill-btn${scopeMode === "session" ? " is-scoped" : ""}" title="${escapeHtml(
+        scopeMode === "session"
+          ? `当前已按本对话隔离显示${otherSessionsRuns > 0 ? `；其他并行对话另有 ${otherSessionsRuns} 个活跃任务` : ""}，点击切换查看全部`
+          : "当前显示全部并行对话的活跃任务，点击切回仅看当前对话",
+      )}">${scopeMode === "session" ? "本对话" : "全部"}${scopeMode === "session" && otherSessionsRuns > 0 ? `<span class="scope-other-badge tabular-nums">+${otherSessionsRuns}</span>` : ""}</button>`
+    : "";
+  const wideScopePillHtml = scopeSessionId
+    ? `<button type="button" id="wide-scope-toggle" data-toggle-scope class="scope-pill-btn${scopeMode === "session" ? " is-scoped" : ""}" title="${escapeHtml(
+        scopeMode === "session"
+          ? "当前已按本对话隔离，点击查看全部并行对话"
+          : "当前显示全部对话，点击切回仅看本对话",
+      )}">${scopeMode === "session"
+        ? `仅本对话${otherSessionsRuns > 0 ? ` (+${otherSessionsRuns} 其他)` : ""}`
+        : `全部对话 (${totalUnclosedRuns || panelRuns.length})`}</button>`
+    : "";
+  const slotTooltip = scopeSessionId && scopeMode === "session"
+    ? `全局并发槽位 ${globalActiveRuns}/${maxConcurrentRuns} | 当前对话 ${activeRunsCount} 运行中`
+    : `当前并发槽位使用情况 ${globalActiveRuns}/${maxConcurrentRuns}`;
+
+  const updateDot = `<span class="badge-dot is-update" role="img" aria-label="有插件更新" title="有插件更新"${hasUpdateNotice() ? "" : " hidden"}></span>`;
   const topbarHtml = `<div class="topbar">
     <div class="narrow-subpage-bar">
       ${isMonitor
-        ? `<span class="narrow-monitor-title">${subTitleMap.subagents}</span><span class="tab-count-pill tabular-nums" title="活跃标签数量">${panelRuns.length}</span>`
+        ? `<span class="narrow-monitor-title">${subTitleMap.subagents}</span><span class="tab-count-pill tabular-nums" title="当前视图任务数量">${panelRuns.length}</span>${narrowScopePillHtml}`
         : `<button type="button" id="narrow-back-btn" class="btn btn-sm">← 返回监控</button><span class="narrow-subpage-title">${subTitleMap[activeTab]}</span>`}
     </div>
 
@@ -1303,15 +1849,15 @@ function render(): void {
         ${closed24hCount > 0 ? `<span class="tab-count-pill tabular-nums">${closed24hCount}</span>` : ""}
       </button>
       <button type="button" role="tab" data-nav-tab="stats" aria-selected="${activeTab === "stats" ? "true" : "false"}" class="wide-view-tab">统计面板</button>
-      <button type="button" role="tab" data-nav-tab="models" aria-selected="${activeTab === "models" ? "true" : "false"}" class="wide-view-tab">模型与配置</button>
+      <button type="button" role="tab" data-nav-tab="models" aria-selected="${activeTab === "models" ? "true" : "false"}" class="wide-view-tab">模型与配置${updateDot}</button>
     </div>
 
     <div class="topbar-right">
       ${renderCodexToggleButton(codexEnabled, "topbar")}
 
-      <span class="slot-pill tabular-nums" title="当前并发槽位使用情况">
-        <span class="status-dot ${activeRunsCount > 0 ? "is-running" : "is-done"}" aria-hidden="true"></span>
-        <span>${activeRunsCount}/${maxConcurrentRuns}</span>
+      <span class="slot-pill tabular-nums" title="${escapeHtml(slotTooltip)}">
+        <span class="status-dot ${globalActiveRuns > 0 ? "is-running" : "is-done"}" aria-hidden="true"></span>
+        <span>${globalActiveRuns}/${maxConcurrentRuns}</span>
       </span>
 
       <button type="button" data-nav-tab="history" class="narrow-only-nav icon-btn" title="历史对话 (按 Antigravity 大会话分组)" aria-label="打开历史对话">
@@ -1332,6 +1878,7 @@ function render(): void {
           <path d="M8 10a2 2 0 100-4 2 2 0 000 4z" stroke="currentColor" stroke-width="1.4" />
           <path d="M13.2 8a5.2 5.2 0 00-.08-.9l1.2-.92-1.15-2-1.42.45a5.3 5.3 0 00-1.55-.9L9.9 2.3H7.6l-.3 1.43c-.56.2-1.08.5-1.55.9L4.33 4.18l-1.15 2 1.2.92a5.2 5.2 0 000 1.8l-1.2.92 1.15 2 1.42-.45c.47.4.99.7 1.55.9l.3 1.43h2.3l.3-1.43c.56-.2 1.08-.5 1.55-.9l1.42.45 1.15-2-1.2-.92c.05-.3.08-.6.08-.9z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
         </svg>
+        ${updateDot}
       </button>
 
       <button type="button" id="btn-archive-all" class="icon-btn" title="归档所有已完成标签" aria-label="清空已完成标签">
@@ -1358,7 +1905,9 @@ function render(): void {
     ? `<div id="wide-subagent-strip" class="wide-only-nav wide-subagent-strip">
         <div id="wide-agent-tablist" class="agent-tablist" role="tablist" aria-label="活跃子 Agent 对话标签">${wideTablistHtml}</div>
         <div class="wide-subagent-right">
-          <span class="wide-subagent-hint">Antigravity 联动子 Agent (留存 ${retentionHours}h)</span>
+          ${wideScopePillHtml}
+          <span class="wide-subagent-hint">活跃 Codex 会话 (留存 ${retentionHours}h)</span>
+          <button type="button" id="wide-new-chat-btn" data-open-composer class="btn btn-primary btn-sm">+ 新建对话</button>
         </div>
       </div>`
     : "";
@@ -1371,6 +1920,13 @@ function render(): void {
       currentRun,
       traceState: getMonitorTraceViewState(),
       retentionHours,
+      scope: scopeInfo,
+      composer: composerOpen ? {
+        draft: getComposerDraft(),
+        models: getComposerModels(),
+        sending: composerSending,
+        error: composerError,
+      } : null,
     });
   } else if (activeTab === "history") {
     bodyHtml = renderHistoryView({
@@ -1409,18 +1965,28 @@ function render(): void {
       retentionHours,
       statusMsg: configStatusMsg,
       errorMsg: configErrorMsg,
+      update: getUpdateViewState(),
     });
   }
 
-  const narrowSwitcherHtml = isMonitor ? renderNarrowAgentSwitcher(panelRuns, activeRunId, narrowPickerOpen) : "";
-  root.innerHTML = `${topbarHtml}${narrowSwitcherHtml}${pausedBannerHtml}${wideStripHtml}<div class="panel-body">${bodyHtml}</div>`;
+  const narrowSwitcherHtml = isMonitor ? renderNarrowAgentSwitcher(panelRuns, activeRunId, narrowPickerOpen, scopeInfo) : "";
+  root.innerHTML = `${topbarHtml}<div id="panel-update-region">${renderUpdateBanner()}</div>${narrowSwitcherHtml}${pausedBannerHtml}${wideStripHtml}<div class="panel-body">${bodyHtml}</div>`;
   bindInteractions();
   restoreTimelineScroll();
   if (narrowPickerOpen) {
     const popover = document.getElementById("narrow-agent-popover");
     if (popover) popover.scrollTop = pickerScroll;
   }
-  if (switcherFocusId) {
+  const newComposerBox = document.getElementById("user-task-drawer");
+  if (newComposerBox) newComposerBox.scrollTop = composerScrollTop;
+  if (composerFocus) {
+    const field = document.getElementById(composerFocus);
+    field?.focus({ preventScroll: true });
+    if ((field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement) &&
+        composerSelection && composerSelection[0] !== null && composerSelection[1] !== null) {
+      field.setSelectionRange(composerSelection[0], composerSelection[1]);
+    }
+  } else if (switcherFocusId) {
     const button = document.getElementById(switcherFocusId) ??
       (narrowPickerOpen ? document.querySelector<HTMLElement>('#narrow-agent-options [aria-selected="true"]') : null) ??
       document.getElementById("narrow-agent-picker-btn");
@@ -1468,12 +2034,10 @@ function bindInteractions(): void {
     switchTab("subagents");
   });
 
-  document.getElementById("panel-refresh-btn")?.addEventListener("click", () => {
-    if (activeTab === "subagents") void refreshMonitorRuns();
-    else if (activeTab === "history") void refreshHistory(undefined, true);
-    else if (activeTab === "stats") void refreshStats(true);
-    else if (activeTab === "models") void refreshWorkbenchConfig();
-  });
+  paintManualRefreshButton();
+  document.getElementById("panel-refresh-btn")?.addEventListener("click", () => void handleManualRefresh());
+  bindComposer();
+  bindUpdateActions(document);
 
   document.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
     "[data-toggle-codex-master], #cfg-intercept-switch, #cfg-orch-switch, #save-workbench-btn",
@@ -1506,6 +2070,23 @@ function bindInteractions(): void {
 
   document.getElementById("empty-to-history")?.addEventListener("click", () => {
     switchTab("history");
+  });
+
+  document.querySelectorAll<HTMLElement>("[data-toggle-scope]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!scopeSessionId) return;
+      scopeMode = scopeMode === "session" ? "all" : "session";
+      narrowPickerOpen = false;
+      monitorRunMutationSeq++;
+      render();
+      void refreshMonitorRuns(true).then(() => {
+        showToast(
+          scopeMode === "session"
+            ? `已按本对话隔离显示 (${panelRuns.length} 个任务)`
+            : `已切换为显示全部并行对话 (${panelRuns.length} 个任务)`,
+        );
+      }).catch((err) => showToast(`切换会话过滤失败: ${errorText(err)}`));
+    });
   });
 
   const picker = document.getElementById("narrow-agent-picker-btn");
@@ -1707,14 +2288,25 @@ function bindInteractions(): void {
     const files = (Array.isArray(resObj?.changed_files)
       ? resObj.changed_files.filter((file) => typeof file === "string").join(", ") : "") || "无变更文件";
     const wt = currentRun.worktree?.branch ? `，分支 ${currentRun.worktree.branch}` : "";
-    const msg = `请复核 Codex 子任务 ${currentRun.run_id}（模型 ${currentRun.model || "默认"}${wt}，改动: ${files}），检查 diff 并验证测试。`;
+    const rawAnswer = typeof currentRun.result === "string" ? currentRun.result : resObj?.summary;
+    const reply = rawAnswer ? `Codex 回复${rawAnswer.length > 4000 ? "（节选）" : ""}: ${rawAnswer.slice(0, 4000)}` : "";
+    const userPrompt = currentRun.prompt || currentRun.prompt_preview;
+    const reviewRunId = currentRun.run_id;
+    const msg = currentRun.origin === "user"
+      ? [
+          `请复核 Codex 直连会话 ${reviewRunId}（工作目录 ${currentRun.cwd}${wt}）。如果涉及代码变更，请检查 diff 并验证测试。`,
+          userPrompt ? `用户指令: ${userPrompt.slice(0, 1000)}` : "",
+          reply,
+        ].filter(Boolean).join("\n")
+      : `请复核 Codex 子任务 ${reviewRunId}（模型 ${currentRun.model || "默认"}${wt}，改动: ${files}），检查 diff 并验证测试。`;
     try {
-      await app.sendMessage({ role: "user", content: [{ type: "text", text: msg }] });
+      const result = await app.sendMessage({ role: "user", content: [{ type: "text", text: msg }] });
+      if (result?.isError) throw new Error("主 Agent 未接收消息");
+      if (currentRun?.run_id !== reviewRunId) return;
       actionFeedback = "已发送复核请求";
       render();
-    } catch {
-      actionFeedback = "当前视图不支持发送消息";
-      render();
+    } catch (err) {
+      showToast(`发送复核请求失败: ${errorText(err)}`);
     }
   });
 
@@ -1732,6 +2324,7 @@ function bindInteractions(): void {
       if (!id || followupSending) return;
       const prompt = (composerDrafts.get(id) || "").trim();
       if (!prompt) return;
+      const previousRun = currentRun?.run_id === id ? currentRun : panelRuns.find((run) => run.run_id === id);
       followupSending = true;
       render();
       try {
@@ -1739,18 +2332,19 @@ function bindInteractions(): void {
           name: "send_followup",
           arguments: { run_id: id, prompt },
         });
-        const newRun = res?.structuredContent as RunSnapshot | undefined;
-        composerDrafts.set(id, "");
-        if (newRun?.run_id) {
-          panelRuns = [newRun, ...panelRuns.filter((r) => r.run_id !== newRun.run_id)];
-          activeRunsCount = panelRuns.filter((r) => r.status === "running").length;
-          activeTab = "subagents";
-          resetMonitorSelection(newRun.run_id, newRun);
-          resetRunTimeline(newRun);
-          syncPollingTimers();
-          render();
-          showToast(`已发起追问，切换至新执行「${getRunShortTitle(newRun)}」`);
-        }
+        const snapshot = res?.structuredContent as RunSnapshot | undefined;
+        if (res?.isError || !snapshot?.run_id) throw new Error(extractToolErrorMessage(res, "服务端未返回追问任务"));
+        if (!resourcesActive) return;
+        const newRun = { origin: previousRun?.origin, raw: previousRun?.raw, ...snapshot };
+        composerDrafts.delete(id);
+        monitorRunMutationSeq++;
+        panelRuns = [newRun, ...panelRuns.filter((r) => r.run_id !== newRun.run_id)];
+        activeRunsCount = panelRuns.filter((r) => r.status === "running").length;
+        activeTab = "subagents";
+        resetMonitorSelection(newRun.run_id, newRun);
+        resetRunTimeline(newRun);
+        syncPollingTimers();
+        showToast(`已发起追问，切换至新执行「${getRunShortTitle(newRun)}」`);
       } catch (err) {
         showToast(`追问发送失败: ${String(err)}`);
       } finally {
@@ -2072,6 +2666,7 @@ app.ontoolinput = ({ arguments: args }) => {
   if (typeof a.prompt === "string") {
     activateUiResources();
     viewMode = "inline";
+    stopUpdatePolling();
     narrowPickerOpen = false;
     const pendingRun: RunSnapshot = {
       run_id: "pending",
@@ -2103,8 +2698,19 @@ app.ontoolresult = (result) => {
       sc.tab === "history" || sc.tab === "stats" || sc.tab === "models" || sc.tab === "subagents"
         ? sc.tab
         : "subagents";
+    monitorRunMutationSeq++;
     panelRuns = Array.isArray(sc.runs) ? (sc.runs as RunSnapshot[]) : [];
+    const incomingScopeId = typeof sc.scope_session_id === "string" && sc.scope_session_id.trim()
+      ? sc.scope_session_id.trim() : null;
+    scopeSessionId = incomingScopeId;
+    scopeSessionTitle = typeof sc.scope_session_title === "string" && sc.scope_session_title.trim()
+      ? sc.scope_session_title.trim() : null;
+    scopeMode = incomingScopeId && sc.scope_mode !== "all" ? "session" : "all";
+    if (typeof sc.default_cwd === "string" && sc.default_cwd.trim()) defaultCwd = sc.default_cwd.trim();
     activeRunsCount = Number(sc.active_runs ?? panelRuns.filter((r) => r.status === "running").length);
+    globalActiveRuns = Number(sc.global_active_runs ?? activeRunsCount);
+    totalUnclosedRuns = Number(sc.total_unclosed_runs ?? panelRuns.length);
+    otherSessionsRuns = Number(sc.other_sessions_runs ?? 0);
     closed24hCount = Number(sc.closed_24h_count ?? closed24hCount);
     maxConcurrentRuns = Number(sc.max_concurrent_runs ?? 5);
     if (!configWritePending) applyConfigFlags(sc as ConfigFlags);
@@ -2137,12 +2743,19 @@ app.ontoolresult = (result) => {
         render();
       }
     }
+    if (!updateInitialized) {
+      updateInitialized = true;
+      void checkForUpdates({ force: false });
+      void refreshUpdateStatus().catch(() => { /* 更新卡展示错误；不阻塞首屏。 */ });
+    }
+    scheduleUpdatePolling();
     return;
   }
 
   if (typeof sc.run_id === "string") {
     activateUiResources();
     viewMode = "inline";
+    stopUpdatePolling();
     narrowPickerOpen = false;
     stopPanelRefresh();
     const run = sc as unknown as RunSnapshot;
@@ -2155,10 +2768,15 @@ app.ontoolresult = (result) => {
 
 function cleanupUiResources(): void {
   resourcesActive = false;
+  stopUpdatePolling();
+  updateLifecycleSeq++;
+  updateStatusSeq++;
+  updateCheckSeq++;
+  updateStatusRequest = null;
+  updateInitialized = updateChecking = updateStarting = false;
   selectRunSeq++;
   historyDetailSeq++;
-  historyPendingRefresh = null;
-  statsPendingReload = false;
+  for (const queue of [monitorRefresh, historyRefresh, statsRefresh, configRefresh]) queue.cancelPending();
   stopPolling();
   stopPanelRefresh();
   for (const timer of [historySearchTimer, toastTimer, interestOpenTimer, interestCloseTimer]) {
@@ -2221,7 +2839,9 @@ document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
     stopPolling();
     stopPanelRefresh();
+    stopUpdatePolling();
   } else {
+    scheduleUpdatePolling();
     handlePageWakeup();
   }
 });
@@ -2238,9 +2858,13 @@ document.addEventListener("pointerdown", (event) => {
   }
 });
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape" && narrowPickerOpen) {
+  if (event.key !== "Escape" || event.isComposing || event.defaultPrevented) return;
+  if (narrowPickerOpen) {
     event.preventDefault();
     setNarrowPickerOpen(false, true);
+  } else if (viewMode === "panel" && activeTab === "subagents" && composerOpen && !composerSending) {
+    event.preventDefault();
+    closeComposer();
   }
 });
 
