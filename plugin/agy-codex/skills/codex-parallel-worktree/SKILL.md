@@ -12,9 +12,7 @@ description: >-
 当面临 2 个以上互不依赖、可并行推进的模块或调查域时，利用 `agy-codex` 的 `worktree` 隔离与滚动等待能力实现高吞吐并行开发。
 
 ## 与 Antigravity 原生子 Agent 的协作边界
-- **可随时开关尊重用户**：当用户或工具返回 Codex 子代理已暂停（`enabled=false`）时，立刻改用 Antigravity 原生子 Agent（`superpowers:dispatching-parallel-agents`）完成任务，不得强行绕过开关。
-- 若用户希望用 Antigravity 内置模型并行，走 `superpowers:dispatching-parallel-agents`。
-- 若用户要求调度 Codex / GPT / 指定外部模型并行，或需要同一仓库多模型同时改文件并统一审查，使用本 Skill。
+- **开箱即默认与开关尊重**：只要「Codex 联动」开关（`enabled=true`）与默认接管（`intercept_native_subagents=true`）开启且本地 Codex CLI 已就绪，2 个以上可并行模块的编码/重构/排障/调研拆分默认通过 `agy-codex` 的 `worktree` 并发派发（仅 `browser`、`image-generator` 等原生专有子代理走原生）。当用户或工具返回 `enabled=false`（或 `intercept_native_subagents=false` 且用户未指定 Codex）时，立刻改用 Antigravity 原生并行（`superpowers:dispatching-parallel-agents`），不得强行绕过开关。
 
 ## 并行编排四步法
 
@@ -30,8 +28,7 @@ description: >-
   6. 可机检验收标准（`acceptance_criteria` 与必跑验证命令）
 - 按模块或测试文件划分互不交叉的写入范围；**同一组文件绝不分配给两个并发写任务**。
 - 先检查 `list_codex_models` 返回的 `max_concurrent_runs`（默认 5）与当前活跃任务数，同时保持活跃槽位不超过上限。
-- **Orchestrator 防嵌套排除**：遵循 `exclude_orchestrator_models=true`，绝不选择 Orchestrator 编排类模型作为 Codex 子代理目标。
-- 若用户未指定各分支使用哪个模型、且对应 `preset` 与 `workbench_config.defaults.model` 均未绑定具体模型，先请用户确认各分支的模型与档位分配再派发。
+- **合规默认模型优先沿用与 Orchestrator 防嵌套排除**：遵循 `exclude_orchestrator_models=true`，绝不选择 Orchestrator 编排类模型作为 Codex 子代理目标。模型优先级依次为「用户当轮指定 -> `preset.model` -> 工作台 `defaults.model` -> `~/.codex/config.toml` 合规默认模型」；只要四层之一已解析出合规模型即可直接并发派发，仅当四层均未绑定合规模型时先请用户确认模型与档位分配。
 
 ### 2. 并发派发（强制写任务启用 `worktree`）
 - **写任务**：为每个分支传唯一的 `worktree` 名称（例如 `worktree="auth-fix"`、`worktree="cli-flags"`），每个子 Agent 会在独立 Git worktree（分支 `codex/<name>`）中工作，主工作区保持干净。

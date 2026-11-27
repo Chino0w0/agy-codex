@@ -144,17 +144,17 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         (self.codex_home / "config.toml").write_text(
             '\n'.join(
                 [
-                    'model = "axon/gpt-6.2-sol"',
+                    'model = "relay/model-pro"',
                     'model_provider = "custom"',
                     'model_reasoning_effort = "xhigh"',
-                    'model_catalog_json = "models-catelog.local.json"',
+                    'model_catalog_json = "models-catalog.local.json"',
                     "model_context_window = 922000",
                     "model_auto_compact_token_limit = 750000",
                     'custom_extra_flag = "enabled-val"',
                     "",
                     "[model_providers.custom]",
-                    'name = "Local LiteLLM"',
-                    'base_url = "http://127.0.0.1:4002/v1"',
+                    'name = "Local Gateway"',
+                    'base_url = "http://127.0.0.1:4099/v1"',
                     'wire_api = "responses"',
                 ]
             )
@@ -162,14 +162,14 @@ class TestCatalogAndWhitelist(unittest.TestCase):
             encoding="utf-8",
             newline="\n",
         )
-        catalog_path = self.codex_home / "models-catelog.local.json"
+        catalog_path = self.codex_home / "models-catalog.local.json"
         catalog_path.write_text(
             json.dumps(
                 {
                     "models": [
                         {
-                            "slug": "axon/gpt-6.2-sol",
-                            "display_name": "[Axon]GPT-6.2-sol",
+                            "slug": "relay/model-pro",
+                            "display_name": "[Relay]Model-Pro",
                             "visibility": "list",
                             "default_reasoning_level": "medium",
                             "supported_reasoning_levels": [
@@ -182,8 +182,8 @@ class TestCatalogAndWhitelist(unittest.TestCase):
                             "context_window": 922000,
                         },
                         {
-                            "slug": "axon/gemini-3.8-flash",
-                            "display_name": "[Axon]Gemini-3.8-flash",
+                            "slug": "relay/model-fast",
+                            "display_name": "[Relay]Model-Fast",
                             "visibility": "list",
                             "default_reasoning_level": "medium",
                             "supported_reasoning_levels": [
@@ -195,7 +195,7 @@ class TestCatalogAndWhitelist(unittest.TestCase):
                             "context_window": 1048576,
                         },
                         {
-                            "slug": "axon/hidden-legacy",
+                            "slug": "relay/hidden-legacy",
                             "display_name": "Hidden Legacy",
                             "visibility": "hide",
                             "supported_reasoning_levels": ["low", "medium"],
@@ -234,17 +234,17 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertEqual(tomllib.loads(toml_expr)["model_catalog_json"], str(catalog_path.resolve()))
 
         # Overriding model omits config.toml context_window (same_model_only) and clamps debug xhigh -> high
-        ov_flash, meta_flash = codex_catalog.collect_isolated_overrides(
+        ov_fast, meta_fast = codex_catalog.collect_isolated_overrides(
             self.codex_home,
             self.data_dir,
-            cli_model="axon/gemini-3.8-flash",
+            cli_model="relay/model-fast",
             preset="debug",
         )
-        ov_flash_dict = dict(ov_flash)
-        self.assertEqual(ov_flash_dict["model_reasoning_effort"], "high")
-        self.assertEqual(meta_flash["original_effort"], "xhigh")
-        self.assertTrue(any("effort clamped: xhigh -> high" in w for w in meta_flash["warnings"]))
-        self.assertNotIn("model_context_window", ov_flash_dict)
+        ov_fast_dict = dict(ov_fast)
+        self.assertEqual(ov_fast_dict["model_reasoning_effort"], "high")
+        self.assertEqual(meta_fast["original_effort"], "xhigh")
+        self.assertTrue(any("effort clamped: xhigh -> high" in w for w in meta_fast["warnings"]))
+        self.assertNotIn("model_context_window", ov_fast_dict)
 
         # Passthrough effort_policy + always_forward context_window + extra_whitelist_keys + allow_nested_subagents + catalog_mode off
         codex_catalog.save_workbench_config(
@@ -256,14 +256,14 @@ class TestCatalogAndWhitelist(unittest.TestCase):
                     "allow_nested_subagents": True,
                     "catalog_mode": "off",
                 },
-                "excluded_models": ["axon/hidden-legacy"],
+                "excluded_models": ["relay/hidden-legacy"],
             },
             self.data_dir,
         )
         ov_custom, meta_custom = codex_catalog.collect_isolated_overrides(
             self.codex_home,
             self.data_dir,
-            cli_model="axon/hidden-legacy",
+            cli_model="relay/hidden-legacy",
             cli_effort="xhigh",
         )
         ov_custom_dict = dict(ov_custom)
@@ -339,14 +339,14 @@ class TestCatalogAndWhitelist(unittest.TestCase):
                 [
                     'model = "gpt-5.2-codex"',
                     "",
-                    "[mcp_servers.fastctx]",
+                    "[mcp_servers.code_search]",
                     'type = "stdio"',
-                    'command = "C:/bin/fastctx.exe"',
+                    'command = "C:/bin/code_search.exe"',
                     'args = ["serve", "--enable-shell"]',
                     "",
-                    "[mcp_servers.fastctx.env]",
-                    'FASTCTX_BASH = "D:/Git/bin/bash.exe"',
-                    'API_KEY = "super-secret-fastctx-key"',
+                    "[mcp_servers.code_search.env]",
+                    'CODE_SEARCH_BASH = "D:/Git/bin/bash.exe"',
+                    'API_KEY = "super-secret-search-key"',
                     "",
                     "[mcp_servers.node_repl]",
                     'command = "C:/bin/node_repl.exe"',
@@ -360,32 +360,32 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         # Default: no MCP servers forwarded in isolated mode, but discovery lists them without env secrets
         disc = codex_catalog.discover_models_and_config(self.codex_home, self.data_dir)
         mcp_ids = {m["id"] for m in disc["mcp_servers"]}
-        self.assertEqual(mcp_ids, {"fastctx", "node_repl"})
-        self.assertNotIn("super-secret-fastctx-key", json.dumps(disc))
+        self.assertEqual(mcp_ids, {"code_search", "node_repl"})
+        self.assertNotIn("super-secret-search-key", json.dumps(disc))
 
         ov_def, _ = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
         self.assertFalse(any(k.startswith("mcp_servers.") for k, _ in ov_def))
 
-        # Opt-in forward fastctx only
+        # Opt-in forward code_search only
         codex_catalog.save_workbench_config(
-            {"mapping": {"forwarded_mcp_servers": ["fastctx"]}}, self.data_dir
+            {"mapping": {"forwarded_mcp_servers": ["code_search"]}}, self.data_dir
         )
         ov_fwd, meta_fwd = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
         ov_dict = dict(ov_fwd)
-        self.assertNotIn("mcp_servers.fastctx.type", ov_dict)
-        self.assertEqual(ov_dict["features.code_mode.direct_only_tool_namespaces"], ["mcp__fastctx"])
-        self.assertEqual(ov_dict["mcp_servers.fastctx.command"], "C:/bin/fastctx.exe")
-        self.assertEqual(ov_dict["mcp_servers.fastctx.args"], ["serve", "--enable-shell"])
+        self.assertNotIn("mcp_servers.code_search.type", ov_dict)
+        self.assertEqual(ov_dict["features.code_mode.direct_only_tool_namespaces"], ["mcp__code_search"])
+        self.assertEqual(ov_dict["mcp_servers.code_search.command"], "C:/bin/code_search.exe")
+        self.assertEqual(ov_dict["mcp_servers.code_search.args"], ["serve", "--enable-shell"])
         self.assertEqual(
-            codex_catalog.to_toml_literal(ov_dict["mcp_servers.fastctx.args"]),
+            codex_catalog.to_toml_literal(ov_dict["mcp_servers.code_search.args"]),
             '["serve", "--enable-shell"]',
         )
-        self.assertEqual(ov_dict["mcp_servers.fastctx.env.FASTCTX_BASH"], "D:/Git/bin/bash.exe")
-        self.assertEqual(ov_dict["mcp_servers.fastctx.env.API_KEY"], "super-secret-fastctx-key")
+        self.assertEqual(ov_dict["mcp_servers.code_search.env.CODE_SEARCH_BASH"], "D:/Git/bin/bash.exe")
+        self.assertEqual(ov_dict["mcp_servers.code_search.env.API_KEY"], "super-secret-search-key")
         self.assertFalse(any(k.startswith("mcp_servers.node_repl") for k in ov_dict))
-        self.assertNotIn("super-secret-fastctx-key", json.dumps(meta_fwd))
+        self.assertNotIn("super-secret-search-key", json.dumps(meta_fwd))
         self.assertEqual(
-            meta_fwd["redacted_overrides"]["mcp_servers.fastctx.env.API_KEY"], "<redacted>"
+            meta_fwd["redacted_overrides"]["mcp_servers.code_search.env.API_KEY"], "<redacted>"
         )
 
     def test_v11_workbench_defaults_validation_and_retention_clamping(self) -> None:

@@ -71,9 +71,19 @@ sh ./install.sh
 
 ```bash
 python ~/.gemini/config/plugins/agy-codex/server/codex_run.py doctor
-python ~/.gemini/config/plugins/agy-codex/server/codex_run.py models --include-hidden
+python ~/.gemini/config/plugins/agy-codex/server/codex_run.py models --query gpt --exclude-filtered
 python ~/.gemini/config/plugins/agy-codex/server/codex_run.py preview --preset debug
 ```
+
+### Upgrade & Reload
+
+```bash
+git pull --ff-only
+```
+
+- **Windows**: `powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`
+- **macOS / Linux**: `sh ./install.sh`
+- Existing `~/.codex/worker.config.toml` and `workbench-config.json` settings are preserved. Refresh `agy-codex` in **MCP Servers** settings (or reopen Antigravity) after upgrading an active session.
 
 ### Uninstall
 
@@ -85,6 +95,81 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```bash
 # macOS / Linux
 sh ./uninstall.sh
+```
+
+---
+
+## Quick Start (Out-of-the-Box Usage)
+
+1. **Zero-Config Default Routing**: With **Codex Linkage** ON by default (`enabled=true`), just ask Antigravity to split modules, implement features, fix bugs, review diffs, or investigate code. Built-in `hooks.json` routes general subagent tasks to Codex CLI automatically and opens the live side-pane monitor.
+2. **Switch Between Codex & Native Anytime**: Use the high-contrast **Codex Linkage** button in the persistent topbar or inside any of the 4 workbench views to pause or resume Codex dispatch immediately, or type "without Codex / use native subagent" in chat for a single-turn bypass.
+3. **Compliant Default Model Resolution**: Resolves in order `chat-explicit -> preset.model -> workbench defaults.model -> compliant ~/.codex/config.toml default`. When `exclude_orchestrator_models=true` leaves no compliant default, Antigravity calls `list_codex_models` and lets you pick first.
+4. **Session-Grouped History & Usage Stats**: Closed task tabs are organized cleanly under their parent Antigravity conversation in **History** (default 24h TTL, configurable 1 to 168h), while **Usage Stats** reads the permanent `stats-ledger.jsonl` for call counts, success rates, and token cache hit trends (zero cost estimation).
+
+---
+
+## Key Settings Reference
+
+Editable in **Models & Config Center** and persisted at `~/.gemini/antigravity/plugin_data/agy-codex/workbench-config.json`:
+
+| Setting | Default | Purpose |
+| :--- | :--- | :--- |
+| `enabled` | `true` | Master **Codex Linkage** switch (turn off to revert to native Antigravity subagents anytime) |
+| `intercept_native_subagents` | `true` | Automatically redirect general `invoke_subagent` calls to `agy-codex` while `enabled=true` |
+| `exclude_orchestrator_models` | `true` | Dual anti-nesting guard excluding `orchestrator` models from Codex subagent selection |
+| `defaults.model` | `null` | Pinned default Codex model (`null` inherits compliant `~/.codex/config.toml` default) |
+| `mapping.native_passthrough_subagents` | `["browser", "image-generator"]` | Native-only subagents always allowed natively |
+| `mapping.retention_hours` | `24` | Hours to retain full archived run event logs (`1` to `168`) |
+| `mapping.forwarded_mcp_servers` | `[]` | Opt-in allowlist of Codex MCP servers to forward into isolated worker runs |
+
+---
+
+## Troubleshooting (FAQ)
+
+- **What if I install Agy Codex before installing or logging into Codex CLI?**
+  The `PreToolUse` hook runs a `<5ms` local readiness check (CLI binary + `auth.json` or configured custom provider). If Codex CLI is not ready yet, it automatically fails open to native Antigravity subagents and prints a quick setup notice on session start.
+- **Why do browser or image tasks still use Antigravity native subagents?**
+  Capabilities unique to Antigravity such as `browser` and `image-generator` (plus accessibility/diagnostic built-ins) are allowed through automatically and configurable via `mapping.native_passthrough_subagents`.
+- **How do I inspect environment health?**
+  Run `python ~/.gemini/config/plugins/agy-codex/server/codex_run.py doctor` to verify `python`, `codex_bin`, `config`, `auth`, `schema`, and `git`.
+
+---
+
+## Project Structure
+
+```text
+agy-codex/
+├── CHANGELOG.md                                # Release changelog
+├── docs/
+│   ├── INSTALL_AGENT.md                        # Agent auto-install guide
+│   └── superpowers/specs/                      # Design docs
+├── install.py / install.ps1 / install.sh       # Cross-platform installer
+├── uninstall.py / uninstall.ps1 / uninstall.sh # Cross-platform uninstaller
+├── profiles/
+│   └── worker.config.toml                      # Lightweight Codex worker config template
+├── plugin/
+│   └── agy-codex/                              # Native Antigravity plugin bundle
+│       ├── plugin.json                         # Plugin manifest (v1.2.0)
+│       ├── mcp_config.json                     # MCP server entrypoint
+│       ├── hooks.json                          # SessionStart / PreToolUse default routing hooks
+│       ├── assets/
+│       │   ├── app.html                        # Prebuilt single-file MCP App UI
+│       │   └── logo.svg                        # Plugin icon
+│       ├── rules/
+│       │   └── AGENTS.md                       # Default Codex routing & 6-part contract rules
+│       ├── skills/
+│       │   ├── codex-dispatch/SKILL.md         # Bounded single-task dispatch skill
+│       │   ├── codex-parallel-worktree/SKILL.md# Parallel worktree & rolling verification skill
+│       │   └── codex-second-opinion/SKILL.md   # Cross-model review & root-cause skill
+│       ├── server/
+│       │   ├── mcp_server.py                   # Concurrent stdio MCP App server
+│       │   ├── routing_hook.py                 # Lifecycle routing & fail-open readiness hook
+│       │   ├── codex_run.py                    # Runner wrapper + doctor/models/preview CLI
+│       │   ├── codex_catalog.py                # 4-source catalog, presets & whitelist engine
+│       │   ├── codex_telemetry.py              # stats-ledger persistence & archive pruning
+│       │   └── handoff_schema.json             # Structured handoff JSON Schema
+│       └── ui-src/                             # Frontend TypeScript sources
+└── tests/                                      # Python unittest suite (including hooks & installer)
 ```
 
 ---

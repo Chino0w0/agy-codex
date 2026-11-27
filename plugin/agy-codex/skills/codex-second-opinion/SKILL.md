@@ -12,8 +12,8 @@ description: >-
 
 ## 开关尊重、结构化参数与档位纪律
 
-- **可随时开关尊重用户**：当用户或工具返回 Codex 子代理已暂停（`enabled=false`）时，立刻改用 Antigravity 原生子 Agent 完成审查，不得强行绕过开关。
-- **Orchestrator 防嵌套排除**：遵循 `exclude_orchestrator_models=true`，绝不选择 Orchestrator 编排类模型作为 Codex 子代理目标。
+- **开箱即用与开关尊重**：在 `enabled=true` 且 `intercept_native_subagents=true` 且本地 Codex CLI 已就绪时，独立只读审查与根因会诊子任务默认优先走 `agy-codex` MCP（`preset="review"` / `"debug"`）；当用户或工具返回 Codex 子代理已暂停（`enabled=false`，或 `intercept_native_subagents=false` 且用户未指定 Codex）时，立刻改用 Antigravity 原生子 Agent 完成审查，不得强行绕过开关。
+- **合规默认模型优先沿用与 Orchestrator 防嵌套排除**：模型选择依次遵循「用户当轮指定 -> `preset.model` -> 工作台 `defaults.model` -> `~/.codex/config.toml` 合规默认模型」（符合 `exclude_orchestrator_models=true` 与 `excluded_models`，绝不选择 Orchestrator 编排类模型），仅四层均未解析出合规模型时先调用 `list_codex_models` 列给用户选定。
 - **结构化传参**：调用 `start_codex_task` 时传入可选参数 `title`、`role`、`conversation_id`、`conversation_title`、`context_files`、`acceptance_criteria`、`non_goals`，并通过 `open_codex_panel(tab="subagents", run_id=...)`（`tab` 支持 `"subagents" | "history" | "stats" | "models"`）在右侧查看进度。
 - **档位纪律与粒度**：常规合并前代码审查（`review`）使用 `medium` 或 `high`，仅将 `xhigh` 留给复杂疑难根因会诊（`debug`）；单次会诊聚焦 1 个有界问题域（2–5 分钟）。
 

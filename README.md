@@ -70,15 +70,26 @@ sh ./install.sh
 ### CLI 工具命令（安装后立即可用）
 
 ```bash
-# 环境体检
+# 环境体检（校验 Python / Codex CLI / 凭据 / Schema / Git / Hooks）
 python ~/.gemini/config/plugins/agy-codex/server/codex_run.py doctor
 
-# 查看已发现的模型、Provider 与预设（加 --include-hidden 显示隐藏模型）
-python ~/.gemini/config/plugins/agy-codex/server/codex_run.py models
+# 查看已发现的模型、Provider 与预设（支持按关键词过滤或隐藏 excluded 模型）
+python ~/.gemini/config/plugins/agy-codex/server/codex_run.py models --query gpt --exclude-filtered
 
 # 干跑预览实际生成的脱敏命令行与告警
 python ~/.gemini/config/plugins/agy-codex/server/codex_run.py preview --preset debug
 ```
+
+### 升级与热刷新
+
+```bash
+# 在仓库目录拉取最新代码后直接覆盖安装（会保留 ~/.codex/worker.config.toml 与现有插件配置/历史）
+git pull --ff-only
+```
+
+- **Windows**：`powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`
+- **macOS / Linux**：`sh ./install.sh`
+- 如 Antigravity 正在运行，安装完成后在设置中的 **MCP Servers** 刷新 `agy-codex`（或重启客户端）即可生效。
 
 ### 卸载
 
@@ -94,10 +105,47 @@ sh ./uninstall.sh
 
 ---
 
+## 开箱即用：快速上手
+
+1. **装完即走 Codex（免配置默认生效）**：只要处于开启状态（默认 `enabled=true`），在新对话里直接让 Antigravity 拆模块写代码、排查 Bug、Code Review 或调研代码，内置 `hooks.json` 会自动把通用子任务导流给 Codex CLI，并在右侧分屏打开实时追踪面板。
+2. **随时一键切换 Codex / 原生子代理**：在左侧 **插件 -> Agy Codex** 全屏页、右侧分屏的顶部栏与四个视图右上角都有高对比度 **「Codex 联动」** 开关，点关闭立刻切回 Antigravity 原生子代理；也可在对话中直接说「不用 Codex / 用原生子代理」单轮放行。
+3. **自动沿用合规默认模型**：按「对话显式指定 -> 角色 `preset.model` -> 工作台 `defaults.model` -> `~/.codex/config.toml` 默认模型」解析；如已开启 `exclude_orchestrator_models=true`（默认开启）且均未解析出合规模型，则会先列出可用模型清单让你选定。
+4. **查看分组历史与用量统计**：已关闭的任务卡片会按 Antigravity 大会话自动归类在 **「历史对话」** 中留存（默认 24h，可在 1 到 168h 间调整），**「统计面板」** 则通过 `stats-ledger.jsonl` 永久记录 Antigravity 与 Codex 联动的调用次数、成功率和 Token 缓存命中趋势（不做费用估算）。
+
+---
+
+## 核心配置与开关速查
+
+可在 **「模型与配置」** 页面可视化修改（持久化于 `~/.gemini/antigravity/plugin_data/agy-codex/workbench-config.json`）：
+
+| 配置项 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `enabled` | `true` | 全局 **Codex 联动** 开关（可随时关闭，立即切回 Antigravity 原生子代理） |
+| `intercept_native_subagents` | `true` | 开启联动后自动拦截并重定向通用 `invoke_subagent` 调用至 `agy-codex` |
+| `exclude_orchestrator_models` | `true` | 双重防嵌套保护：从 Codex 候选中排除 `orchestrator` 类编排模型 |
+| `defaults.model` | `null` | 固定默认派发模型（留空则优先沿用 `~/.codex/config.toml` 合规默认模型） |
+| `mapping.native_passthrough_subagents` | `["browser", "image-generator"]` | 原生专有子代理放行白名单（内置已额外兜底放行无障碍检查与诊断专有代理） |
+| `mapping.retention_hours` | `24` | 归档任务完整时间线日志的保留小时数（支持范围 `1` 至 `168`） |
+| `mapping.forwarded_mcp_servers` | `[]` | 按需白名单透传给 Codex Worker 的 MCP 服务名（默认全关以加速隔离启动） |
+
+---
+
+## 常见问题排障 (FAQ)
+
+- **还没配置或登录 Codex CLI 会不会把 Antigravity 原生子代理也锁死？**
+  不会。`PreToolUse` 钩子每次都会在 5ms 内纯本地校验 `codex` 可执行文件及登录/自定义 Provider 凭据；若尚未就绪，会自动降级放行 Antigravity 原生子代理，并在会话启动时给出提示。
+- **为什么用浏览器操作或生成图片时仍然走 Antigravity 原生？**
+  内置浏览器交互与图像生成等专有子代理属于 Codex CLI 无法替代的能力，默认在放行白名单内；你也可在 `mapping.native_passthrough_subagents` 中增减放行条目。
+- **如何快速定位环境或路径问题？**
+  运行 `python ~/.gemini/config/plugins/agy-codex/server/codex_run.py doctor` 检查 `python`、`codex_bin`、`config`、`auth`、`schema` 与 `git` 六项健康状态；Windows 下工作区子任务还会自动在子进程环境中注入 `safe.directory=*` 以兼容隔离 Git worktree。
+
+---
+
 ## 目录结构
 
 ```text
 agy-codex/
+├── CHANGELOG.md                                # 版本更新日志
 ├── docs/
 │   ├── INSTALL_AGENT.md                        # Agent 自动安装指南
 │   └── superpowers/specs/                      # 架构设计文档
@@ -107,25 +155,27 @@ agy-codex/
 │   └── worker.config.toml                      # Codex CLI Worker 轻量配置模板
 ├── plugin/
 │   └── agy-codex/                              # Antigravity 一体化原生插件
-│       ├── plugin.json                         # 插件元数据
+│       ├── plugin.json                         # 插件元数据 (v1.2.0)
 │       ├── mcp_config.json                     # MCP Server 配置
+│       ├── hooks.json                          # SessionStart / PreToolUse 默认路由钩子
 │       ├── assets/
 │       │   ├── app.html                        # 预构建单文件 MCP App 前端 UI
 │       │   └── logo.svg                        # 插件图标
 │       ├── rules/
-│       │   └── AGENTS.md                       # 常驻路由与子 Agent 编排规范
+│       │   └── AGENTS.md                       # 常驻默认路由与六段式契约规范
 │       ├── skills/
 │       │   ├── codex-dispatch/SKILL.md         # 单任务精准委派与模型路由
 │       │   ├── codex-parallel-worktree/SKILL.md# 多分支并行 Worktree 滚动验收
 │       │   └── codex-second-opinion/SKILL.md   # 跨模型独立审查与会诊
 │       ├── server/
-│       │   ├── mcp_server.py                   # 零依赖 Python MCP App 服务端
+│       │   ├── mcp_server.py                   # 并发 stdio Python MCP App 服务端
+│       │   ├── routing_hook.py                 # 生命周期路由与未就绪自动降级钩子
 │       │   ├── codex_run.py                    # 封装执行器 + doctor/models/preview CLI
 │       │   ├── codex_catalog.py                # 四源模型目录、预设与安全白名单引擎
-│       │   ├── codex_telemetry.py              # 本地 SQLite/JSONL 只读统计融合引擎
+│       │   ├── codex_telemetry.py              # stats-ledger 持久化与归档清理引擎
 │       │   └── handoff_schema.json             # 结构化交付 JSON Schema
 │       └── ui-src/                             # 前端 TypeScript 源码（仅二次开发打包用）
-└── tests/                                      # Python unittest 自动化测试套件
+└── tests/                                      # Python unittest 自动化测试套件 (含 hooks 与安装测试)
 ```
 
 ---
