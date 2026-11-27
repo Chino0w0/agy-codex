@@ -153,18 +153,18 @@ export function getRunShortTitle(run: RunSnapshot): string {
   return run.run_id;
 }
 
-export function getRunDisplayTitle(run: RunSnapshot): string {
+export function getRunDisplayTitle(run: RunSnapshot, maxChars = 64): string {
   if (run.title && run.title.trim()) {
     const cleaned = stripTitleBoilerplate(run.title);
-    return capShortTitle(cleaned || run.title.trim(), 64);
+    return capShortTitle(cleaned || run.title.trim(), maxChars);
   }
   if (run.preset && run.preset.trim()) {
-    return capShortTitle(run.preset.trim(), 64);
+    return capShortTitle(run.preset.trim(), maxChars);
   }
   const rawPrev = (run.prompt_preview || run.prompt || "").trim().replace(/\s+/g, " ");
   if (rawPrev) {
     const cleaned = stripTitleBoilerplate(rawPrev);
-    return capShortTitle(cleaned || rawPrev, 64);
+    return capShortTitle(cleaned || rawPrev, maxChars);
   }
   return run.run_id;
 }
@@ -406,20 +406,15 @@ export function renderHelpTip(id: string, label: string, text: string): string {
 
 export function renderCodexToggleButton(
   enabled: boolean,
-  variant: "topbar" | "inline" | "card" = "inline",
+  variant: "topbar" | "card",
 ): string {
   const stateClass = enabled ? "is-on" : "is-off";
   const tip = enabled
     ? "点击关闭 Codex 子代理联动（改为 Antigravity 原生子代理执行）"
     : "点击开启 Codex 子代理联动（恢复向 Codex 模型派发子任务）";
-  let labelHtml = "";
-  if (variant === "topbar") {
-    labelHtml = `<span class="codex-toggle-text">Codex 联动: ${enabled ? "已开启" : "已关闭"}</span><span class="codex-toggle-short">联动: ${enabled ? "开" : "关"}</span>`;
-  } else if (variant === "card") {
-    labelHtml = `<span class="codex-toggle-text">${enabled ? "已开启" : "已关闭"}</span><span class="codex-toggle-action">${enabled ? "点击关闭" : "点击开启"}</span>`;
-  } else {
-    labelHtml = `<span class="codex-toggle-text">Codex 联动: ${enabled ? "已开启" : "已关闭"}</span><span class="codex-toggle-action">${enabled ? "点击关闭" : "点击开启"}</span>`;
-  }
+  const labelHtml = variant === "topbar"
+    ? `<span class="codex-toggle-text">Codex 联动: ${enabled ? "已开启" : "已关闭"}</span><span class="codex-toggle-short">联动: ${enabled ? "开" : "关"}</span>`
+    : `<span class="codex-toggle-text">${enabled ? "已开启" : "已关闭"}</span><span class="codex-toggle-action">${enabled ? "点击关闭" : "点击开启"}</span>`;
   return `<button type="button" data-toggle-codex-master role="switch" aria-checked="${enabled ? "true" : "false"}" class="codex-toggle-btn is-${variant} ${stateClass}" title="${escapeHtml(tip)}">
     <span class="codex-toggle-dot" aria-hidden="true"></span>
     ${labelHtml}

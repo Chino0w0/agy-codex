@@ -8,21 +8,19 @@ import type {
   RunSnapshot,
   StatsPayload,
   TimelineEvent,
-  ToggleExcludeOrchestratorPayload,
-  ToggleInterceptNativePayload,
   WorkbenchConfig,
   WorkbenchPayload,
 } from "./types";
 import { escapeHtml, formatDuration, getRunShortTitle, renderCodexToggleButton } from "./utils";
 import { renderHistoryView, type HistoryFilter } from "./views/history";
 import { renderModelsView } from "./views/models";
-import { renderMonitorTablist, renderMonitorView } from "./views/monitor";
+import { renderMonitorTablist, renderMonitorView, renderNarrowAgentSwitcher } from "./views/monitor";
 import { renderStatsView } from "./views/stats";
 import { renderTraceView, type TraceViewState } from "./views/trace";
 
 const AuxPaneResponseSchema = z.object({ isError: z.boolean().optional() }).passthrough();
 
-const app = new App({ name: "Agy Codex", version: "1.2.0" }, {});
+const app = new App({ name: "Agy Codex", version: "1.4.0" }, {}, { autoResize: false });
 
 if (typeof HTMLInputElement !== "undefined" && !("switch" in HTMLInputElement.prototype)) {
   document.documentElement.classList.add("no-native-switch");
@@ -43,6 +41,7 @@ let maxConcurrentRuns = 5;
 
 // Monitor / active trace state (strictly isolated from History!)
 let panelRuns: RunSnapshot[] = [];
+let narrowPickerOpen = false;
 let activeRunId: string | null = null;
 let currentRun: RunSnapshot | null = null;
 let monitorTimeline: TimelineEvent[] = [];
@@ -71,6 +70,10 @@ let historyInFlight = false;
 let statsInFlight = false;
 let modelsInFlight = false;
 let selectRunSeq = 0;
+let monitorSelectionPending = false;
+let resourcesActive = true;
+let appConnected = false;
+let disconnectSizeObserver: (() => void) | null = null;
 let historyDetailSeq = 0;
 let historyPendingRefresh: { focusRunId?: string } | null = null;
 let statsPendingReload = false;
@@ -87,6 +90,7 @@ let historyInspecting = false;
 let openSessionIds = new Set<string>();
 let historySearchTimer: number | null = null;
 let historyTimeline: TimelineEvent[] = [];
+let historyTimelineRunId: string | null = null;
 let historyExpandedCmdIds = new Set<string>();
 let historyGroupOpenOverrides = new Map<string, boolean>();
 let historySavedScrollTop = 0;
@@ -107,7 +111,8 @@ let previewPayload: CommandPreviewPayload | null = null;
 let modelSearchQuery = "";
 let modelsLoading = false;
 let modelsLoadError: string | null = null;
-let codexToggleInFlight = false;
+let configMutationSeq = 0;
+let configWritePending = false;
 let savingConfig = false;
 let configStatusMsg: string | null = null;
 let configErrorMsg: string | null = null;
@@ -130,6 +135,7 @@ function cloneConfig(cfg: WorkbenchConfig): WorkbenchConfig {
 }
 
 function showToast(msg: string, actionLabel?: string, actionCb?: () => void): void {
+  if (!resourcesActive) return;
   const bar = document.getElementById("toast-bar");
   const msgEl = document.getElementById("toast-msg");
   const actEl = document.getElementById("toast-action") as HTMLButtonElement | null;
@@ -150,6 +156,7 @@ function showToast(msg: string, actionLabel?: string, actionCb?: () => void): vo
   bar.classList.remove("is-hidden");
   if (toastTimer !== null) window.clearTimeout(toastTimer);
   toastTimer = window.setTimeout(() => {
+    toastTimer = null;
     bar.classList.add("is-hidden");
   }, 4200);
 }
@@ -162,13 +169,11 @@ function updateLocalTiming(run: RunSnapshot): void {
   } else {
     localStartedMs = Date.now();
   }
-  if (run.status === "running") {
+  if (run.status === "running" && typeof run.timeout_sec === "number" && run.timeout_sec > 0) {
     if (typeof run.remaining_timeout_sec === "number") {
       localTimeoutDeadlineMs = Date.now() + Math.max(0, run.remaining_timeout_sec) * 1000;
-    } else if (typeof run.timeout_sec === "number" && run.timeout_sec > 0) {
-      localTimeoutDeadlineMs = localStartedMs + run.timeout_sec * 1000;
     } else {
-      localTimeoutDeadlineMs = null;
+      localTimeoutDeadlineMs = localStartedMs + run.timeout_sec * 1000;
     }
   } else {
     localTimeoutDeadlineMs = null;
@@ -189,7 +194,7 @@ function resetMonitorTimelineState(): void {
 function applyIncomingEvents(events: TimelineEvent[]): void {
   for (const ev of events) {
     if (ev.kind === "session" || ev.kind === "turn_done") continue;
-    const itemId = typeof ev.item_id === "string" && ev.item_id ? ev.item_id : null;
+    const itemId = "item_id" in ev && typeof ev.item_id === "string" && ev.item_id ? ev.item_id : null;
     if (itemId && monitorItemIndexById.has(itemId)) {
       const idx = monitorItemIndexById.get(itemId)!;
       monitorTimeline[idx] = ev;
@@ -209,6 +214,18 @@ function applyIncomingEvents(events: TimelineEvent[]): void {
   }
 }
 
+// 每次替换监控目标都使上一代请求失效，即使后来又切回同一任务。
+function resetMonitorSelection(runId: string | null, summary: RunSnapshot | null): number {
+  const token = ++selectRunSeq;
+  monitorSelectionPending = false;
+  activeRunId = runId;
+  currentRun = summary;
+  actionFeedback = null;
+  resetMonitorTimelineState();
+  if (summary) updateLocalTiming(summary);
+  return token;
+}
+
 function resetRunTimeline(run: RunSnapshot): void {
   currentRun = run;
   activeRunId = run.run_id;
@@ -222,7 +239,7 @@ function resetRunTimeline(run: RunSnapshot): void {
 
 function canPollActiveRun(): boolean {
   return (
-    !document.hidden &&
+    resourcesActive && !document.hidden && !monitorSelectionPending &&
     (viewMode === "inline" || (viewMode === "panel" && activeTab === "subagents")) &&
     Boolean(activeRunId) &&
     currentRun?.status === "running"
@@ -230,7 +247,7 @@ function canPollActiveRun(): boolean {
 }
 
 function canPollMonitorList(): boolean {
-  return !document.hidden && viewMode === "panel" && activeTab === "subagents";
+  return resourcesActive && !document.hidden && viewMode === "panel" && activeTab === "subagents";
 }
 
 function stopPolling(): void {
@@ -259,14 +276,13 @@ function syncTickTimer(): void {
         const sec = Math.max(0, (Date.now() - localStartedMs) / 1000);
         const durText = formatDuration(sec);
         const ctxTimer = document.getElementById("elapsed-timer");
-        if (ctxTimer) ctxTimer.textContent = durText;
+        if (ctxTimer) ctxTimer.textContent = `已运行 ${durText}`;
         const footerTimer = document.getElementById("running-footer-elapsed");
-        if (footerTimer) footerTimer.textContent = `子 Agent 执行中 (${durText})`;
+        if (footerTimer) footerTimer.textContent = `已运行 ${durText}`;
         const remEl = document.getElementById("timeout-remaining-hint");
         if (remEl && localTimeoutDeadlineMs !== null) {
           const remSec = Math.max(0, (localTimeoutDeadlineMs - Date.now()) / 1000);
           remEl.textContent = `超时剩余 ${formatDuration(remSec)}`;
-          remEl.className = remSec < 180 ? "tabular-nums badge badge-warn" : "tabular-nums trace-muted";
         }
       }, 1000);
     }
@@ -307,6 +323,10 @@ function syncPollingTimers(): void {
   scheduleNextMonitorListRefresh();
 }
 
+function runAlertSignature(run: RunSnapshot | null): string {
+  return JSON.stringify([run?.health, run?.health_reason, run?.in_flight_command, run?.recent_errors]);
+}
+
 function computeMonitorSnapshotSig(): string {
   const runsSig = panelRuns
     .map((r) => {
@@ -314,15 +334,16 @@ function computeMonitorSnapshotSig(): string {
         typeof r.latest_seq === "number"
           ? `s${r.latest_seq}`
           : `e${Math.floor((r.duration_sec ?? r.elapsed_sec ?? 0) / 5)}`;
-      return `${r.run_id}:${r.status}:${r.closed ? 1 : 0}:${r.tokens_used ?? 0}:${seqOrBucket}`;
+      return `${r.run_id}:${r.status}:${r.closed ? 1 : 0}:${r.tokens_used ?? 0}:${seqOrBucket}:${runAlertSignature(r)}`;
     })
     .join(",");
   return `${runsSig}|a=${activeRunsCount}|c=${closed24hCount}|m=${maxConcurrentRuns}|en=${codexEnabled ? 1 : 0}|eo=${excludeOrchestratorModels ? 1 : 0}|rh=${retentionHours}|act=${activeRunId ?? ""}`;
 }
 
 async function fetchIncrementalEvents(): Promise<void> {
-  if (!activeRunId || pollInFlight || document.hidden) return;
+  if (!activeRunId || pollInFlight || !canPollActiveRun()) return;
   const targetRunId = activeRunId;
+  const pollToken = selectRunSeq;
   pollInFlight = true;
   try {
     const res = await app.callServerTool({
@@ -330,30 +351,30 @@ async function fetchIncrementalEvents(): Promise<void> {
       arguments: { run_id: targetRunId, since_seq: latestSeq },
     });
     const data = res?.structuredContent as RunSnapshot | undefined;
-    if (!data) return;
+    if (pollToken !== selectRunSeq || activeRunId !== targetRunId || data?.run_id !== targetRunId) return;
 
-    const idx = panelRuns.findIndex((r) => r.run_id === data.run_id);
+    const idx = panelRuns.findIndex((r) => r.run_id === targetRunId);
     if (idx >= 0) {
       panelRuns[idx] = { ...panelRuns[idx], ...data };
     }
-    if (activeRunId !== targetRunId) return;
-
     const prevStatus = currentRun?.status;
     const prevTokens = currentRun?.tokens_used ?? null;
     const prevError = currentRun?.error ?? null;
+    const prevAlerts = runAlertSignature(currentRun);
     const prevSeq = latestSeq;
     const incomingEvents = Array.isArray(data.events) ? data.events : [];
 
     currentRun = data;
     updateLocalTiming(data);
     if (incomingEvents.length > 0) applyIncomingEvents(incomingEvents);
-    if (typeof data.latest_seq === "number") latestSeq = data.latest_seq;
+    if (typeof data.latest_seq === "number") latestSeq = Math.max(latestSeq, data.latest_seq);
 
     const changed =
       incomingEvents.length > 0 ||
       data.status !== prevStatus ||
       (data.tokens_used ?? null) !== prevTokens ||
       (data.error ?? null) !== prevError ||
+      runAlertSignature(data) !== prevAlerts ||
       latestSeq !== prevSeq;
 
     if (data.status !== "running" && viewMode === "panel" && prevStatus === "running") {
@@ -371,7 +392,7 @@ async function fetchIncrementalEvents(): Promise<void> {
   }
 }
 
-function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload): void {
+function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload, configReadSeq?: number): void {
   if (Array.isArray(data.runs)) {
     panelRuns = data.runs;
   }
@@ -386,20 +407,8 @@ function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload): void {
   if ("max_concurrent_runs" in data && typeof data.max_concurrent_runs === "number") {
     maxConcurrentRuns = data.max_concurrent_runs;
   }
-  if ("enabled" in data && typeof data.enabled === "boolean") {
-    codexEnabled = data.enabled;
-  }
-  if (
-    "intercept_native_subagents" in data &&
-    typeof data.intercept_native_subagents === "boolean"
-  ) {
-    interceptNativeSubagents = data.intercept_native_subagents;
-  }
-  if (
-    "exclude_orchestrator_models" in data &&
-    typeof data.exclude_orchestrator_models === "boolean"
-  ) {
-    excludeOrchestratorModels = data.exclude_orchestrator_models;
+  if (configReadSeq === configMutationSeq && !configWritePending) {
+    applyConfigFlags(data as Partial<ConfigFlags>);
   }
   if ("retention_hours" in data && typeof data.retention_hours === "number") {
     retentionHours = data.retention_hours;
@@ -407,8 +416,9 @@ function applyRunListMetadata(data: ListRunsPayload | CloseRunPayload): void {
 }
 
 async function refreshMonitorRuns(): Promise<void> {
-  if (listInFlight) return;
+  if (!resourcesActive || listInFlight) return;
   listInFlight = true;
+  const configReadSeq = configMutationSeq;
   try {
     const prevSig = computeMonitorSnapshotSig();
     const prevActiveId = activeRunId;
@@ -417,30 +427,29 @@ async function refreshMonitorRuns(): Promise<void> {
       arguments: { status: "all", limit: 40, include_closed: false },
     });
     const data = res?.structuredContent as ListRunsPayload | undefined;
-    if (!data) return;
+    if (!data || !resourcesActive || viewMode !== "panel") return;
 
-    applyRunListMetadata(data);
+    applyRunListMetadata(data, configReadSeq);
 
     let focusedChanged = false;
     if (panelRuns.length === 0) {
       if (activeRunId !== null || currentRun !== null || monitorTimeline.length > 0) {
         focusedChanged = true;
       }
-      activeRunId = null;
-      currentRun = null;
-      resetMonitorTimelineState();
+      if (focusedChanged) resetMonitorSelection(null, null);
+      narrowPickerOpen = false;
     } else if (!activeRunId || !panelRuns.some((r) => r.run_id === activeRunId)) {
       if (viewMode === "panel" && activeTab === "subagents") {
         await selectRun(panelRuns[0].run_id);
         return;
       }
-      activeRunId = panelRuns[0].run_id;
-      currentRun = panelRuns[0];
+      resetMonitorSelection(panelRuns[0].run_id, panelRuns[0]);
       focusedChanged = true;
     } else if (currentRun && currentRun.run_id === activeRunId) {
       const fresh = panelRuns.find((r) => r.run_id === activeRunId);
       if (
         fresh &&
+        !monitorSelectionPending &&
         fresh.status !== currentRun.status &&
         viewMode === "panel" &&
         activeTab === "subagents"
@@ -466,13 +475,12 @@ async function refreshMonitorRuns(): Promise<void> {
 }
 
 async function selectRun(runId: string): Promise<void> {
-  const token = ++selectRunSeq;
-  activeRunId = runId;
-  actionFeedback = null;
-  resetMonitorTimelineState();
-  const listRun = panelRuns.find((r) => r.run_id === runId) || null;
-  currentRun = listRun;
-  if (listRun) updateLocalTiming(listRun);
+  if (!resourcesActive) return;
+  const listRun = panelRuns.find((r) => r.run_id === runId) ?? null;
+  const token = resetMonitorSelection(runId, listRun);
+  monitorSelectionPending = true;
+  syncPollingTimers();
+  if (viewMode === "inline" || activeTab === "subagents") render();
   try {
     const res = await app.callServerTool({
       name: "get_run_events",
@@ -480,21 +488,28 @@ async function selectRun(runId: string): Promise<void> {
     });
     if (token !== selectRunSeq || activeRunId !== runId) return;
     const data = res?.structuredContent as RunSnapshot | undefined;
-    if (data) {
+    if (data?.run_id === runId) {
       resetRunTimeline(data);
-      const idx = panelRuns.findIndex((r) => r.run_id === data.run_id);
-      if (idx >= 0) {
-        panelRuns[idx] = { ...panelRuns[idx], ...data };
-      }
+      const idx = panelRuns.findIndex((r) => r.run_id === runId);
+      if (idx >= 0) panelRuns[idx] = { ...panelRuns[idx], ...data };
     }
   } catch {
-    if (token !== selectRunSeq || activeRunId !== runId) return;
-    currentRun = panelRuns.find((r) => r.run_id === runId) || null;
+    // 保留列表摘要；下一次轮询从 0 重新取日志。
+  } finally {
+    if (token === selectRunSeq && activeRunId === runId) {
+      monitorSelectionPending = false;
+      syncPollingTimers();
+      if (viewMode === "inline" || activeTab === "subagents") render();
+    }
   }
-  syncPollingTimers();
-  if (viewMode === "inline" || activeTab === "subagents") {
-    render();
-  }
+}
+
+function applyArchiveResult(data: CloseRunPayload, closedIds: string[]): void {
+  const closed = new Set(closedIds);
+  applyRunListMetadata({ ...data, runs: (data.runs ?? panelRuns).filter((run) => !closed.has(run.run_id)) });
+  if (typeof data.closed_24h_count !== "number") closed24hCount += closed.size;
+  newArchiveBadge = true;
+  if (panelRuns.length === 0) narrowPickerOpen = false;
 }
 
 async function handleCloseRun(runId: string): Promise<void> {
@@ -505,21 +520,15 @@ async function handleCloseRun(runId: string): Promise<void> {
       arguments: { run_id: runId },
     });
     const data = res?.structuredContent as CloseRunPayload | undefined;
-    if (data) {
-      applyRunListMetadata(data);
-    } else {
-      panelRuns = panelRuns.filter((r) => r.run_id !== runId);
-      activeRunsCount = panelRuns.filter((r) => r.status === "running").length;
-      closed24hCount += 1;
+    if (res?.isError || !Array.isArray(data?.closed_ids) || !data.closed_ids.includes(runId)) {
+      throw new Error(extractToolErrorMessage(res, "服务端未确认此任务已归档"));
     }
-    newArchiveBadge = true;
+    applyArchiveResult(data, data.closed_ids);
     if (activeRunId === runId) {
       if (panelRuns.length > 0) {
         await selectRun(panelRuns[0].run_id);
       } else {
-        activeRunId = null;
-        currentRun = null;
-        resetMonitorTimelineState();
+        resetMonitorSelection(null, null);
         syncPollingTimers();
         render();
       }
@@ -548,21 +557,16 @@ async function handleCloseAllFinished(): Promise<void> {
       arguments: { close_all_finished: true },
     });
     const data = res?.structuredContent as CloseRunPayload | undefined;
-    if (data) {
-      applyRunListMetadata(data);
-    } else {
-      panelRuns = panelRuns.filter((r) => r.status === "running");
-      activeRunsCount = panelRuns.length;
+    if (res?.isError || !Array.isArray(data?.closed_ids) || data.closed_ids.length === 0) {
+      throw new Error(extractToolErrorMessage(res, "服务端未确认任何任务已归档"));
     }
-    newArchiveBadge = true;
-    const closedCount = data?.closed_ids?.length ?? finishedCount;
+    applyArchiveResult(data, data.closed_ids);
+    const closedCount = data.closed_ids.length;
     if (!panelRuns.some((r) => r.run_id === activeRunId)) {
       if (panelRuns.length > 0) {
         await selectRun(panelRuns[0].run_id);
       } else {
-        activeRunId = null;
-        currentRun = null;
-        resetMonitorTimelineState();
+        resetMonitorSelection(null, null);
         syncPollingTimers();
         render();
       }
@@ -600,129 +604,61 @@ async function handleReopenRun(runId: string): Promise<void> {
   }
 }
 
-async function handleToggleCodexEnabled(nextVal: boolean): Promise<void> {
-  if (codexToggleInFlight) return;
-  codexToggleInFlight = true;
+type ConfigFlags = Pick<WorkbenchConfig, "enabled" | "intercept_native_subagents" | "exclude_orchestrator_models">;
+
+function currentConfigFlags(): Required<ConfigFlags> {
+  return { enabled: codexEnabled, intercept_native_subagents: interceptNativeSubagents, exclude_orchestrator_models: excludeOrchestratorModels };
+}
+
+function applyConfigFlags(flags: ConfigFlags): void {
+  codexEnabled = flags.enabled ?? codexEnabled;
+  interceptNativeSubagents = flags.intercept_native_subagents ?? interceptNativeSubagents;
+  excludeOrchestratorModels = flags.exclude_orchestrator_models ?? excludeOrchestratorModels;
+  if (workbenchDraft) Object.assign(workbenchDraft, currentConfigFlags());
+}
+
+function beginConfigWrite(): boolean {
+  if (!resourcesActive || configWritePending) return false;
+  configMutationSeq++;
+  configWritePending = true;
   if (activeTab === "models") syncDraftFromDom();
-  const prevVal = codexEnabled;
-  codexEnabled = nextVal;
-  if (workbenchDraft) {
-    workbenchDraft.enabled = nextVal;
-  }
+  return true;
+}
+
+function endConfigWrite(): void {
+  configWritePending = false;
+  // 写入过程中启动的读取也可能观察到旧数据。
+  configMutationSeq++;
+  render();
+}
+
+async function toggleConfigFlag(
+  key: keyof ConfigFlags,
+  nextVal: boolean,
+  tool: "toggle_codex_enabled" | "toggle_exclude_orchestrator" | "toggle_intercept_native_subagents",
+  successMessages: [string, string],
+): Promise<void> {
+  if (!beginConfigWrite()) return;
+  const previous = currentConfigFlags()[key];
+  applyConfigFlags({ [key]: nextVal });
   render();
   try {
-    const res = await app.callServerTool({
-      name: "toggle_codex_enabled",
-      arguments: { enabled: nextVal },
-    });
-    const data = res?.structuredContent as
-      | { enabled?: boolean; workbench_config?: WorkbenchConfig }
-      | undefined;
-    if (data && typeof data.enabled === "boolean") {
-      codexEnabled = data.enabled;
-    }
-    if (workbenchDraft) {
-      workbenchDraft.enabled = codexEnabled;
-    }
-    render();
-    showToast(
-      codexEnabled
-        ? "已开启 Codex 子代理联动，通用子任务将默认走 Codex"
-        : "已暂停 Codex 子代理联动，新子任务已全部交由 Antigravity 原生子代理执行",
-    );
+    const res = await app.callServerTool({ name: tool, arguments: { enabled: nextVal } });
+    const data = res?.structuredContent as (ConfigFlags & { saved?: WorkbenchConfig }) | undefined;
+    if (res?.isError || !data) throw new Error(extractToolErrorMessage(res, "开关服务未返回配置"));
+    applyConfigFlags({ [key]: data[key] ?? data.saved?.[key] ?? data.enabled ?? nextVal });
+    showToast(successMessages[currentConfigFlags()[key] ? 0 : 1]);
   } catch (err) {
-    codexEnabled = prevVal;
-    if (workbenchDraft) {
-      workbenchDraft.enabled = prevVal;
-    }
-    render();
+    applyConfigFlags({ [key]: previous });
     showToast(`切换失败: ${String(err)}`);
   } finally {
-    codexToggleInFlight = false;
-  }
-}
-
-async function handleToggleExcludeOrchestrator(nextVal: boolean): Promise<void> {
-  if (activeTab === "models") syncDraftFromDom();
-  const prevVal = excludeOrchestratorModels;
-  excludeOrchestratorModels = nextVal;
-  if (workbenchDraft) {
-    workbenchDraft.exclude_orchestrator_models = nextVal;
-  }
-  render();
-  try {
-    const res = await app.callServerTool({
-      name: "toggle_exclude_orchestrator",
-      arguments: { enabled: nextVal },
-    });
-    const data = res?.structuredContent as ToggleExcludeOrchestratorPayload | undefined;
-    if (data) {
-      if (typeof data.exclude_orchestrator_models === "boolean") {
-        excludeOrchestratorModels = data.exclude_orchestrator_models;
-      } else if (typeof data.enabled === "boolean") {
-        excludeOrchestratorModels = data.enabled;
-      }
-      if (workbenchDraft) {
-        workbenchDraft.exclude_orchestrator_models = excludeOrchestratorModels;
-      }
-    }
-    render();
-    showToast(
-      excludeOrchestratorModels
-        ? "已开启 Orchestrator 模型排除保护"
-        : "已解除 Orchestrator 模型派发限制",
-    );
-  } catch (err) {
-    excludeOrchestratorModels = prevVal;
-    if (workbenchDraft) {
-      workbenchDraft.exclude_orchestrator_models = prevVal;
-    }
-    render();
-    showToast(`切换保护开关失败: ${String(err)}`);
-  }
-}
-
-async function handleToggleInterceptNative(nextVal: boolean): Promise<void> {
-  if (activeTab === "models") syncDraftFromDom();
-  const prevVal = interceptNativeSubagents;
-  interceptNativeSubagents = nextVal;
-  if (workbenchDraft) {
-    workbenchDraft.intercept_native_subagents = nextVal;
-  }
-  render();
-  try {
-    const res = await app.callServerTool({
-      name: "toggle_intercept_native_subagents",
-      arguments: { enabled: nextVal },
-    });
-    const data = res?.structuredContent as ToggleInterceptNativePayload | undefined;
-    if (data) {
-      if (typeof data.intercept_native_subagents === "boolean") {
-        interceptNativeSubagents = data.intercept_native_subagents;
-      } else if (typeof data.enabled === "boolean") {
-        interceptNativeSubagents = data.enabled;
-      }
-      if (workbenchDraft) {
-        workbenchDraft.intercept_native_subagents = interceptNativeSubagents;
-      }
-    }
-    render();
-    showToast(
-      interceptNativeSubagents
-        ? "已启用默认接管原生子代理路由"
-        : "已改为仅按需使用 Codex（不自动拦截原生子代理）",
-    );
-  } catch (err) {
-    interceptNativeSubagents = prevVal;
-    if (workbenchDraft) {
-      workbenchDraft.intercept_native_subagents = prevVal;
-    }
-    render();
-    showToast(`切换路由接管开关失败: ${String(err)}`);
+    if (activeTab === "models") syncDraftFromDom();
+    endConfigWrite();
   }
 }
 
 function populateHistoryTimelineFromRun(run: RunSnapshot | null): void {
+  historyTimelineRunId = run?.run_id ?? null;
   historyTimeline = Array.isArray(run?.events)
     ? run.events.filter((e) => e.kind !== "session" && e.kind !== "turn_done")
     : [];
@@ -751,6 +687,7 @@ function extractToolErrorMessage(res: unknown, fallback: string): string {
 }
 
 async function refreshHistory(focusRunId?: string, queueIfBusy = false): Promise<void> {
+  if (!resourcesActive) return;
   if (historyInFlight) {
     if (queueIfBusy) {
       historyPendingRefresh = { focusRunId };
@@ -828,6 +765,10 @@ async function loadHistoryRunDetail(runId: string): Promise<void> {
   historySelectedRunId = runId;
   const flatRuns = (historyPayload?.sessions || []).flatMap((s) => s.runs || []);
   const summaryRun = flatRuns.find((r) => r.run_id === runId) || null;
+  if (historyTimelineRunId !== runId) {
+    historySelectedRunDetail = summaryRun;
+    populateHistoryTimelineFromRun(null);
+  }
   if (summaryRun?.expired) {
     historySelectedRunDetail = summaryRun;
     populateHistoryTimelineFromRun(null);
@@ -836,6 +777,7 @@ async function loadHistoryRunDetail(runId: string): Promise<void> {
     }
     return;
   }
+  if (activeTab === "history" && viewMode === "panel") render();
   try {
     const res = await app.callServerTool({
       name: "get_run_events",
@@ -843,7 +785,7 @@ async function loadHistoryRunDetail(runId: string): Promise<void> {
     });
     if (detailToken !== historyDetailSeq || historySelectedRunId !== runId) return;
     const detail = res?.structuredContent as RunSnapshot | undefined;
-    if (detail) {
+    if (detail?.run_id === runId) {
       historySelectedRunDetail = detail;
       populateHistoryTimelineFromRun(detail);
     } else {
@@ -861,6 +803,7 @@ async function loadHistoryRunDetail(runId: string): Promise<void> {
 }
 
 async function refreshStats(queueIfBusy = false): Promise<void> {
+  if (!resourcesActive) return;
   if (statsInFlight) {
     if (queueIfBusy) {
       statsPendingReload = true;
@@ -900,7 +843,8 @@ async function refreshStats(queueIfBusy = false): Promise<void> {
 }
 
 async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
-  if (modelsInFlight) return;
+  if (!resourcesActive || modelsInFlight) return;
+  const configReadSeq = configMutationSeq;
   modelsInFlight = true;
   modelsLoading = true;
   modelsLoadError = null;
@@ -916,19 +860,18 @@ async function refreshWorkbenchConfig(keepDraft = false): Promise<void> {
     if ((res as { isError?: boolean } | undefined)?.isError || !data || !data.workbench_config) {
       modelsLoadError = extractToolErrorMessage(res, "配置服务返回空数据");
     } else {
-      workbenchData = data;
-      maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
-      if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
-      if (typeof data.enabled === "boolean") codexEnabled = data.enabled;
-      if (typeof data.intercept_native_subagents === "boolean") {
-        interceptNativeSubagents = data.intercept_native_subagents;
+      const freshConfig = configReadSeq === configMutationSeq && !configWritePending;
+      if (freshConfig || !workbenchData) workbenchData = data;
+      if (freshConfig) {
+        maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
+        if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
       }
-      if (typeof data.exclude_orchestrator_models === "boolean") {
-        excludeOrchestratorModels = data.exclude_orchestrator_models;
-      }
-      if (!keepDraft || !workbenchDraft) {
+      if (!workbenchDraft || (freshConfig && !keepDraft)) {
         workbenchDraft = cloneConfig(data.workbench_config);
+      } else if (activeTab === "models") {
+        syncDraftFromDom();
       }
+      applyConfigFlags(freshConfig ? data : {});
     }
   } catch (err) {
     modelsLoadError = err instanceof Error ? err.message : String(err);
@@ -999,6 +942,9 @@ function syncDraftFromDom(): void {
     if (!Number.isNaN(rh)) {
       workbenchDraft.mapping.retention_hours = Math.max(1, Math.min(168, rh));
     }
+    const timeout = (id: string) => Math.min(86400, Math.max(0, Number.parseInt(val(id), 10) || 0));
+    workbenchDraft.mapping.worker_timeout_sec = timeout("cfg-map-worker-timeout");
+    workbenchDraft.mapping.idle_timeout_sec = timeout("cfg-map-idle-timeout");
     workbenchDraft.mapping.allow_nested_subagents = checked("cfg-map-allow-nested");
   }
 
@@ -1028,13 +974,9 @@ async function openFileInAuxPane(filePath: string): Promise<void> {
   const normalized = abs.replace(/\\/g, "/");
   const uri = normalized.startsWith("/") ? `file://${normalized}` : `file:///${normalized}`;
   try {
-    await app.request(
-      {
-        method: "com.google.antigravity/toggle-aux-pane",
-        params: { tabType: "fileView", uri },
-      },
-      AuxPaneResponseSchema,
-    );
+    // Antigravity 的宿主扩展不在 SDK 的标准请求联合类型内。
+    const request = { method: "com.google.antigravity/toggle-aux-pane", params: { tabType: "fileView", uri } };
+    await app.request(request as unknown as Parameters<typeof app.request>[0], AuxPaneResponseSchema);
   } catch {
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(filePath).catch(() => {});
@@ -1044,10 +986,17 @@ async function openFileInAuxPane(filePath: string): Promise<void> {
 }
 
 function switchTab(tab: PanelTab, focusHistoryRunId?: string): void {
+  const wasMonitoring = activeTab === "subagents";
   activeTab = tab;
+  if (tab !== "subagents") narrowPickerOpen = false;
   if (tab === "history") {
     newArchiveBadge = false;
     historyInspecting = Boolean(focusHistoryRunId);
+  }
+  if (tab === "subagents" && !wasMonitoring && activeRunId) {
+    void selectRun(activeRunId);
+    void refreshMonitorRuns();
+    return;
   }
   syncPollingTimers();
   render();
@@ -1060,6 +1009,7 @@ function switchTab(tab: PanelTab, focusHistoryRunId?: string): void {
 function getMonitorTraceViewState(): TraceViewState {
   return {
     timelineEntries: monitorTimeline,
+    timelineRunId: activeRunId,
     expandedCmdIds: monitorExpandedCmdIds,
     groupOpenOverrides: monitorGroupOpenOverrides,
     traceExpandedOverrides,
@@ -1077,6 +1027,7 @@ function getMonitorTraceViewState(): TraceViewState {
 function getHistoryTraceViewState(): TraceViewState {
   return {
     timelineEntries: historyTimeline,
+    timelineRunId: historyTimelineRunId,
     expandedCmdIds: historyExpandedCmdIds,
     groupOpenOverrides: historyGroupOpenOverrides,
     traceExpandedOverrides,
@@ -1166,6 +1117,7 @@ function wireHelpTips(container: HTMLElement): void {
     if (supportsInterest) return;
 
     const openTip = () => {
+      if (!resourcesActive) return;
       if (interestCloseTimer !== null) {
         window.clearTimeout(interestCloseTimer);
         interestCloseTimer = null;
@@ -1194,6 +1146,7 @@ function wireHelpTips(container: HTMLElement): void {
     };
 
     const scheduleClose = () => {
+      if (!resourcesActive) return;
       if (interestOpenTimer !== null) {
         window.clearTimeout(interestOpenTimer);
         interestOpenTimer = null;
@@ -1275,15 +1228,35 @@ function attachTablistOverflowHints(tablist: HTMLElement | null): void {
   tablistObservers.set(key, observer);
 }
 
+function setNarrowPickerOpen(open: boolean, restoreFocus = false): void {
+  const picker = document.getElementById("narrow-agent-picker-btn");
+  const popover = document.getElementById("narrow-agent-popover");
+  if (!picker || !popover) return;
+  narrowPickerOpen = open;
+  picker.setAttribute("aria-expanded", String(open));
+  popover.hidden = !open;
+  if (open) {
+    popover.querySelector<HTMLElement>('[role="option"][aria-selected="true"]')?.focus();
+  } else if (restoreFocus) {
+    picker.focus();
+  }
+}
+
 function render(): void {
+  if (!resourcesActive) return;
   const root = document.getElementById("root");
   if (!root) return;
 
+  const wasFocused = document.activeElement as HTMLElement | null;
+  const switcherFocusId = wasFocused?.closest(".narrow-agent-switcher-bar") ? wasFocused.id : "";
+  const wideTabFocusId = wasFocused?.closest("#wide-agent-tablist") ? wasFocused.id : "";
+  const pickerScroll = document.getElementById("narrow-agent-popover")?.scrollTop ?? 0;
   const existingBox = document.getElementById("timeline-box");
-  if (existingBox) {
-    if (viewMode === "panel" && activeTab === "history") {
+  const trace = existingBox?.closest<HTMLElement>(".trace-shell");
+  if (existingBox && trace) {
+    if (trace.dataset.traceMode === "history" && trace.dataset.traceRun === historySelectedRunId) {
       historySavedScrollTop = existingBox.scrollTop;
-    } else {
+    } else if (trace.dataset.traceMode === "monitor" && trace.dataset.traceRun === activeRunId) {
       monitorSavedScrollTop = existingBox.scrollTop;
       monitorUserPinnedToBottom =
         existingBox.scrollHeight - existingBox.scrollTop - existingBox.clientHeight < 36;
@@ -1309,22 +1282,18 @@ function render(): void {
   const isMonitor = activeTab === "subagents";
   const subTitleMap: Record<PanelTab, string> = {
     subagents: "活跃监控",
-    history: "历史对话 (Antigravity 大会话)",
+    history: "历史对话",
     stats: "统计面板",
     models: "模型与配置",
   };
 
-  const narrowTablistHtml = renderMonitorTablist(panelRuns, activeRunId, "narrow", retentionHours);
   const wideTablistHtml = renderMonitorTablist(panelRuns, activeRunId, "wide", retentionHours);
 
   const topbarHtml = `<div class="topbar">
-    <div id="narrow-subpage-bar" class="narrow-subpage-bar${isMonitor ? " is-hidden" : ""}">
-      <button type="button" id="narrow-back-btn" class="btn btn-sm">← 返回监控</button>
-      <span class="narrow-subpage-title">${escapeHtml(subTitleMap[activeTab])}</span>
-    </div>
-
-    <div id="narrow-tabs-wrap" class="narrow-tabs-wrap${isMonitor ? "" : " is-hidden"}">
-      <div id="narrow-agent-tablist" class="agent-tablist" role="tablist" aria-label="活跃子 Agent 标签">${narrowTablistHtml}</div>
+    <div class="narrow-subpage-bar">
+      ${isMonitor
+        ? `<span class="narrow-monitor-title">${subTitleMap.subagents}</span><span class="tab-count-pill tabular-nums" title="活跃标签数量">${panelRuns.length}</span>`
+        : `<button type="button" id="narrow-back-btn" class="btn btn-sm">← 返回监控</button><span class="narrow-subpage-title">${subTitleMap[activeTab]}</span>`}
     </div>
 
     <div class="wide-only-nav wide-top-nav" role="tablist" aria-label="控制中心主视图">
@@ -1382,7 +1351,6 @@ function render(): void {
   const pausedBannerHtml = !codexEnabled
     ? `<div id="paused-banner" class="paused-banner">
         <span>Codex 子代理已暂停，新子任务将直接交由 Antigravity 原生子代理执行（现有日志仍可查看）。</span>
-        <button type="button" id="banner-resume-btn" class="btn btn-sm">重新开启</button>
       </div>`
     : "";
 
@@ -1391,7 +1359,6 @@ function render(): void {
         <div id="wide-agent-tablist" class="agent-tablist" role="tablist" aria-label="活跃子 Agent 对话标签">${wideTablistHtml}</div>
         <div class="wide-subagent-right">
           <span class="wide-subagent-hint">Antigravity 联动子 Agent (留存 ${retentionHours}h)</span>
-          ${renderCodexToggleButton(codexEnabled, "inline")}
         </div>
       </div>`
     : "";
@@ -1404,7 +1371,6 @@ function render(): void {
       currentRun,
       traceState: getMonitorTraceViewState(),
       retentionHours,
-      enabled: codexEnabled,
     });
   } else if (activeTab === "history") {
     bodyHtml = renderHistoryView({
@@ -1419,7 +1385,6 @@ function render(): void {
       openSessionIds,
       traceState: getHistoryTraceViewState(),
       retentionHours,
-      enabled: codexEnabled,
     });
   } else if (activeTab === "stats") {
     bodyHtml = renderStatsView({
@@ -1427,7 +1392,7 @@ function render(): void {
       stats: statsPayload,
       loading: statsLoading,
       loadError: statsLoadError,
-      enabled: codexEnabled,
+      retentionHours,
     });
   } else {
     bodyHtml = renderModelsView({
@@ -1447,9 +1412,22 @@ function render(): void {
     });
   }
 
-  root.innerHTML = `${topbarHtml}${pausedBannerHtml}${wideStripHtml}<div class="panel-body">${bodyHtml}</div>`;
+  const narrowSwitcherHtml = isMonitor ? renderNarrowAgentSwitcher(panelRuns, activeRunId, narrowPickerOpen) : "";
+  root.innerHTML = `${topbarHtml}${narrowSwitcherHtml}${pausedBannerHtml}${wideStripHtml}<div class="panel-body">${bodyHtml}</div>`;
   bindInteractions();
   restoreTimelineScroll();
+  if (narrowPickerOpen) {
+    const popover = document.getElementById("narrow-agent-popover");
+    if (popover) popover.scrollTop = pickerScroll;
+  }
+  if (switcherFocusId) {
+    const button = document.getElementById(switcherFocusId) ??
+      (narrowPickerOpen ? document.querySelector<HTMLElement>('#narrow-agent-options [aria-selected="true"]') : null) ??
+      document.getElementById("narrow-agent-picker-btn");
+    button?.focus({ preventScroll: true });
+  } else if (wideTabFocusId) {
+    document.getElementById(wideTabFocusId)?.focus({ preventScroll: true });
+  }
 }
 
 function restoreTimelineScroll(): void {
@@ -1497,9 +1475,16 @@ function bindInteractions(): void {
     else if (activeTab === "models") void refreshWorkbenchConfig();
   });
 
+  document.querySelectorAll<HTMLInputElement | HTMLButtonElement>(
+    "[data-toggle-codex-master], #cfg-intercept-switch, #cfg-orch-switch, #save-workbench-btn",
+  ).forEach((btn) => { btn.disabled = configWritePending; });
+
   document.querySelectorAll<HTMLElement>("[data-toggle-codex-master]").forEach((btn) => {
     btn.addEventListener("click", () => {
-      void handleToggleCodexEnabled(!codexEnabled);
+      void toggleConfigFlag("enabled", !codexEnabled, "toggle_codex_enabled", [
+        "已开启 Codex 子代理联动，通用子任务将默认走 Codex",
+        "已暂停 Codex 子代理联动，新子任务已全部交由 Antigravity 原生子代理执行",
+      ]);
     });
   });
 
@@ -1515,16 +1500,49 @@ function bindInteractions(): void {
     void refreshStats(true);
   });
 
-  document.getElementById("banner-resume-btn")?.addEventListener("click", () => {
-    void handleToggleCodexEnabled(true);
-  });
-
   document.getElementById("btn-archive-all")?.addEventListener("click", () => {
     void handleCloseAllFinished();
   });
 
   document.getElementById("empty-to-history")?.addEventListener("click", () => {
     switchTab("history");
+  });
+
+  const picker = document.getElementById("narrow-agent-picker-btn");
+  picker?.addEventListener("click", () => setNarrowPickerOpen(!narrowPickerOpen));
+  picker?.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      setNarrowPickerOpen(true);
+    }
+  });
+  const stepAgent = (offset: number) => {
+    if (panelRuns.length < 2) return;
+    const index = Math.max(0, panelRuns.findIndex((run) => run.run_id === activeRunId));
+    const target = panelRuns[(index + offset + panelRuns.length) % panelRuns.length];
+    setNarrowPickerOpen(false);
+    void selectRun(target.run_id);
+  };
+  document.getElementById("narrow-agent-prev")?.addEventListener("click", () => stepAgent(-1));
+  document.getElementById("narrow-agent-next")?.addEventListener("click", () => stepAgent(1));
+  document.getElementById("narrow-archive-finished")?.addEventListener("click", () => void handleCloseAllFinished());
+  const options = Array.from(document.querySelectorAll<HTMLElement>("[data-narrow-run]"));
+  options.forEach((option, index) => {
+    option.addEventListener("click", () => {
+      const id = option.getAttribute("data-narrow-run");
+      setNarrowPickerOpen(false, true);
+      if (id && id !== activeRunId) void selectRun(id);
+    });
+    option.addEventListener("keydown", (event) => {
+      let nextIndex: number;
+      if (event.key === "ArrowDown") nextIndex = (index + 1) % options.length;
+      else if (event.key === "ArrowUp") nextIndex = (index + options.length - 1) % options.length;
+      else if (event.key === "Home") nextIndex = 0;
+      else if (event.key === "End") nextIndex = options.length - 1;
+      else return;
+      event.preventDefault();
+      options[nextIndex].focus();
+    });
   });
 
   // Monitor tablist interactions
@@ -1548,19 +1566,18 @@ function bindInteractions(): void {
       else if (ev.key === "End") nextIdx = tabs.length - 1;
       if (nextIdx >= 0) {
         ev.preventDefault();
-        const nextId = tabs[nextIdx].getAttribute("data-run-id");
+        const next = tabs[nextIdx];
+        const nextId = next.getAttribute("data-run-id");
         if (nextId) {
-          void selectRun(nextId).then(() => {
-            const focused = list.querySelector<HTMLElement>(`[data-run-id="${CSS.escape(nextId)}"]`);
-            focused?.focus();
-            focused?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
-          });
+          if (nextId !== activeRunId) void selectRun(nextId);
+          const focused = document.getElementById(next.id);
+          focused?.focus({ preventScroll: true });
+          focused?.scrollIntoView({ block: "nearest", inline: "nearest" });
         }
       }
     });
   });
 
-  attachTablistOverflowHints(document.getElementById("narrow-agent-tablist"));
   attachTablistOverflowHints(document.getElementById("wide-agent-tablist"));
 
   document.querySelectorAll<HTMLElement>("[data-close-run]").forEach((btn) => {
@@ -1669,12 +1686,14 @@ function bindInteractions(): void {
     });
   });
 
-  document.getElementById("stop-run-btn")?.addEventListener("click", async () => {
-    const id = activeRunId;
+  const stopBtn = document.getElementById("stop-run-btn");
+  stopBtn?.addEventListener("click", async () => {
+    const id = stopBtn.getAttribute("data-stop-run") || activeRunId;
     if (!id) return;
     try {
-      await app.callServerTool({ name: "cancel_run", arguments: { run_id: id } });
-      await fetchIncrementalEvents();
+      const res = await app.callServerTool({ name: "cancel_run", arguments: { run_id: id } });
+      if (res?.isError) throw new Error(extractToolErrorMessage(res, "停止任务失败"));
+      if (activeRunId === id) await fetchIncrementalEvents();
       showToast("已发送停止信号");
     } catch {
       showToast("停止任务失败");
@@ -1685,7 +1704,8 @@ function bindInteractions(): void {
     if (!currentRun) return;
     const resObj =
       currentRun.result && typeof currentRun.result === "object" ? currentRun.result : null;
-    const files = resObj?.changed_files?.join(", ") || "无变更文件";
+    const files = (Array.isArray(resObj?.changed_files)
+      ? resObj.changed_files.filter((file) => typeof file === "string").join(", ") : "") || "无变更文件";
     const wt = currentRun.worktree?.branch ? `，分支 ${currentRun.worktree.branch}` : "";
     const msg = `请复核 Codex 子任务 ${currentRun.run_id}（模型 ${currentRun.model || "默认"}${wt}，改动: ${files}），检查 diff 并验证测试。`;
     try {
@@ -1725,6 +1745,7 @@ function bindInteractions(): void {
           panelRuns = [newRun, ...panelRuns.filter((r) => r.run_id !== newRun.run_id)];
           activeRunsCount = panelRuns.filter((r) => r.status === "running").length;
           activeTab = "subagents";
+          resetMonitorSelection(newRun.run_id, newRun);
           resetRunTimeline(newRun);
           syncPollingTimers();
           render();
@@ -1760,10 +1781,12 @@ function bindInteractions(): void {
   const histSearch = document.getElementById("history-search-input") as HTMLInputElement | null;
   if (histSearch) {
     histSearch.addEventListener("input", () => {
+      if (!resourcesActive) return;
       const pos = histSearch.selectionStart ?? histSearch.value.length;
       historyQuery = histSearch.value;
       if (historySearchTimer !== null) window.clearTimeout(historySearchTimer);
       historySearchTimer = window.setTimeout(() => {
+        historySearchTimer = null;
         void refreshHistory(undefined, true).then(() => {
           const again = document.getElementById("history-search-input") as HTMLInputElement | null;
           if (again) {
@@ -1865,11 +1888,13 @@ function bindInteractions(): void {
   }
 
   document.getElementById("cfg-intercept-switch")?.addEventListener("change", (ev) => {
-    void handleToggleInterceptNative(Boolean((ev.target as HTMLInputElement).checked));
+    void toggleConfigFlag("intercept_native_subagents", (ev.target as HTMLInputElement).checked,
+      "toggle_intercept_native_subagents", ["已启用默认接管原生子代理路由", "已改为仅按需使用 Codex（不自动拦截原生子代理）"]);
   });
 
   document.getElementById("cfg-orch-switch")?.addEventListener("change", (ev) => {
-    void handleToggleExcludeOrchestrator(Boolean((ev.target as HTMLInputElement).checked));
+    void toggleConfigFlag("exclude_orchestrator_models", (ev.target as HTMLInputElement).checked,
+      "toggle_exclude_orchestrator", ["已开启 Orchestrator 模型排除保护", "已解除 Orchestrator 模型派发限制"]);
   });
 
   document.getElementById("run-doctor-btn")?.addEventListener("click", async () => {
@@ -1886,8 +1911,7 @@ function bindInteractions(): void {
   });
 
   document.getElementById("save-workbench-btn")?.addEventListener("click", async () => {
-    syncDraftFromDom();
-    if (!workbenchDraft) return;
+    if (!workbenchDraft || !beginConfigWrite()) return;
     savingConfig = true;
     configStatusMsg = null;
     configErrorMsg = null;
@@ -1907,25 +1931,18 @@ function bindInteractions(): void {
         },
       });
       const data = res?.structuredContent as (WorkbenchPayload & { saved?: WorkbenchConfig }) | undefined;
-      if (data) {
-        workbenchData = data;
-        if (data.saved) workbenchDraft = cloneConfig(data.saved);
-        maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
-        if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
-        if (typeof data.enabled === "boolean") codexEnabled = data.enabled;
-        if (typeof data.intercept_native_subagents === "boolean") {
-          interceptNativeSubagents = data.intercept_native_subagents;
-        }
-        if (typeof data.exclude_orchestrator_models === "boolean") {
-          excludeOrchestratorModels = data.exclude_orchestrator_models;
-        }
-        configStatusMsg = "配置已保存并立即生效";
-      }
+      if (res?.isError || !data?.saved) throw new Error(extractToolErrorMessage(res, "服务端未确认配置已保存"));
+      workbenchData = data;
+      workbenchDraft = cloneConfig(data.saved);
+      maxConcurrentRuns = data.max_concurrent_runs || maxConcurrentRuns;
+      if (typeof data.retention_hours === "number") retentionHours = data.retention_hours;
+      applyConfigFlags({ ...data.saved, ...data });
+      configStatusMsg = "配置已保存并立即生效";
     } catch (err) {
       configErrorMsg = String(err);
     } finally {
       savingConfig = false;
-      render();
+      endConfigWrite();
     }
   });
 
@@ -1941,7 +1958,8 @@ function bindInteractions(): void {
           config_mode: workbenchDraft?.defaults.config_mode || undefined,
         },
       });
-      previewPayload = (res?.structuredContent as CommandPreviewPayload) || null;
+      const preview = res?.structuredContent as Partial<CommandPreviewPayload> | undefined;
+      previewPayload = typeof preview?.command_line === "string" ? preview as CommandPreviewPayload : null;
       render();
     } catch (err) {
       configErrorMsg = String(err);
@@ -1952,7 +1970,9 @@ function bindInteractions(): void {
   document.getElementById("add-preset-btn")?.addEventListener("click", () => {
     syncDraftFromDom();
     if (!workbenchDraft) return;
-    const baseName = `custom_${Object.keys(workbenchDraft.presets).length + 1}`;
+    let index = 1;
+    while (Object.prototype.hasOwnProperty.call(workbenchDraft.presets, `custom_${index}`)) index++;
+    const baseName = `custom_${index}`;
     workbenchDraft.presets[baseName] = {
       label: baseName,
       model: null,
@@ -2041,12 +2061,19 @@ function bindInteractions(): void {
   });
 }
 
+function activateUiResources(): void {
+  resourcesActive = true;
+  if (appConnected && !disconnectSizeObserver) disconnectSizeObserver = app.setupSizeChangedNotifications();
+}
+
 // Register handlers BEFORE connect()
 app.ontoolinput = ({ arguments: args }) => {
   const a = (args || {}) as Record<string, unknown>;
   if (typeof a.prompt === "string") {
+    activateUiResources();
     viewMode = "inline";
-    currentRun = {
+    narrowPickerOpen = false;
+    const pendingRun: RunSnapshot = {
       run_id: "pending",
       status: "running",
       cwd: String(a.cwd || "."),
@@ -2060,8 +2087,8 @@ app.ontoolinput = ({ arguments: args }) => {
       prompt_preview: a.prompt.slice(0, 180),
       elapsed_sec: 0,
     };
-    resetMonitorTimelineState();
-    updateLocalTiming(currentRun);
+    resetMonitorSelection(null, pendingRun);
+    syncPollingTimers();
     render();
   }
 };
@@ -2069,7 +2096,9 @@ app.ontoolinput = ({ arguments: args }) => {
 app.ontoolresult = (result) => {
   const sc = (result?.structuredContent || {}) as Record<string, unknown>;
   if (sc.view === "panel") {
+    activateUiResources();
     viewMode = "panel";
+    narrowPickerOpen = false;
     activeTab =
       sc.tab === "history" || sc.tab === "stats" || sc.tab === "models" || sc.tab === "subagents"
         ? sc.tab
@@ -2078,13 +2107,7 @@ app.ontoolresult = (result) => {
     activeRunsCount = Number(sc.active_runs ?? panelRuns.filter((r) => r.status === "running").length);
     closed24hCount = Number(sc.closed_24h_count ?? closed24hCount);
     maxConcurrentRuns = Number(sc.max_concurrent_runs ?? 5);
-    if (typeof sc.enabled === "boolean") codexEnabled = sc.enabled;
-    if (typeof sc.intercept_native_subagents === "boolean") {
-      interceptNativeSubagents = sc.intercept_native_subagents;
-    }
-    if (typeof sc.exclude_orchestrator_models === "boolean") {
-      excludeOrchestratorModels = sc.exclude_orchestrator_models;
-    }
+    if (!configWritePending) applyConfigFlags(sc as ConfigFlags);
     if (typeof sc.retention_hours === "number") retentionHours = sc.retention_hours;
 
     const targetId =
@@ -2092,6 +2115,7 @@ app.ontoolresult = (result) => {
         ? sc.selected_run_id
         : panelRuns[0]?.run_id || null;
 
+    resetMonitorSelection(targetId, panelRuns.find((r) => r.run_id === targetId) ?? null);
     if (activeTab === "history") {
       newArchiveBadge = false;
       syncPollingTimers();
@@ -2107,18 +2131,8 @@ app.ontoolresult = (result) => {
       void refreshWorkbenchConfig();
     } else {
       if (targetId) {
-        activeRunId = targetId;
-        currentRun = panelRuns.find((r) => r.run_id === targetId) || null;
-        if (currentRun) updateLocalTiming(currentRun);
-        render();
-        void (async () => {
-          await selectRun(targetId);
-          scheduleNextMonitorListRefresh();
-        })();
+        void selectRun(targetId);
       } else {
-        activeRunId = null;
-        currentRun = null;
-        resetMonitorTimelineState();
         syncPollingTimers();
         render();
       }
@@ -2127,17 +2141,47 @@ app.ontoolresult = (result) => {
   }
 
   if (typeof sc.run_id === "string") {
+    activateUiResources();
     viewMode = "inline";
+    narrowPickerOpen = false;
     stopPanelRefresh();
-    resetRunTimeline(sc as unknown as RunSnapshot);
+    const run = sc as unknown as RunSnapshot;
+    resetMonitorSelection(run.run_id, run);
+    resetRunTimeline(run);
     syncPollingTimers();
     render();
   }
 };
 
-app.ontoolcancelled = () => {
+function cleanupUiResources(): void {
+  resourcesActive = false;
+  selectRunSeq++;
+  historyDetailSeq++;
+  historyPendingRefresh = null;
+  statsPendingReload = false;
   stopPolling();
   stopPanelRefresh();
+  for (const timer of [historySearchTimer, toastTimer, interestOpenTimer, interestCloseTimer]) {
+    if (timer !== null) window.clearTimeout(timer);
+  }
+  historySearchTimer = toastTimer = interestOpenTimer = interestCloseTimer = null;
+  try {
+    interestPolyfillActiveTip?.hidePopover?.();
+  } catch {
+    // 提示节点可能已经被重绘移除。
+  }
+  interestPolyfillActiveTip = null;
+  disconnectSizeObserver?.();
+  disconnectSizeObserver = null;
+  document.getElementById("toast-bar")?.classList.add("is-hidden");
+  setNarrowPickerOpen(false);
+  disconnectAllTablistObservers();
+}
+
+app.ontoolcancelled = cleanupUiResources;
+app.onteardown = () => {
+  cleanupUiResources();
+  return {};
 };
 
 app.onhostcontextchanged = (ctx) => {
@@ -2146,7 +2190,7 @@ app.onhostcontextchanged = (ctx) => {
 };
 
 function handlePageWakeup(): void {
-  if (document.hidden) return;
+  if (!resourcesActive || document.hidden) return;
   const now = Date.now();
   if (now - lastWakeupMs < 250) return;
   lastWakeupMs = now;
@@ -2188,11 +2232,38 @@ window.addEventListener("focus", () => {
   }
 });
 
+document.addEventListener("pointerdown", (event) => {
+  if (narrowPickerOpen && !(event.target as Element | null)?.closest?.(".narrow-agent-switcher-bar")) {
+    setNarrowPickerOpen(false);
+  }
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && narrowPickerOpen) {
+    event.preventDefault();
+    setNarrowPickerOpen(false, true);
+  }
+});
+
 async function init(): Promise<void> {
-  await app.connect();
-  const ctx = app.getHostContext();
-  if (ctx?.theme) applyDocumentTheme(ctx.theme);
-  if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+  try {
+    await app.connect();
+    appConnected = true;
+    if (resourcesActive) activateUiResources();
+    const ctx = app.getHostContext();
+    if (ctx?.theme) applyDocumentTheme(ctx.theme);
+    if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+  } catch (err) {
+    const root = document.getElementById("root");
+    if (!root) return;
+    root.innerHTML = `<div class="load-error-card" role="alert">
+      <div>连接 Agy Codex MCP 主机失败: ${escapeHtml(err instanceof Error ? err.message : String(err))}</div>
+      <div class="load-error-actions"><button type="button" id="retry-connect-btn" class="btn btn-primary btn-sm">重试连接</button></div>
+    </div>`;
+    document.getElementById("retry-connect-btn")?.addEventListener("click", () => {
+      root.innerHTML = '<div class="empty-hint" role="status">正在重新连接 Agy Codex MCP 主机...</div>';
+      void init();
+    });
+  }
 }
 
 void init();

@@ -5,7 +5,6 @@ import {
   formatDuration,
   formatNumber,
   formatTimestamp,
-  renderCodexToggleButton,
   renderDailySvgChart,
 } from "../utils";
 
@@ -14,7 +13,7 @@ export interface StatsViewState {
   stats: StatsPayload | null;
   loading: boolean;
   loadError?: string | null;
-  enabled: boolean;
+  retentionHours: number;
 }
 
 function renderDimBreakdown(
@@ -32,12 +31,6 @@ function renderDimBreakdown(
       .slice(0, 12)
       .map((row) => {
         const pct = Math.round((row.count / denom) * 100);
-        const sRate =
-          typeof row.success_rate === "number"
-            ? `${row.success_rate}%`
-            : row.count > 0
-              ? `${Math.round(((row.count - (row.errors || 0)) / row.count) * 100)}%`
-              : "-";
         const avgDur =
           row.avg_duration_sec !== null && row.avg_duration_sec !== undefined
             ? `均 ${formatDuration(row.avg_duration_sec)}`
@@ -48,7 +41,7 @@ function renderDimBreakdown(
             : "";
         const meta = [
           `${row.count} 次`,
-          `成功 ${sRate}`,
+          typeof row.success_rate === "number" ? `成功 ${row.success_rate}%` : "",
           avgDur,
           cacheTxt,
           row.tokens > 0 ? `${formatNumber(row.tokens)} tok` : "",
@@ -80,7 +73,6 @@ export function renderStatsView(st: StatsViewState): string {
   const headerHtml = `<div class="stats-header">
     <div class="trace-muted">仅统计 Antigravity 与 Codex 联动子 Agent 数据（永久账本 stats-ledger.jsonl，不含费用估算）</div>
     <div class="stats-header-right">
-      ${renderCodexToggleButton(st.enabled, "inline")}
       <div class="seg-group" role="group" aria-label="统计周期">
         ${ranges
           .map(
@@ -117,7 +109,7 @@ export function renderStatsView(st: StatsViewState): string {
   const dispatchCount = ov.plugin_run_count ?? ov.total_items ?? 0;
   const issueCount = (ov.error_count || 0) + (ov.cancelled_count || 0);
   const sessionCount = ov.session_count ?? 0;
-  const archive24h = ov.archive_24h_count ?? 0;
+  const archiveCount = ov.archive_24h_count ?? 0;
   const archiveBytes = ov.archive_storage_bytes ?? 0;
 
   const warnHtml =
@@ -142,8 +134,8 @@ export function renderStatsView(st: StatsViewState): string {
       <div class="kpi-sub">平均缓存命中 ${ov.cache_hit_rate !== null ? `${ov.cache_hit_rate}%` : "-"}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">24h 可追溯归档</div>
-      <div class="kpi-val tabular-nums">${archive24h} 条可查</div>
+      <div class="kpi-label">${st.retentionHours}h 可追溯归档</div>
+      <div class="kpi-val tabular-nums">${archiveCount} 条可查</div>
       <div class="kpi-sub">临时日志 ${formatBytes(archiveBytes)}</div>
     </div>
   </div>`;
