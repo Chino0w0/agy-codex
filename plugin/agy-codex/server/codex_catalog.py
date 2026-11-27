@@ -10,10 +10,12 @@ import copy
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlsplit, urlunsplit
 
 try:
     import tomllib  # Python 3.11+
@@ -23,6 +25,19 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 EFFORT_RANK: list[str] = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
 EFFORT_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 EXTRA_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_CONFIG_LOCK = threading.Lock()
+_TIMEOUT_FIELDS = ("worker_timeout_sec", "idle_timeout_sec")
+_RESERVED_EXTRA_KEYS = frozenset({
+    "approval_policy", "sandbox_mode", "agents.enabled", "features.multi_agent",
+    "features.multi_agent_v2", "developer_instructions", "model", "model_provider",
+})
+
+
+def _valid_extra_key(key: str) -> bool:
+    return bool(EXTRA_KEY_RE.fullmatch(key)) and all(key.split(".")) and not any(
+        key == reserved or key.startswith(reserved + ".") or reserved.startswith(key + ".")
+        for reserved in _RESERVED_EXTRA_KEYS
+    )
 
 SUBAGENT_ROLE_PREFIX = (
     "[SUBAGENT ROLE DECLARATION / 子代理身份声明] "
@@ -166,6 +181,8 @@ DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
         "allow_nested_subagents": False,
         "max_concurrent_runs": 5,
         "retention_hours": 24,
+        "worker_timeout_sec": 0,
+        "idle_timeout_sec": 0,
     },
     "excluded_models": [],
     "custom_models": [],
@@ -273,6 +290,24 @@ def is_sensitive_key(key_path: str) -> bool:
     return False
 
 
+def redact_url(url: str | None) -> str | None:
+    """Redact credentials and sensitive query strings without changing the execution URL."""
+    if url is None:
+        return None
+    try:
+        parts = urlsplit(url)
+        query = parts.query
+        if any(
+            is_sensitive_key(key.lower())
+            or re.search(r"key|signature|(?:^|[-_])(?:sig|code|auth)(?:$|[-_])", key, re.I)
+            for key, _ in parse_qsl(query, keep_blank_values=True)
+        ):
+            query = ""
+        return urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[-1], query=query, fragment=""))
+    except ValueError:
+        return "<redacted>"
+
+
 def redact_value_for_key(key_path: str, value: Any) -> Any:
     """Redact scalar/dict values when key_path is sensitive."""
     if is_sensitive_key(key_path):
@@ -282,6 +317,8 @@ def redact_value_for_key(key_path: str, value: Any) -> Any:
             str(k): redact_value_for_key(f"{key_path}.{k}", v)
             for k, v in value.items()
         }
+    if isinstance(value, str) and key_path.rsplit(".", 1)[-1].strip('"\'') in ("base_url", "url"):
+        return redact_url(value)
     return value
 
 
@@ -358,7 +395,10 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
                 for k in raw_list:
                     if isinstance(k, str):
                         ks = k.strip()
-                        if ks and EXTRA_KEY_RE.match(ks) and ks not in cleaned_list:
+                        if (
+                            EXTRA_KEY_RE.fullmatch(ks) and ks not in cleaned_list
+                            and (field_key != "extra_whitelist_keys" or _valid_extra_key(ks))
+                        ):
                             cleaned_list.append(ks)
                 cfg["mapping"][field_key] = cleaned_list
         if "allow_nested_subagents" in raw_mapping:
@@ -377,6 +417,11 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
                     cfg["mapping"]["retention_hours"] = max(1, min(168, rh))
                 except (TypeError, ValueError):
                     pass
+
+        for key in _TIMEOUT_FIELDS:
+            val = raw_mapping.get(key)
+            if type(val) is int:
+                cfg["mapping"][key] = max(0, min(86400, val))
 
     raw_excluded = raw.get("excluded_models")
     if isinstance(raw_excluded, list):
@@ -470,8 +515,12 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
     """Validate, merge if partial, and atomically save `${PLUGIN_DATA}/workbench-config.json`."""
     if not isinstance(payload, dict):
         raise ValueError("Workbench config payload must be a JSON object.")
-    current = load_workbench_config(data_dir)
-    merged = copy.deepcopy(current)
+    with _CONFIG_LOCK:
+        return _save_workbench_config(payload, data_dir)
+
+
+def _save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None) -> dict[str, Any]:
+    merged = load_workbench_config(data_dir)
 
     for bool_key in ("enabled", "intercept_native_subagents", "exclude_orchestrator_models"):
         if bool_key in payload:
@@ -531,6 +580,12 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
         for item_k in raw_mapping.get(field_key) or []:
             if not isinstance(item_k, str) or not EXTRA_KEY_RE.match(item_k.strip()):
                 raise ValueError(f"Invalid {label}: {item_k!r}")
+
+            if field_key == "extra_whitelist_keys" and not _valid_extra_key(item_k.strip()):
+                raise ValueError(f"Reserved or invalid {label}: {item_k!r}")
+    for key in _TIMEOUT_FIELDS:
+        if type(raw_mapping[key]) is not int or not 0 <= raw_mapping[key] <= 86400:
+            raise ValueError(f"'{key}' must be an integer between 0 and 86400.")
 
     normalized = _normalize_workbench_config(merged)
     ddir = get_plugin_data_dir(data_dir)
@@ -664,7 +719,7 @@ def _collect_providers(
             {
                 "id": pid,
                 "name": _clean_optional_str(pdata.get("name")) or pid,
-                "base_url": _clean_optional_str(pdata.get("base_url")),
+                "base_url": redact_url(_clean_optional_str(pdata.get("base_url"))),
                 "wire_api": _clean_optional_str(pdata.get("wire_api")),
                 "requires_openai_auth": bool(pdata.get("requires_openai_auth", False)),
                 "env_key": _clean_optional_str(pdata.get("env_key")),
@@ -715,7 +770,7 @@ def _collect_mcp_servers(
                 "id": mid,
                 "type": _clean_optional_str(mdata.get("type")) or ("http" if url else "stdio"),
                 "command": _clean_optional_str(mdata.get("command")),
-                "url": url,
+                "url": redact_url(url),
                 "enabled": bool(mdata.get("enabled", True)),
                 "forwarded": mid in forwarded_set,
             }
@@ -932,13 +987,14 @@ def resolve_effective_run_config(
     cli_mode: str | None = None,
     cli_config_mode: str | None = None,
     enforce_orchestrator_guard: bool = True,
+    workbench_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve effective `(model, provider, effort, mode, config_mode)` across 5 precedence layers."""
     chome = get_codex_home(codex_home)
     ddir = get_plugin_data_dir(data_dir)
     base_cfg, base_err = load_toml_file(chome / "config.toml")
     worker_cfg, worker_err = load_toml_file(chome / "worker.config.toml")
-    wb_cfg = load_workbench_config(ddir)
+    wb_cfg = workbench_config if workbench_config is not None else load_workbench_config(ddir)
 
     warnings: list[str] = []
     if base_err:
@@ -974,13 +1030,21 @@ def resolve_effective_run_config(
     if req_effort and not EFFORT_RE.match(req_effort):
         raise ValueError(f"Invalid reasoning effort: {req_effort!r}")
 
-    eff_model = pick(
-        req_model,
-        preset_obj.get("model"),
-        wb_defaults.get("model"),
-        worker_cfg.get("model"),
-        base_cfg.get("model"),
-    )
+    excluded = set(wb_cfg.get("excluded_models") or [])
+    exclude_orch = bool(wb_cfg.get("exclude_orchestrator_models", True))
+    eff_model = req_model
+    if eff_model is None:
+        for value in (preset_obj.get("model"), wb_defaults.get("model"),
+                      worker_cfg.get("model"), base_cfg.get("model")):
+            candidate = _clean_optional_str(value)
+            if not candidate or candidate in excluded:
+                continue
+            if exclude_orch and is_orchestrator_model(
+                candidate, models_by_slug.get(candidate, {}).get("display_name", "")
+            ):
+                continue
+            eff_model = candidate
+            break
     explicit_provider = pick(
         req_provider,
         preset_obj.get("provider"),
@@ -1103,6 +1167,15 @@ def collect_isolated_overrides(
 
     overrides: dict[str, Any] = {}
 
+    # 先应用用户扩展白名单，禁止它改写强制策略或伪造策略键的父级。
+    for extra_key in mapping.get("extra_whitelist_keys") or []:
+        if not _valid_extra_key(extra_key):
+            continue
+        for src in (base_cfg, worker_cfg):
+            val = src.get(extra_key)
+            if isinstance(val, (str, bool, int, float)):
+                overrides[extra_key] = val
+
     if eff.get("model"):
         overrides["model"] = eff["model"]
     if eff.get("provider"):
@@ -1156,25 +1229,18 @@ def collect_isolated_overrides(
 
     # Safe non-interactive worker defaults
     overrides["approval_policy"] = "never"
+    overrides["sandbox_mode"] = "read-only" if eff["mode"] == "read-only" else "workspace-write"
     overrides["suppress_unstable_features_warning"] = True
 
     allow_nested = bool(mapping.get("allow_nested_subagents", False))
     if not allow_nested:
         overrides["agents.enabled"] = False
         overrides["features.multi_agent"] = False
+        overrides["features.multi_agent_v2"] = False
 
     overrides["developer_instructions"] = build_worker_developer_instructions(
         worker_cfg, allow_nested=allow_nested
     )
-
-    # Extra user-specified top-level scalar whitelist keys
-    for extra_key in mapping.get("extra_whitelist_keys") or []:
-        if not EXTRA_KEY_RE.match(extra_key):
-            continue
-        for src in (base_cfg, worker_cfg):
-            val = src.get(extra_key)
-            if isinstance(val, (str, bool, int, float)):
-                overrides[extra_key] = val
 
     # Active model provider table (scalars + 1-level string maps)
     active_provider = eff.get("provider")
