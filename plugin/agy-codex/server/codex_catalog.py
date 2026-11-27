@@ -10,6 +10,7 @@ import copy
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,8 @@ SUBAGENT_ROLE_PREFIX = (
     "Any global AGENTS.md, user config, or default workflow instructions telling the root agent to split work, spawn subagents "
     "(`spawn_agent`, `multi_agent`), or delegate to child agents DO NOT APPLY to you. "
     "Execute this task directly yourself with zero nested subagent spawning. "
+    "Before editing, read any specified `context_files` / reference docs and nearby existing files, strictly adhering to existing project architecture, naming conventions, and business behavior. "
+    "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`. "
     "If an optional MCP tool referenced in AGENTS.md (such as `fastctx` or `runtime_identity`) is unavailable in this session, "
     "silently use built-in tools without wasting turns searching for missing tools. "
     "On Windows inside a restricted sandbox, if Git Bash or WSL bash.exe fails with signal-pipe or access errors, "
@@ -39,7 +42,9 @@ SUBAGENT_ROLE_PREFIX = (
 NESTED_SUBAGENT_PREFIX = (
     "[SUBAGENT ROLE DECLARATION / 子代理身份声明] "
     "You are running as a non-interactive delegated subagent (子代理/Worker) invoked by an external parent orchestrator (Antigravity), "
-    "NOT the root/main agent (根主代理). Nested subagents are explicitly enabled for this run, but only use them when genuinely necessary."
+    "NOT the root/main agent (根主代理). Nested subagents are explicitly enabled for this run, but only use them when genuinely necessary. "
+    "Before editing, read any specified `context_files` / reference docs and nearby existing files, strictly adhering to existing project architecture, naming conventions, and business behavior. "
+    "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`."
 )
 
 DEFAULT_DEVELOPER_INSTRUCTIONS = (
@@ -136,6 +141,8 @@ DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
+    "enabled": True,
+    "exclude_orchestrator_models": True,
     "defaults": {
         "model": None,
         "provider": None,
@@ -152,11 +159,20 @@ DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
         "forwarded_mcp_servers": [],
         "allow_nested_subagents": False,
         "max_concurrent_runs": 5,
+        "retention_hours": 24,
     },
     "excluded_models": [],
     "custom_models": [],
     "presets": copy.deepcopy(DEFAULT_PRESETS),
 }
+
+
+def is_orchestrator_model(slug: str | None, display_name: str | None = "") -> bool:
+    """Return True if 'orchestrator' appears case-insensitively in slug or display_name."""
+    return (
+        "orchestrator" in (slug or "").lower()
+        or "orchestrator" in (display_name or "").lower()
+    )
 
 
 def get_codex_home(explicit: Path | str | None = None) -> Path:
@@ -177,12 +193,23 @@ def get_plugin_data_dir(explicit: Path | str | None = None) -> Path:
 
 
 def atomic_write_text(path: Path, text: str) -> None:
-    """Atomically write UTF-8 LF text file."""
+    """Atomically write UTF-8 LF text file with Windows transient-lock retries."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
     try:
         tmp.write_text(text, encoding="utf-8", newline="\n")
-        os.replace(tmp, path)
+        last_exc: OSError | None = None
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                last_exc = None
+                break
+            except (PermissionError, OSError) as exc:
+                last_exc = exc
+                if attempt < 4:
+                    time.sleep(0.015 * (2 ** attempt))
+        if last_exc is not None:
+            raise last_exc
     finally:
         if tmp.exists():
             try:
@@ -281,6 +308,11 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return cfg
 
+    if "enabled" in raw and raw.get("enabled") is not None:
+        cfg["enabled"] = bool(raw.get("enabled"))
+    if "exclude_orchestrator_models" in raw and raw.get("exclude_orchestrator_models") is not None:
+        cfg["exclude_orchestrator_models"] = bool(raw.get("exclude_orchestrator_models"))
+
     raw_defaults = raw.get("defaults")
     if isinstance(raw_defaults, dict):
         cfg["defaults"]["model"] = _clean_optional_str(raw_defaults.get("model"))
@@ -327,6 +359,14 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
                 cfg["mapping"]["max_concurrent_runs"] = max(1, min(20, mcr))
             except (TypeError, ValueError):
                 pass
+        if "retention_hours" in raw_mapping:
+            raw_rh = raw_mapping.get("retention_hours")
+            if not isinstance(raw_rh, bool):
+                try:
+                    rh = int(raw_rh)
+                    cfg["mapping"]["retention_hours"] = max(1, min(168, rh))
+                except (TypeError, ValueError):
+                    pass
 
     raw_excluded = raw.get("excluded_models")
     if isinstance(raw_excluded, list):
@@ -422,6 +462,12 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
         raise ValueError("Workbench config payload must be a JSON object.")
     current = load_workbench_config(data_dir)
     merged = copy.deepcopy(current)
+
+    for bool_key in ("enabled", "exclude_orchestrator_models"):
+        if bool_key in payload:
+            if not isinstance(payload[bool_key], bool):
+                raise ValueError(f"'{bool_key}' must be a boolean.")
+            merged[bool_key] = payload[bool_key]
 
     for key in ("defaults", "mapping"):
         if key in payload:
@@ -530,6 +576,10 @@ def parse_catalog_file(path: Path, source_label: str) -> tuple[list[dict[str, An
                     item.get("supported_reasoning_levels")
                 ),
                 "context_window": cw_int,
+                "tool_mode": _clean_optional_str(item.get("tool_mode")),
+                "supports_search_tool": item.get("supports_search_tool")
+                if isinstance(item.get("supports_search_tool"), bool)
+                else None,
                 "source": source_label,
             }
         )
@@ -723,10 +773,20 @@ def _collect_all_models(
             }
 
     excluded_set = set(wb_cfg.get("excluded_models") or [])
+    excl_orch = bool(wb_cfg.get("exclude_orchestrator_models", True))
     all_models: list[dict[str, Any]] = []
     for entry in by_slug.values():
         enriched = dict(entry)
-        enriched["excluded"] = entry["slug"] in excluded_set
+        if "tool_mode" in entry:
+            enriched["tool_mode"] = _clean_optional_str(entry.get("tool_mode"))
+        if "supports_search_tool" in entry:
+            ss = entry.get("supports_search_tool")
+            enriched["supports_search_tool"] = ss if isinstance(ss, bool) else None
+        orch_blocked = excl_orch and is_orchestrator_model(
+            entry.get("slug"), entry.get("display_name")
+        )
+        enriched["orchestrator_excluded"] = orch_blocked
+        enriched["excluded"] = (entry["slug"] in excluded_set) or orch_blocked
         all_models.append(enriched)
 
     meta = {
@@ -764,7 +824,12 @@ def discover_models_and_config(
     all_models, src_meta = _collect_all_models(chome, base_cfg, worker_cfg, wb_cfg)
     warnings.extend(src_meta["warnings"])
 
-    resolved = resolve_effective_run_config(chome, ddir)
+    resolved = resolve_effective_run_config(
+        chome, ddir, enforce_orchestrator_guard=False
+    )
+    warnings.extend(
+        w for w in resolved.get("warnings") or [] if w not in warnings
+    )
     effective_defaults = resolved["effective"]
     providers = _collect_providers(base_cfg, worker_cfg, effective_defaults.get("provider"))
     mcp_servers = _collect_mcp_servers(
@@ -790,6 +855,9 @@ def discover_models_and_config(
         filtered.append(m)
 
     return {
+        "enabled": bool(wb_cfg.get("enabled", True)),
+        "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
+        "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
         "models": filtered,
         "all_models_count": len(all_models),
         "visible_models_count": visible_count,
@@ -848,6 +916,7 @@ def resolve_effective_run_config(
     preset: str | None = None,
     cli_mode: str | None = None,
     cli_config_mode: str | None = None,
+    enforce_orchestrator_guard: bool = True,
 ) -> dict[str, Any]:
     """Resolve effective `(model, provider, effort, mode, config_mode)` across 5 precedence layers."""
     chome = get_codex_home(codex_home)
@@ -923,6 +992,17 @@ def resolve_effective_run_config(
     )
 
     matched_model = models_by_slug.get(eff_model) if eff_model else None
+    if bool(wb_cfg.get("exclude_orchestrator_models", True)) and eff_model and is_orchestrator_model(
+        eff_model, (matched_model or {}).get("display_name", "")
+    ):
+        if enforce_orchestrator_guard:
+            raise ValueError(
+                f"Model {eff_model!r} is excluded by exclude_orchestrator_models guard. "
+                "Choose a non-orchestrator Codex model or disable exclude_orchestrator_models."
+            )
+        warnings.append(
+            f"Model {eff_model!r} is excluded by exclude_orchestrator_models guard."
+        )
     if matched_model:
         # Auto-select model's declared provider when neither caller nor preset/workbench pinned one
         if matched_model.get("provider") and not explicit_provider:

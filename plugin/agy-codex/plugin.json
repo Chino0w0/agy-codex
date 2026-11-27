@@ -1,8 +1,8 @@
 {
   "name": "agy-codex",
   "displayName": "Agy Codex",
-  "version": "1.0.0",
-  "description": "Native Antigravity 2.0 <-> Codex CLI multi-model subagent workbench: flexible model catalog & cache discovery, extended reasoning efforts, live subagent monitor, and unified local telemetry.",
+  "version": "1.1.2",
+  "description": "Antigravity <-> Codex ephemeral subagent orchestration with instant enable/disable toggle, Orchestrator guard, 24h traceable history, live subagent monitor, and clean workbench UI.",
   "logo": "assets/logo.svg",
   "author": {
     "name": "Chino0w0",

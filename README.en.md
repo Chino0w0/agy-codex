@@ -4,7 +4,7 @@
 
 **A native Antigravity 2.0 ↔ OpenAI Codex CLI multi-model subagent workbench plugin.**
 
-> Forked from [Silhouette-my/codex-in-anti](https://github.com/Silhouette-my/codex-in-anti) under the MIT License. **Agy Codex** upgrades the whitelist-isolated MCP App architecture into an out-of-the-box Antigravity plugin with 4-source flexible model discovery, configurable mapping policies, extended reasoning efforts, rolling parallel worktree orchestration, and a Powertools-inspired 3-tab native workbench.
+> Forked from [Silhouette-my/codex-in-anti](https://github.com/Silhouette-my/codex-in-anti) under the MIT License. **Agy Codex** upgrades the whitelist-isolated MCP App architecture into an out-of-the-box Antigravity plugin with 4-source model discovery, Orchestrator anti-nesting protection, 6-part self-contained dispatch contracts, and a 4-tab Antigravity-linked workbench.
 
 ---
 
@@ -12,20 +12,20 @@
 
 Let **Antigravity** act as orchestrator, code reviewer, and final verifier while delegating bounded tasks to any specified model in your local **Codex CLI**:
 
-- **4-Source Flexible Model & Provider Mapping (Works With or Without `model_catalog_json`)**:
+- **4-Source Flexible Model Mapping & Orchestrator Guard**:
   - Merges models from `custom_models` (UI-editable) > `model_catalog_json` (`auto`/`custom`/`off`) > `~/.codex/models_cache.json` > `config.toml`, plus freeform model strings anywhere;
-  - Whitelist-isolated (`--ignore-user-config`) execution skips desktop plugins, MCP servers, hooks, and memories while forwarding model, provider, proxy, Windows sandbox settings (`[windows]`, `[sandbox_workspace_write]`, `allow_login_shell`), and user-specified `extra_whitelist_keys`;
-  - Configurable **`catalog_mode`**, **`effort_policy`** (`clamp_with_warning` | `passthrough`), **`context_window_policy`** (`same_model_only` | `always_forward` | `never_forward`), and **`excluded_models`**;
-  - Supports extended reasoning efforts (`none / minimal / low / medium / high / xhigh / max / ultra` and custom catalog levels) plus per-task `model`, `provider`, and role `preset` overrides.
-- **Parallel Subagent Orchestration & Cross-Model Collaboration**:
-  - Model-visible MCP tools: `list_codex_models`, `start_codex_task`, `get_codex_task_status`, `wait_codex_task` (supports `run_ids` + `wait_mode="any"|"all"` for rolling verification; wait timeout is never misreported as task failure), `stop_codex_task` (full process-tree termination), and `open_codex_panel`;
-  - Strict 3-tier identity traceability (`requested` vs `effective` vs `observed`);
-  - Ships a concise always-on `rules/AGENTS.md`, three progressive-disclosure skills (`codex-dispatch`, `codex-parallel-worktree`, `codex-second-opinion`), and 6 customizable role presets (`explore`, `coding`, `frontend`, `review`, `debug`, `fast`).
-- **Native 3-Tab MCP App Workbench (Zero Client Injection, Update-Safe)**:
-  - Uses Antigravity's official **MCP App** surfaces (sidebar full-page, right side pane, and inline chat card) with zero Electron CDP injection—completely conflict-free with `agy-powertools`;
-  - **Subagents Monitor**: Active slot tracking (`max_concurrent_runs`), live collapsible process timeline, worktree cleanup helpers, click-to-open changed files, host review/context actions, and local Codex session context occupancy bars + spawn trees;
-  - **Usage Analytics**: Merges Antigravity runs with read-only local `~/.codex` sessions (`state_*.sqlite` + cached rollout JSONL tails) for tokens, cache hit rate, duration, success rate, daily trends, and model/provider/effort breakdowns (no price/cost estimation);
-  - **Models & Config Center**: Searchable directory, live mapping policy editor, preset & custom-model editors, **Dry-Run Redacted Command Preview**, and `doctor` diagnostics.
+  - Whitelist-isolated (`--ignore-user-config`) execution skips heavy desktop plugins, MCP servers, hooks, and memories while forwarding model, provider, proxy, Windows sandbox settings, subprocess-scoped `safe.directory=*`, and opted-in MCP namespaces;
+  - Dual Orchestrator protection (`exclude_orchestrator_models`), extended reasoning efforts (`none / minimal / low / medium / high / xhigh / max / ultra` and custom catalog levels), and configurable **`catalog_mode`**, **`effort_policy`**, **`context_window_policy`**, and **`excluded_models`**.
+- **Concurrent Subagent Orchestration & Contracted Dispatch (`v1.1.2`)**:
+  - Model-visible MCP tools: `list_codex_models`, `start_codex_task` (with `context_files`, `acceptance_criteria`, `non_goals`), `get_codex_task_status`, `wait_codex_task` (`run_ids` + `wait_mode="any"|"all"`), `stop_codex_task`, `close_codex_task`, and `open_codex_panel`;
+  - Concurrent non-blocking `serve_stdio` JSON-RPC server, cross-process `pid` liveness checks, ephemeral `--ephemeral --thread-source subagent` execution, Windows stdio pipe deadlock fixes, and accurate `partial` handoff detection;
+  - Ships a concise always-on `rules/AGENTS.md`, three progressive-disclosure skills (`codex-dispatch`, `codex-parallel-worktree`, `codex-second-opinion`), and 6 customizable role presets.
+- **Native 4-Tab MCP App Workbench (Zero Client Injection, Instant Toggle Everywhere)**:
+  - Uses Antigravity's official **MCP App** surfaces (sidebar `plugins` entry, right `aux_pane`, and inline chat card) with zero Electron CDP injection, featuring a high-contrast **Codex linkage switch** in both the topbar and every view so users can switch between Codex and native Antigravity subagents anytime;
+  - **Active Monitor**: Running-first tab ordering, live incremental event sync, timeout countdown, expandable full dispatch prompt, click-to-open files, and one-click archive/clear controls;
+  - **History**: Grouped strictly by Antigravity parent session in clean 4-row cards (status + title, role/archive badges, 2-line digest, compact telemetry line) with configurable 1 to 168h retention (24h default) and reopen support;
+  - **Usage Stats**: Tracks Antigravity-dispatched runs via permanent compact `stats-ledger.jsonl` (tokens, cache hit rate, daily trend, model/role/provider/effort breakdowns, copyable error snippets, no cost estimation);
+  - **Models & Config Center**: Selective `?` help tooltips, instant Codex linkage & Orchestrator switches, forwarded MCP checkboxes, presets editor, **Dry-Run Redacted Command Preview**, and `doctor` diagnostics.
 - **Zero-Bloat Packaging**: 100% Python stdlib backend + pre-bundled single-file `assets/app.html` (no Node.js required for end users).
 
 ---
