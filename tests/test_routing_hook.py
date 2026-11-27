@@ -93,7 +93,7 @@ class TestRoutingHook(unittest.TestCase):
         msg = ss["injectSteps"][0]["systemMessage"]["systemMessage"]
         self.assertIn("默认路由已激活", msg)
         self.assertIn("gpt-5.4", msg)
-        self.assertIn("timeout=600", msg)
+        self.assertIn("未配置时不限总时长", msg)
         self.assertIn("timeout=120", msg)
 
     def test_2_switch_off_allows_native_subagent_immediately(self) -> None:

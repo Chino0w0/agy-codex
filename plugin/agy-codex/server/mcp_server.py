@@ -18,13 +18,17 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import copy
+import hashlib
 import json
 import os
+import queue
+import re
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,28 @@ import codex_run  # noqa: E402
 import codex_telemetry  # noqa: E402
 
 APP_URI = "ui://agy-codex/app.html"
+
+
+_RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+_ERROR_LINE_RE = re.compile(
+    r"\b(?:401|403|429)\b|unauthorized|rate limit|connection refused|timed out|"
+    r"error:|fatal:|invalid|denied|not found|traceback", re.IGNORECASE,
+)
+_ISSUE_STATUSES = frozenset({"error", "blocked", "partial", "cancelled"})
+_ERROR_STATUSES = _ISSUE_STATUSES - {"cancelled"}
+
+
+def _run_health(status: str, last_activity_at: float, loop_reason: str | None,
+                now: float) -> tuple[str, str | None, float | None]:
+    if status != "running":
+        return ("error" if status in _ERROR_STATUSES else "healthy", None, None)
+    idle = max(0.0, now - last_activity_at)
+    if idle >= 180:
+        minutes, seconds = divmod(int(idle), 60)
+        return "stalled", f"已静默 {minutes}m {seconds}s 无新输出", round(idle, 1)
+    if loop_reason:
+        return "loop_warning", loop_reason, round(idle, 1)
+    return "healthy", None, round(idle, 1)
 
 
 def _is_pid_alive(pid: int | None) -> bool:
@@ -127,7 +153,7 @@ def format_models_brief(payload: dict[str, Any], *, active_runs: int = 0) -> str
         "# Agy Codex Dispatch Brief",
         (
             f"Status: enabled={str(enabled).lower()} | intercept_native={str(intercept).lower()} "
-            f"| slots={active_runs}/{max_conc} | worker_timeout=600s | wait_timeout<=120s"
+            f"| slots={active_runs}/{max_conc} | worker_timeout=workbench (0=unlimited) | wait_timeout<=120s"
         ),
         (
             f"Default: {compliant_default or '(none - ask user to pick from Available Models below)'} "
@@ -207,6 +233,7 @@ def format_start_brief(summary: dict[str, Any]) -> str:
     eff_effort = eff.get("effort") or summary.get("effort") or "default"
     mode = summary.get("mode") or "write"
     timeout_sec = summary.get("timeout_sec")
+    timeout_label = f"{timeout_sec}s" if timeout_sec else "unlimited"
     active = summary.get("active_runs", 1)
     max_conc = summary.get("max_concurrent_runs", 5)
 
@@ -214,7 +241,7 @@ def format_start_brief(summary: dict[str, Any]) -> str:
         f"Started Codex task: {run_id} ({title})",
         (
             f"Config: model={eff_model} | provider={eff_prov} | effort={eff_effort} "
-            f"| mode={mode} | timeout={timeout_sec}s | slots={active}/{max_conc}"
+            f"| mode={mode} | timeout={timeout_label} | slots={active}/{max_conc}"
         ),
     ]
     wt = summary.get("worktree")
@@ -246,6 +273,14 @@ def _format_single_run_digest(r: dict[str, Any]) -> list[str]:
     tok_str = str(tok) if tok is not None else "n/a"
 
     out = [f"- {rid} [{status}] {title} | model={model} ({effort}) | {elapsed_str}{cmd_part} | tokens={tok_str}"]
+
+    health = r.get("health") or "healthy"
+    if health != "healthy":
+        reason = r.get("health_reason")
+        out.append(f"  health: {health}" + (f" ({reason})" if reason else ""))
+    if status == "running":
+        for recent in (r.get("recent_errors") or [])[-2:]:
+            out.append(f"  recent_error: {recent}")
 
     res = r.get("result")
     if isinstance(res, dict):
@@ -375,7 +410,22 @@ class RunState:
     updated_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     duration_sec: float | None = None
-    timeout_sec: int = 600
+    timeout_sec: int = 0
+    idle_timeout_sec: int = 0
+    last_activity_at: float = field(init=False)
+    in_flight_command: str | None = None
+    recent_errors: list[str] = field(default_factory=list)
+    _loop_reason: str | None = field(default=None, repr=False)
+    _completed_ids: set[str] = field(default_factory=set, repr=False)
+    _anonymous_commands: int = field(default=0, repr=False)
+    _tool_ids: set[str] = field(default_factory=set, repr=False)
+    _failure_command: str = field(default="", repr=False)
+    _failure_fingerprint: str = field(default="", repr=False)
+    _failure_count: int = field(default=0, repr=False)
+    _fingerprint_count: int = field(default=0, repr=False)
+    _tool_key: str = field(default="", repr=False)
+    _tool_count: int = field(default=0, repr=False)
+    worker: threading.Thread | None = field(default=None, repr=False)
     exit_code: int | None = None
     session_id: str | None = None
     tokens_used: int | None = None
@@ -399,13 +449,88 @@ class RunState:
     _last_state_write: float = field(default=0.0, repr=False)
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    def __post_init__(self) -> None:
+        self.last_activity_at = self.started_at
+
+    @property
+    def completed_commands(self) -> int:
+        return len(self._completed_ids) + self._anonymous_commands
+
+    def record_command_completion(self, item_id: str) -> bool:
+        if not item_id:
+            self._anonymous_commands += 1
+        elif item_id in self._completed_ids:
+            return False
+        else:
+            self._completed_ids.add(item_id)
+        return True
+
+    def record_error(self, message: str) -> None:
+        compact = codex_run.truncate_text(message, 300)
+        if compact:
+            if compact in self.recent_errors:
+                self.recent_errors.remove(compact)
+            self.recent_errors.append(compact)
+            del self.recent_errors[:-5]
+
+    def record_command_outcome(self, command: str, exit_code: Any, output: str) -> None:
+        self._tool_key, self._tool_count = "", 0
+        self._loop_reason = None
+        normalized = " ".join(command.split())
+        if exit_code in (0, None) or not normalized:
+            self._failure_command, self._failure_fingerprint = "", ""
+            self._failure_count = self._fingerprint_count = 0
+            return
+        fingerprint = hashlib.sha256(" ".join(output.split()).encode("utf-8")).hexdigest()
+        same_command = normalized == self._failure_command
+        self._failure_count = self._failure_count + 1 if same_command else 1
+        self._fingerprint_count = (
+            self._fingerprint_count + 1 if same_command and fingerprint == self._failure_fingerprint else 1
+        )
+        self._failure_command, self._failure_fingerprint = normalized, fingerprint
+        label = codex_run.truncate_text(normalized, 80)
+        excerpt = codex_run.truncate_text(output, 180)
+        self.record_error(f"命令 {label!r} 退出码 {exit_code}" + (f": {excerpt}" if excerpt else ""))
+        if self._fingerprint_count >= 4:
+            self._loop_reason = f"检测到命令 {label!r} 连续 {self._fingerprint_count} 次相同报错循环"
+        elif self._failure_count >= 4:
+            self._loop_reason = f"检测到命令 {label!r} 连续 {self._failure_count} 次失败"
+
+    def record_tool_call(self, item: dict[str, Any], label: str) -> None:
+        item_id = str(item.get("id") or "")
+        if item_id in self._tool_ids:
+            return
+        if item_id:
+            self._tool_ids.add(item_id)
+        args = item.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                pass
+        key = json.dumps([label, args], sort_keys=True, ensure_ascii=False)
+        self._tool_count = self._tool_count + 1 if key == self._tool_key else 1
+        self._tool_key = key
+        self._failure_command, self._failure_fingerprint = "", ""
+        self._failure_count = self._fingerprint_count = 0
+        self._loop_reason = (
+            f"检测到工具 {label!r} 连续 {self._tool_count} 次使用相同参数调用"
+            if self._tool_count >= 6 else None
+        )
 
     def to_summary_dict(self) -> dict[str, Any]:
+        with self.lock:
+            return self._summary_locked()
+
+    def _summary_locked(self) -> dict[str, Any]:
+        now = time.time()
+        health, health_reason, idle_sec = _run_health(self.status, self.last_activity_at, self._loop_reason, now)
         elapsed = (
             self.duration_sec
             if self.duration_sec is not None
-            else round(max(0.0, time.time() - self.started_at), 2)
+            else round(max(0.0, now - self.started_at), 2)
         )
         remaining_timeout = (
             max(0, int(round(self.timeout_sec - elapsed)))
@@ -421,11 +546,7 @@ class RunState:
         if not digest_src:
             digest_src = preview or self.prompt
         work_digest = codex_run.truncate_text(digest_src, 120)
-        completed_cmds = sum(
-            1
-            for ev in self.events
-            if ev.get("kind") == "command" and ev.get("status") == "completed"
-        )
+        usage = self.usage if self.saw_usage else self._snapshot_usage
 
         return {
             "run_id": self.run_id,
@@ -436,7 +557,7 @@ class RunState:
             "title": self.title or codex_run.derive_short_title(preview or self.prompt, 16),
             "role": self.role or ("只读探索" if self.mode == "read-only" else "代码实现"),
             "work_digest": work_digest,
-            "completed_commands": completed_cmds,
+            "completed_commands": self.completed_commands,
             "parent_session_id": self.parent_session_id or "default",
             "parent_session_title": self.parent_session_title or Path(self.cwd).name,
             "closed": self.closed,
@@ -451,13 +572,19 @@ class RunState:
             "effort": self.effort,
             "preset": self.preset,
             "persist": self.persist,
-            "requested": self.requested,
-            "effective": self.effective,
-            "observed": self.observed,
-            "warnings": self.warnings,
+            "requested": copy.deepcopy(self.requested),
+            "effective": copy.deepcopy(self.effective),
+            "observed": copy.deepcopy(self.observed),
+            "warnings": copy.deepcopy(self.warnings),
             "prompt_preview": preview,
             "started_at": self.started_at,
             "updated_at": self.updated_at,
+            "last_activity_at": self.last_activity_at,
+            "in_flight_command": self.in_flight_command,
+            "recent_errors": list(self.recent_errors),
+            "health": health,
+            "health_reason": health_reason,
+            "idle_sec": idle_sec,
             "finished_at": self.finished_at,
             "elapsed_sec": elapsed,
             "duration_sec": self.duration_sec,
@@ -466,9 +593,9 @@ class RunState:
             "exit_code": self.exit_code,
             "session_id": self.session_id,
             "tokens_used": self.tokens_used,
-            "usage": self.usage if self.saw_usage else self._snapshot_usage,
-            "worktree": self.worktree,
-            "result": self.result,
+            "usage": dict(usage) if usage is not None else None,
+            "worktree": copy.deepcopy(self.worktree),
+            "result": copy.deepcopy(self.result),
             "error": self.error,
             "log_file": self.log_file,
             "output_file": self.output_file,
@@ -490,15 +617,38 @@ class RunManager:
         self._cache_lock = threading.Lock()
         self._prune_lock = threading.Lock()
         self._any_done_cond = threading.Condition(self._lock)
+        self._shutting_down = False
+
+    def _validate_run_id(self, run_id: str) -> str:
+        if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id) or ".." in run_id:
+            raise ValueError(f"Invalid run_id: {run_id!r}")
+        try:
+            root = self.runs_dir.resolve()
+            candidate = (self.runs_dir / run_id).resolve()
+            if candidate != root and candidate.is_relative_to(root):
+                return run_id
+        except (OSError, RuntimeError, ValueError):
+            pass
+        raise ValueError(f"Invalid run_id outside the runs directory: {run_id!r}")
+
+    def _run_file(self, run_id: str, name: str) -> Path:
+        directory = self.runs_dir / self._validate_run_id(run_id)
+        target = directory / name
+        try:
+            if not target.is_symlink() and target.resolve().parent == directory.resolve():
+                return target
+        except (OSError, RuntimeError, ValueError):
+            pass
+        raise ValueError(f"Invalid run file for run_id: {run_id!r}")
 
     def _state_path(self, run_id: str) -> Path:
-        return self.runs_dir / run_id / "state.json"
+        return self._run_file(run_id, "state.json")
 
     def _events_path(self, run_id: str) -> Path:
-        return self.runs_dir / run_id / "events.jsonl"
+        return self._run_file(run_id, "events.jsonl")
 
     def _prompt_path(self, run_id: str) -> Path:
-        return self.runs_dir / run_id / "prompt.txt"
+        return self._run_file(run_id, "prompt.txt")
 
     def _persist_state(self, state: RunState, *, force: bool = False) -> None:
         now_mono = time.monotonic()
@@ -535,6 +685,7 @@ class RunManager:
         if not isinstance(data, dict):
             return None
         summary = dict(data)
+        summary["run_id"] = run_id
         summary.pop("events", None)
         summary.setdefault("expired", False)
         summary.setdefault("closed", False)
@@ -585,6 +736,9 @@ class RunManager:
             return sum(1 for s in self._runs.values() if s.status == "running")
 
     def start_run(self, params: dict[str, Any]) -> RunState:
+        with self._lock:
+            if self._shutting_down:
+                raise ValueError("The run manager is shutting down.")
         self._maybe_prune_expired()
         wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
         if not wb_cfg.get("enabled", True):
@@ -634,7 +788,11 @@ class RunManager:
         raw = bool(params.get("raw", False))
         raw_add_dir = params.get("add_dir") or []
         add_dir = [str(d) for d in raw_add_dir if isinstance(d, str) and d.strip()]
-        timeout = int(params.get("timeout") or 600)
+        mapping = wb_cfg.get("mapping") or {}
+        timeout = params.get("timeout", mapping.get("worker_timeout_sec", 0))
+        if type(timeout) is not int or timeout < 0:
+            raise ValueError("'timeout' must be a non-negative integer.")
+        idle_timeout = mapping.get("idle_timeout_sec", 0)
 
         def _clean_str_list(raw_val: Any) -> list[str]:
             if not isinstance(raw_val, list):
@@ -665,10 +823,10 @@ class RunManager:
             effective_prompt = prompt
 
         run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        run_dir = self.runs_dir / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        log_file = run_dir / "codex.log"
-        output_file = run_dir / ("output.txt" if raw else "output.json")
+        run_dir = self.runs_dir / self._validate_run_id(run_id)
+        run_dir.mkdir(parents=True, exist_ok=False)
+        log_file = self._run_file(run_id, "codex.log")
+        output_file = self._run_file(run_id, "output.txt" if raw else "output.json")
         codex_catalog.atomic_write_text(self._prompt_path(run_id), effective_prompt)
 
         codex_bin = codex_run.find_codex_bin()
@@ -775,20 +933,21 @@ class RunManager:
             effective=eff,
             warnings=warnings,
             timeout_sec=timeout,
+            idle_timeout_sec=idle_timeout,
             log_file=str(log_file),
             output_file=str(output_file),
         )
-        with self._lock:
-            self._runs[run_id] = state
-        with state.lock:
-            self._persist_state(state, force=True)
-
-        thread = threading.Thread(
+        state.worker = threading.Thread(
             target=self._execute_worker,
             args=(state, cmd, log_file, output_file, timeout, effective_prompt),
             daemon=True,
         )
-        thread.start()
+        with self._lock:
+            if self._shutting_down:
+                raise ValueError("The run manager is shutting down.")
+            self._persist_state(state, force=True)
+            self._runs[run_id] = state
+            state.worker.start()
         return state
 
     def _append_event(self, state: RunState, event_payload: dict[str, Any]) -> None:
@@ -819,209 +978,271 @@ class RunManager:
         timeout: int,
         stdin_prompt: str | None = None,
     ) -> None:
-        env = codex_run.build_exec_env()
-        timed_out = False
-        log_lines: list[str] = []
-
-        popen_kwargs: dict[str, Any] = {
-            "stdin": subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.STDOUT,
-            "text": True,
-            "encoding": "utf-8",
-            "errors": "replace",
-            "bufsize": 1,
-            "env": env,
-        }
-        if os.name != "nt":
-            popen_kwargs["start_new_session"] = True
-        else:
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
-        try:
-            proc = subprocess.Popen(cmd, **popen_kwargs)
-            codex_run.write_prompt_to_stdin(proc, stdin_prompt)
-        except Exception as exc:
-            with state.lock:
-                state.status = "error"
-                state.error = f"Failed to launch codex CLI: {exc}"
-                state.finished_at = time.time()
-                state.duration_sec = round(state.finished_at - state.started_at, 2)
-                state.exit_code = 1
-                self._append_event(state, {"kind": "error", "message": state.error})
-                self._persist_state(state, force=True)
-                summary = state.to_summary_dict()
-            codex_telemetry.append_ledger_record(self.data_dir, summary)
-            self._notify_done(state)
-            return
-
-        with state.lock:
-            state.process = proc
-            state.pid = proc.pid
-            state.updated_at = time.time()
-            self._persist_state(state, force=True)
-
-        def on_timeout() -> None:
-            nonlocal timed_out
-            timed_out = True
-            codex_run.terminate_process_tree(proc)
-
+        proc: subprocess.Popen[str] | None = None
         timer: threading.Timer | None = None
-        if timeout > 0:
-            timer = threading.Timer(timeout, on_timeout)
-            timer.daemon = True
-            timer.start()
+        finishing = timed_out = False
+        idle_timeout_error: str | None = None
+        idle_timeout = state.idle_timeout_sec
+        stop_readers = threading.Event()
+        active_pipes = set()
+        lines: queue.Queue[tuple[bool, str | None]] = queue.Queue(maxsize=256)
+        stderr_tail: deque[str] = deque(maxlen=12)
+        log_head: list[str] = []
+        log_tail: deque[str] = deque(maxlen=128)
+        parsed_result = None
+        fallback: dict[str, Any] = {}
 
-        try:
-            assert proc.stdout is not None
-            for raw_line in proc.stdout:
-                log_lines.append(raw_line)
-                stripped = raw_line.strip()
-                if not stripped:
+        def enqueue(stderr: bool, line: str | None) -> None:
+            while not stop_readers.is_set():
+                try:
+                    lines.put((stderr, line), timeout=0.1)
+                    return
+                except queue.Full:
                     continue
 
-                if stripped.startswith("{"):
-                    try:
-                        evt = json.loads(stripped)
-                    except json.JSONDecodeError:
-                        evt = None
-                    if isinstance(evt, dict):
-                        self._handle_json_event(state, evt)
-                        continue
+        def drain(pipe: Any, stderr: bool) -> None:
+            try:
+                with pipe:
+                    for raw_line in pipe:
+                        if stop_readers.is_set():
+                            break
+                        with state.lock:
+                            state.last_activity_at = time.time()
+                        enqueue(stderr, raw_line)
+            except (OSError, ValueError):
+                pass
+            finally:
+                enqueue(stderr, None)
 
-                if "ERROR" in stripped or "fatal" in stripped.lower() or "warning:" in stripped.lower():
-                    with state.lock:
-                        self._append_event(state, {"kind": "log", "text": stripped})
-                        self._persist_state(state)
+        def on_timeout(*, idle: bool = False) -> None:
+            nonlocal timed_out, idle_timeout_error
+            with state.lock:
+                if (proc is None or finishing or timed_out or state.status != "running"
+                        or proc.poll() is not None):
+                    return
+                if idle and time.time() - state.last_activity_at < idle_timeout:
+                    return
+                timed_out = True
+                if idle:
+                    idle_timeout_error = f"连续无输出卡死超时 ({idle_timeout}s)"
+                    state.error = idle_timeout_error
+            codex_run.terminate_process_tree(proc)
 
-            if timed_out and proc.poll() is None:
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    codex_run.terminate_process_tree(proc)
-                    proc.wait(timeout=5)
+        try:
+            with state.lock:
+                if state.status == "cancelled":
+                    return
+            popen_kwargs: dict[str, Any] = {
+                "stdin": subprocess.PIPE if stdin_prompt is not None else subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "encoding": "utf-8",
+                "errors": "replace",
+                "bufsize": 1,
+                "env": codex_run.build_exec_env(),
+            }
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             else:
-                proc.wait()
+                popen_kwargs["start_new_session"] = True
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+            with state.lock:
+                if state.status == "cancelled":
+                    return  # finally 负责回收 Popen 交接期间被取消的进程。
+                state.process = proc
+                state.pid = proc.pid
+                state.updated_at = time.time()
+                self._persist_state(state, force=True)
+
+            if timeout > 0:
+                timer = threading.Timer(timeout, on_timeout)
+                timer.daemon = True
+                timer.start()
+            for stderr, pipe in ((False, proc.stdout), (True, proc.stderr)):
+                threading.Thread(target=drain, args=(pipe, stderr), daemon=True).start()
+                active_pipes.add(pipe)
+            if stdin_prompt is not None:
+                threading.Thread(target=codex_run.write_prompt_to_stdin,
+                                 args=(proc, stdin_prompt), daemon=True).start()
+                active_pipes.add(proc.stdin)
+
+            open_pipes = 2
+            abort_at: float | None = None
+            piped_exit_at: float | None = None
+            log_file = self._run_file(state.run_id, log_file.name)
+            with log_file.open("w", encoding="utf-8", newline='\n', buffering=1) as log:
+                while open_pipes or proc.poll() is None:
+                    now = time.monotonic()
+                    with state.lock:
+                        aborting = timed_out or state.status == "cancelled"
+                    if aborting:
+                        abort_at = abort_at or now
+                        if now - abort_at >= 1:
+                            break
+                    try:
+                        stderr, raw_line = lines.get(timeout=0.1)
+                    except queue.Empty:
+                        if proc.poll() is not None:
+                            piped_exit_at = piped_exit_at or now
+                            if now - piped_exit_at >= 1:
+                                break  # 子进程已退出，不无限等待继承管道的后代。
+                        elif idle_timeout:
+                            on_timeout(idle=True)
+                        continue
+                    piped_exit_at = None
+                    if raw_line is None:
+                        open_pipes -= 1
+                        continue
+                    log.write(raw_line)
+                    if len(log_head) < 128:
+                        log_head.append(raw_line[:8192])
+                    else:
+                        log_tail.append(raw_line[:8192])
+                    self._handle_worker_line(state, raw_line, stderr, stderr_tail)
+                with state.lock:
+                    finishing = True
+
+            output_file = self._run_file(state.run_id, output_file.name)
+            raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
+            parsed_result = safe_parse_handoff(raw_output) if raw_output else None
+            if parsed_result is None and state.last_agent_message:
+                candidate = safe_parse_handoff(state.last_agent_message.strip())
+                if not timed_out or (isinstance(candidate, dict) and "status" in candidate):
+                    parsed_result = candidate
+            fallback = codex_run.parse_telemetry("".join([*log_head, *log_tail]))
         except Exception as exc:
             with state.lock:
-                state.error = str(exc)
-                self._append_event(state, {"kind": "error", "message": str(exc)})
+                if state.status == "running" and not timed_out:
+                    message = f"Failed to launch codex CLI: {exc}" if proc is None else str(exc)
+                    state.status = "error"
+                    state.error = message
+                    state.record_error(message)
         finally:
-            if timer is not None:
-                timer.cancel()
-            if proc.stdin is not None and not proc.stdin.closed:
+            try:
+                with state.lock:
+                    finishing = True
+                if timer is not None:
+                    timer.cancel()
+                stop_readers.set()
+                if proc is not None:
+                    if proc.poll() is None or (os.name != "nt" and any(not p.closed for p in active_pipes)):
+                        codex_run.terminate_process_tree(proc, force=True)
+                    try:
+                        proc.wait(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                        if pipe is not None and pipe not in active_pipes:
+                            pipe.close()
+            finally:
                 try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-            if proc.stdout is not None:
-                try:
-                    proc.stdout.close()
-                except OSError:
-                    pass
+                    self._finish_worker(
+                        state, proc, timeout, timed_out, idle_timeout_error, parsed_result, fallback, stderr_tail
+                    )
+                finally:
+                    self._notify_done(state)
 
-        if not log_file.parent.exists():
-            self._notify_done(state)
-            return
+    def _handle_worker_line(
+        self, state: RunState, raw_line: str, stderr: bool, stderr_tail: deque[str]
+    ) -> None:
+        stripped = raw_line.strip()
+        if stripped.startswith("{"):
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError:
+                event = None
+            if isinstance(event, dict):
+                self._handle_json_event(state, event)
+                return
+        with state.lock:
+            if state.status != "running":
+                return
+            if stderr and stripped:
+                stderr_tail.append(codex_run.truncate_text(stripped, 300))
+                if _ERROR_LINE_RE.search(stripped):
+                    state.record_error(stripped)
+                    self._append_event(state, {"kind": "log", "text": stripped})
+            elif "ERROR" in stripped or "fatal" in stripped.lower() or "warning:" in stripped.lower():
+                self._append_event(state, {"kind": "log", "text": stripped})
+            self._persist_state(state)
 
-        combined_log = "".join(log_lines)
-        try:
-            log_file.write_text(combined_log, encoding="utf-8", newline="\n")
-        except FileNotFoundError:
-            self._notify_done(state)
-            return
-
-        raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
-        parsed_result = safe_parse_handoff(raw_output) if raw_output else None
-        if parsed_result is None and state.last_agent_message:
-            candidate = safe_parse_handoff(state.last_agent_message.strip())
-            if not timed_out or (isinstance(candidate, dict) and "status" in candidate):
-                parsed_result = candidate
-
-        fallback = codex_run.parse_telemetry(combined_log)
-
+    def _finish_worker(
+        self, state: RunState, proc: subprocess.Popen[str] | None, timeout: int, timed_out: bool,
+        idle_timeout_error: str | None, parsed_result: Any, fallback: dict[str, Any],
+        stderr_tail: deque[str],
+    ) -> None:
         with state.lock:
             state.process = None
             state.pid = None
-            state.finished_at = time.time()
+            state.in_flight_command = None
+            state.finished_at = state.finished_at or time.time()
             state.updated_at = state.finished_at
-            state.duration_sec = round(state.finished_at - state.started_at, 2)
-            state.exit_code = 124 if timed_out else (proc.returncode if proc.returncode is not None else 1)
+            state.duration_sec = round(max(0.0, state.finished_at - state.started_at), 2)
+            state.exit_code = 124 if timed_out else (proc.returncode if proc and proc.returncode is not None else 1)
             state.result = parsed_result
-            if fallback.get("model") and not state.observed.get("model"):
-                state.observed["model"] = fallback["model"]
-            if fallback.get("effort") and not state.observed.get("effort"):
-                state.observed["effort"] = fallback["effort"]
+            for key in ("model", "effort"):
+                if fallback.get(key) and not state.observed.get(key):
+                    state.observed[key] = fallback[key]
             if state.observed.get("model"):
                 state.model = state.observed["model"]
             if not state.session_id and fallback.get("session_id"):
                 state.session_id = fallback["session_id"]
-            if state.saw_usage:
-                state.tokens_used = state.usage["input_tokens"] + state.usage["output_tokens"]
-            elif state._snapshot_usage:
+            if not state.saw_usage and state._snapshot_usage:
                 state.usage = dict(state._snapshot_usage)
                 state.saw_usage = True
-                snap_tok = state.usage["input_tokens"] + state.usage["output_tokens"]
-                if snap_tok > 0:
-                    state.tokens_used = snap_tok
+            if state.saw_usage:
+                state.tokens_used = state.usage["input_tokens"] + state.usage["output_tokens"]
             elif fallback.get("tokens_used"):
                 state.tokens_used = fallback["tokens_used"]
 
-            handoff_status = (
-                parsed_result.get("status") if isinstance(parsed_result, dict) else None
-            )
-            handoff_summary = (
-                codex_catalog._clean_optional_str(parsed_result.get("summary"))
-                if isinstance(parsed_result, dict)
-                else None
-            )
-            if state.status != "cancelled":
+            if state.status == "running":
+                handoff = parsed_result if isinstance(parsed_result, dict) else {}
+                status = handoff.get("status")
+                summary = codex_catalog._clean_optional_str(handoff.get("summary"))
                 if timed_out:
-                    completed_cmds = sum(
-                        1
-                        for ev in state.events
-                        if ev.get("kind") == "command" and ev.get("status") == "completed"
-                    )
                     state.status = "error"
-                    if completed_cmds > 0:
+                    if idle_timeout_error:
+                        state.error = idle_timeout_error
+                    else:
+                        count = state.completed_commands
                         state.error = (
-                            f"执行超时 ({timeout}s)，中止前已完成 {completed_cmds} 条命令"
+                            f"执行超时 ({timeout}s)，中止前已完成 {count} 条命令"
                             "（完整过程日志已保存在 codex.log，可展开步骤查看）"
+                            if count else f"Timed out after {timeout}s"
                         )
-                    else:
-                        state.error = f"Timed out after {timeout}s"
-                    self._append_event(state, {"kind": "error", "message": state.error})
-                elif state.exit_code == 0:
-                    if handoff_status == "blocked":
-                        state.status = "blocked"
-                        if not state.error:
-                            state.error = handoff_summary or "Worker reported status=blocked."
-                    elif handoff_status == "partial":
-                        state.status = "partial"
-                        if not state.error:
-                            state.error = (
-                                handoff_summary or "Worker reported status=partial (incomplete)."
-                            )
-                    elif handoff_status == "failed":
-                        state.status = "error"
-                        if not state.error:
-                            state.error = handoff_summary or "Worker reported status=failed."
-                    else:
-                        state.status = "done"
-                else:
+                elif state.exit_code != 0:
                     state.status = "error"
-                    if not state.error:
-                        state.error = f"codex exited with code {state.exit_code}"
-            self._persist_state(state, force=True)
-            final_summary = state.to_summary_dict()
-        codex_telemetry.append_ledger_record(self.data_dir, final_summary)
-        self._notify_done(state)
+                    state.error = state.error or (state.recent_errors[-1] if state.recent_errors else None) or (
+                        stderr_tail[-1] if stderr_tail else f"codex exited with code {state.exit_code}"
+                    )
+                elif status in ("blocked", "partial", "failed"):
+                    state.status = "error" if status == "failed" else status
+                    state.error = state.error or summary or f"Worker reported status={status}."
+                else:
+                    state.status = "done"
+            try:
+                if state.status == "error" and state.error:
+                    self._append_event(state, {"kind": "error", "message": state.error})
+            finally:
+                try:
+                    self._persist_state(state, force=True)
+                except (OSError, ValueError):
+                    pass
+            summary = state.to_summary_dict()
+        try:
+            codex_telemetry.append_ledger_record(self.data_dir, summary)
+        except (OSError, UnicodeError):
+            pass
 
     def _handle_json_event(self, state: RunState, evt: dict[str, Any]) -> None:
         etype = evt.get("type")
         force_write = False
         with state.lock:
-            state.updated_at = time.time()
+            if state.status != "running":
+                return
+            state.last_activity_at = state.updated_at = time.time()
             if isinstance(evt.get("model"), str) and evt["model"].strip():
                 state.observed["model"] = evt["model"].strip()
             if isinstance(evt.get("reasoning_effort"), str) and evt["reasoning_effort"].strip():
@@ -1033,21 +1254,31 @@ class RunManager:
                     self._append_event(state, {"kind": "session", "session_id": tid})
                     force_write = True
             elif etype in ("item.started", "item.completed"):
-                item = evt.get("item") or {}
+                item = evt.get("item")
+                if not isinstance(item, dict):
+                    return
                 item_id = str(item.get("id") or "")
                 itype = str(item.get("type") or "")
                 if itype == "command_execution":
                     raw_cmd = str(item.get("command") or "")
+                    display_command = codex_run.strip_shell_wrapper(raw_cmd)
+                    output = str(item.get("aggregated_output") or "")[:12000]
+                    if etype == "item.started":
+                        state.in_flight_command = display_command
+                    else:
+                        state.in_flight_command = None
+                        if state.record_command_completion(item_id):
+                            state.record_command_outcome(display_command, item.get("exit_code"), output)
                     self._append_event(
                         state,
                         {
                             "kind": "command",
                             "item_id": item_id,
                             "command": raw_cmd,
-                            "display_command": codex_run.strip_shell_wrapper(raw_cmd),
+                            "display_command": display_command,
                             "status": str(item.get("status") or ""),
                             "exit_code": item.get("exit_code"),
-                            "output": str(item.get("aggregated_output") or "")[:12000],
+                            "output": output,
                         },
                     )
                 elif itype == "file_change":
@@ -1083,6 +1314,11 @@ class RunManager:
                         )
                 elif itype == "mcp_tool_call":
                     mcp_ev, obs_m, obs_e = codex_run.extract_mcp_tool_call_event(item)
+                    if "arguments" in item or etype == "item.completed":
+                        state.record_tool_call(item, mcp_ev["display_command"])
+                    if etype == "item.completed" and state.record_command_completion(item_id):
+                        if mcp_ev["exit_code"] not in (None, 0):
+                            state.record_error(f"{mcp_ev['display_command']}: {mcp_ev['output'] or '工具调用失败'}")
                     if obs_m:
                         state.observed["model"] = obs_m
                     if obs_e:
@@ -1117,10 +1353,11 @@ class RunManager:
                 err_obj = evt.get("error")
                 msg = (
                     evt.get("message")
-                    or (err_obj.get("message") if isinstance(err_obj, dict) else None)
+                    or (err_obj.get("message") if isinstance(err_obj, dict) else err_obj)
                     or json.dumps(evt, ensure_ascii=False)
                 )
                 state.error = str(msg)
+                state.record_error(state.error)
                 self._append_event(state, {"kind": "error", "message": state.error})
                 force_write = True
 
@@ -1192,9 +1429,21 @@ class RunManager:
                 data["pid"] = None
                 data["remaining_timeout_sec"] = None
                 data["error"] = "External CLI process exited unexpectedly."
+        now = time.time()
+        last_activity = data.get("last_activity_at") or data.get("updated_at") or data.get("started_at")
+        if not isinstance(last_activity, (int, float)):
+            last_activity = now
+        loop_reason = data.get("health_reason") if data.get("health") == "loop_warning" else None
+        health, reason, idle = _run_health(data.get("status", ""), last_activity, loop_reason, now)
+        data.update(last_activity_at=last_activity, health=health, health_reason=reason, idle_sec=idle)
+        data.setdefault("in_flight_command", None)
+        data.setdefault("recent_errors", [])
+        if data.get("status") != "running":
+            data["in_flight_command"] = None
         return data
 
     def _get_summary(self, run_id: str) -> dict[str, Any]:
+        run_id = self._validate_run_id(run_id)
         with self._lock:
             state = self._runs.get(run_id)
         if state is not None:
@@ -1251,10 +1500,6 @@ class RunManager:
                 if not in_mem_done:
                     self._any_done_cond.wait(timeout=wait_slice)
 
-        summaries = [self._get_summary(rid) for rid in run_ids]
-        still_running_ids = [s["run_id"] for s in summaries if s.get("status") == "running"]
-        finished_ids = [s["run_id"] for s in summaries if s.get("status") != "running"]
-
         if len(run_ids) == 1:
             single = dict(summaries[0])
             if timed_out:
@@ -1309,7 +1554,7 @@ class RunManager:
         all_events: list[dict[str, Any]] = []
         if events_path.is_file():
             try:
-                for raw_line in events_path.read_text(encoding="utf-8").splitlines():
+                for raw_line in events_path.read_text(encoding="utf-8").split('\n'):
                     s = raw_line.strip()
                     if not s:
                         continue
@@ -1334,6 +1579,7 @@ class RunManager:
         return []
 
     def get_run_events(self, run_id: str, since_seq: int = 0) -> dict[str, Any]:
+        run_id = self._validate_run_id(run_id)
         with self._lock:
             state = self._runs.get(run_id)
         if state is not None:
@@ -1361,8 +1607,8 @@ class RunManager:
             full_prompt if full_prompt is not None else persisted.get("prompt_preview")
         )
         all_events = self._read_persisted_events(run_id)
-        default_seq = int(all_events[-1].get("seq", len(all_events))) if all_events else 0
-        latest_seq = int(persisted.pop("seq", default_seq) or default_seq)
+        max_event_seq = max((int(ev.get("seq", i)) for i, ev in enumerate(all_events, 1)), default=0)
+        latest_seq = max(int(persisted.pop("seq", 0) or 0), max_event_seq)
         persisted["events"] = [ev for ev in all_events if int(ev.get("seq", 0)) > since_seq]
         persisted["latest_seq"] = latest_seq
         return persisted
@@ -1386,7 +1632,10 @@ class RunManager:
             for child in sorted(self.runs_dir.iterdir(), reverse=True):
                 if child.name in seen or not child.is_dir():
                     continue
-                persisted = self._load_persisted_state(child.name)
+                try:
+                    persisted = self._load_persisted_state(child.name)
+                except ValueError:
+                    continue
                 if persisted is not None:
                     persisted = self._normalize_persisted_state(persisted, child.name)
                     persisted.pop("events", None)
@@ -1411,6 +1660,7 @@ class RunManager:
         return items[:limit]
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
+        run_id = self._validate_run_id(run_id)
         with self._lock:
             state = self._runs.get(run_id)
         if state is None:
@@ -1426,6 +1676,7 @@ class RunManager:
                 persisted["pid"] = None
                 persisted["remaining_timeout_sec"] = None
                 persisted["error"] = "Cancelled by user."
+                persisted.update(health="healthy", health_reason=None, idle_sec=None, in_flight_command=None)
                 now_ts = time.time()
                 persisted["finished_at"] = persisted.get("finished_at") or now_ts
                 persisted["updated_at"] = now_ts
@@ -1457,23 +1708,53 @@ class RunManager:
             persisted.pop("seq", None)
             return persisted
 
-        with state.lock:
-            proc = state.process
-            if state.status != "running":
-                return state.to_summary_dict()
-            state.status = "cancelled"
-            state.pid = None
-            state.error = "Cancelled by user."
-            state.finished_at = state.finished_at or time.time()
-            state.duration_sec = round(max(0.0, state.finished_at - state.started_at), 2)
-            self._append_event(state, {"kind": "error", "message": "Cancelled by user."})
-            self._persist_state(state, force=True)
-            summary = state.to_summary_dict()
+        return self._cancel_live_run(state)
 
-        codex_telemetry.append_ledger_record(self.data_dir, summary)
-        codex_run.terminate_process_tree(proc)
-        self._notify_done(state)
-        return summary
+    def _cancel_live_run(self, state: RunState) -> dict[str, Any]:
+        proc = None
+        should_notify = False
+        try:
+            with state.lock:
+                if state.status != "running":
+                    return state.to_summary_dict()
+                proc = state.process
+                should_notify = True
+                state.status = "cancelled"
+                state.pid = None
+                state.in_flight_command = None
+                state.error = "Cancelled by user."
+                state.finished_at = state.finished_at or time.time()
+                state.duration_sec = round(max(0.0, state.finished_at - state.started_at), 2)
+                self._append_event(state, {"kind": "error", "message": state.error})
+                self._persist_state(state, force=True)
+                summary = state.to_summary_dict()
+        finally:
+            if should_notify:
+                self._notify_done(state)
+                codex_run.terminate_process_tree(proc)
+                if proc is not None and state.worker is not None:
+                    state.worker.join(timeout=4.0)
+        return summary  # Worker 的 finally 负责更新账本和回收进程句柄。
+
+    def shutdown(self) -> None:
+        """Stop new launches and terminate and reap active workers within a shared deadline."""
+        with self._lock:
+            self._shutting_down = True
+            states = list(self._runs.values())
+
+        def stop(state: RunState) -> None:
+            try:
+                self._cancel_live_run(state)
+            except (OSError, ValueError):
+                pass
+
+        deadline = time.monotonic() + 8.0
+        workers = [s.worker for s in states if s.worker is not None and s.worker.is_alive()]
+        stoppers = [threading.Thread(target=stop, args=(s,), daemon=True) for s in states if s.status == "running"]
+        for thread in stoppers:
+            thread.start()
+        for thread in [*stoppers, *workers]:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def close_runs(
         self,
@@ -1484,6 +1765,7 @@ class RunManager:
     ) -> dict[str, Any]:
         skipped_running_ids: list[str] = []
         targets: list[str] = []
+        run_ids = [self._validate_run_id(rid) for rid in run_ids]
 
         if close_all_finished:
             unclosed = self.list_runs(status="all", limit=1000, include_closed=False)
@@ -1496,11 +1778,7 @@ class RunManager:
                 else:
                     targets.append(rid)
         else:
-            deduped: list[str] = []
-            for rid in run_ids:
-                s = str(rid or "").strip()
-                if s and s not in deduped:
-                    deduped.append(s)
+            deduped = list(dict.fromkeys(run_ids))
             if not deduped:
                 raise ValueError("Provide 'run_id', 'run_ids', or 'close_all_finished=true'.")
             for rid in deduped:
@@ -1557,9 +1835,7 @@ class RunManager:
         }
 
     def reopen_run(self, run_id: str) -> dict[str, Any]:
-        rid = str(run_id or "").strip()
-        if not rid:
-            raise ValueError("'run_id' is required.")
+        rid = self._validate_run_id(run_id)
 
         with self._lock:
             state = self._runs.get(rid)
@@ -1599,9 +1875,7 @@ class RunManager:
         return persisted
 
     def send_followup(self, run_id: str, prompt: str) -> RunState:
-        rid = str(run_id or "").strip()
-        if not rid:
-            raise ValueError("'run_id' is required.")
+        rid = self._validate_run_id(run_id)
         followup_prompt = str(prompt or "").strip()
         if not followup_prompt:
             raise ValueError("'prompt' is required.")
@@ -1677,7 +1951,7 @@ class RunManager:
         elif fmode == "active":
             items = [r for r in items if not bool(r.get("closed")) and not bool(r.get("expired"))]
         elif fmode == "issue":
-            items = [r for r in items if r.get("status") in ("error", "blocked", "cancelled")]
+            items = [r for r in items if r.get("status") in _ISSUE_STATUSES]
 
         q = query.strip().lower()
         if q:
@@ -1732,7 +2006,7 @@ class RunManager:
                 grp["active_count"] += 1
             if r.get("closed"):
                 grp["closed_count"] += 1
-            if r.get("status") in ("error", "blocked", "cancelled"):
+            if r.get("status") in _ISSUE_STATUSES:
                 grp["issue_count"] += 1
             grp["total_tokens"] += int(r.get("tokens_used") or 0)
             ts = float(r.get("started_at") or 0)
@@ -1819,8 +2093,9 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "raw": {"type": "boolean", "default": False, "description": "Disable JSON output schema."},
                 "timeout": {
                     "type": "integer",
-                    "default": 600,
-                    "description": "Worker execution timeout in seconds (default 600; keep >=600 for multi-directory scans, parallel workloads, or complex coding tasks).",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": "Worker wall-clock timeout in seconds. 0 means unlimited; live health, stall and loop detection plus manual stop remain available. If omitted, uses the workbench setting.",
                 },
                 "title": {"type": "string", "description": "Optional short task title for panel/history display."},
                 "role": {"type": "string", "description": "Optional subagent role label (e.g. '只读探索', '代码实现', '独立审查')."},
@@ -2164,7 +2439,7 @@ class McpServer:
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
                     },
-                    "serverInfo": {"name": "agy-codex", "version": "1.3.0"},
+                    "serverInfo": {"name": "agy-codex", "version": "1.4.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -2562,6 +2837,7 @@ def serve_stdio(
                 continue
             executor.submit(_dispatch_request, req)
     finally:
+        server.manager.shutdown()
         executor.shutdown(wait=True)
 
 
