@@ -129,7 +129,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_protocol_and_visibility_separation(self) -> None:
         init = self.server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "agy-codex")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "1.2.0")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "1.3.0")
 
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
@@ -991,6 +991,122 @@ class TestMcpServerAndRunner(unittest.TestCase):
                         pipe.close()
                     except OSError:
                         pass
+
+    def test_list_codex_models_concise_brief_and_start_status_briefs(self) -> None:
+        resp = self._call_tool_raw(140, "list_codex_models", {})["result"]
+        brief_text = resp["content"][0]["text"]
+        sc = resp["structuredContent"]
+        self.assertTrue(brief_text.startswith("# Agy Codex Dispatch Brief"))
+        self.assertIn("demo/model-a", brief_text)
+        self.assertIn("Presets", brief_text)
+        self.assertIn("Available Models", brief_text)
+        self.assertNotIn("\u00b7", brief_text)
+        self.assertLess(len(brief_text), 3500)
+        self.assertIn("active_runs", sc)
+        self.assertEqual(sc.get("recommended_wait_timeout_sec"), 120)
+
+        start_resp = self._call_tool_raw(
+            141,
+            "start_codex_task",
+            {"prompt": "Brief check task", "cwd": str(self.workdir), "preset": "fast"},
+        )["result"]
+        start_text = start_resp["content"][0]["text"]
+        self.assertTrue(start_text.startswith("Started Codex task:"))
+        self.assertFalse(start_text.lstrip().startswith("{"))
+        rid = start_resp["structuredContent"]["run_id"]
+
+        status_resp = self._call_tool_raw(
+            142, "get_codex_task_status", {"run_id": rid}
+        )["result"]
+        self.assertTrue(status_resp["content"][0]["text"].startswith("Codex Status"))
+
+        wait_resp = self._call_tool_raw(
+            143, "wait_codex_task", {"run_id": rid, "timeout": 10}
+        )["result"]
+        self.assertTrue(wait_resp["content"][0]["text"].startswith("Codex Wait Result"))
+
+        close_resp = self._call_tool_raw(144, "close_codex_task", {"run_id": rid})["result"]
+        self.assertTrue(close_resp["content"][0]["text"].startswith("Closed Codex task(s):"))
+
+    def test_wait_codex_task_clamps_timeout_to_120(self) -> None:
+        tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 150, "method": "tools/list"})
+        tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
+        self.assertEqual(tools["start_codex_task"]["inputSchema"]["properties"]["timeout"]["default"], 600)
+        wait_timeout_schema = tools["wait_codex_task"]["inputSchema"]["properties"]["timeout"]
+        self.assertEqual(wait_timeout_schema["default"], 120)
+        self.assertEqual(wait_timeout_schema["maximum"], 120)
+
+        recorded_timeouts: list[int] = []
+        orig_wait = self.manager.wait_runs
+
+        def fake_wait_runs(run_ids, *, wait_mode="all", timeout=120):
+            recorded_timeouts.append(timeout)
+            return {
+                "run_id": run_ids[0],
+                "status": "running",
+                "title": "probe",
+                "wait_timed_out": True,
+                "still_running_ids": list(run_ids),
+            }
+
+        self.manager.wait_runs = fake_wait_runs  # type: ignore[method-assign]
+        try:
+            clamped_res = self._call_tool_raw(
+                151, "wait_codex_task", {"run_id": "fake-run", "timeout": 300}
+            )["result"]["structuredContent"]
+            default_res = self._call_tool_raw(
+                152, "wait_codex_task", {"run_id": "fake-run"}
+            )["result"]["structuredContent"]
+        finally:
+            self.manager.wait_runs = orig_wait  # type: ignore[method-assign]
+
+        self.assertEqual(recorded_timeouts, [120, 120])
+        self.assertEqual(clamped_res.get("wait_timeout_clamped_sec"), 120)
+        self.assertIsNone(default_res.get("wait_timeout_clamped_sec"))
+
+    def test_worker_timeout_reports_completed_commands_without_preamble_result(self) -> None:
+        timeout_py = self.root / "fake_timeout_cmds.py"
+        timeout_py.write_text(
+            "\n".join(
+                [
+                    "import json, sys, time",
+                    'print(json.dumps({"type": "thread.started", "thread_id": "0199-timeout-1"}), flush=True)',
+                    'print(json.dumps({"type": "item.completed", "item": {"id": "m0", "type": "agent_message", "text": "Opening preamble before scanning..."}}), flush=True)',
+                    'print(json.dumps({"type": "item.completed", "item": {"id": "c1", "type": "command_execution", "command": "echo scan1", "status": "completed", "exit_code": 0, "aggregated_output": "ok1"}}), flush=True)',
+                    'print(json.dumps({"type": "item.completed", "item": {"id": "c2", "type": "command_execution", "command": "echo scan2", "status": "completed", "exit_code": 0, "aggregated_output": "ok2"}}), flush=True)',
+                    "time.sleep(5)",
+                ]
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        if os.name == "nt":
+            timeout_bin = self.root / "fake_timeout.cmd"
+            timeout_bin.write_text(f'@echo off\r\n"{sys.executable}" "{timeout_py}" %*\r\n', encoding="utf-8")
+        else:
+            timeout_bin = self.root / "fake_timeout.sh"
+            timeout_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{timeout_py}" "$@"\n', encoding="utf-8")
+            timeout_bin.chmod(0o755)
+        os.environ["CODEX_BIN"] = str(timeout_bin)
+
+        started = self._call_tool_raw(
+            160,
+            "start_codex_task",
+            {"prompt": "scan workspace", "cwd": str(self.workdir), "mode": "read-only", "timeout": 1},
+        )["result"]["structuredContent"]
+        waited = self._call_tool_raw(
+            161,
+            "wait_codex_task",
+            {"run_id": started["run_id"], "timeout": 10},
+        )["result"]["structuredContent"]
+
+        self.assertEqual(waited["status"], "error")
+        self.assertFalse(waited["ok"])
+        self.assertIsNone(waited["result"])
+        self.assertEqual(waited.get("completed_commands"), 2)
+        self.assertIn("2 条命令", waited.get("error") or "")
+        self.assertIn("codex.log", waited.get("error") or "")
+        self.assertIn("2 条命令", waited.get("work_digest") or "")
 
 
 if __name__ == "__main__":

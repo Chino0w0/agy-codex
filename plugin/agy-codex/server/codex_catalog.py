@@ -30,21 +30,25 @@ SUBAGENT_ROLE_PREFIX = (
     "NOT the root/main agent (根主代理). Your parent orchestrator has already decomposed the task and delegated this bounded subtask to you. "
     "Any global AGENTS.md, user config, or default workflow instructions telling the root agent to split work, spawn subagents "
     "(`spawn_agent`, `multi_agent`), or delegate to child agents DO NOT APPLY to you. "
+    "Ignore unrelated global skills, plugins, or workspace-discovery checklists outside the explicit task scope; start executing directly on the requested paths. "
     "Execute this task directly yourself with zero nested subagent spawning. "
     "Before editing, read any specified `context_files` / reference docs and nearby existing files, strictly adhering to existing project architecture, naming conventions, and business behavior. "
     "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`. "
     "If an optional MCP tool referenced in AGENTS.md (such as desktop or custom MCP tools) is unavailable in this session, "
     "silently use built-in tools without wasting turns searching for missing tools. "
     "On Windows inside a restricted sandbox, if Git Bash or WSL bash.exe fails with signal-pipe or access errors, "
-    "use native PowerShell (pwsh) or Python directly (or any forwarded file/search MCP tools available in this session)."
+    "use native PowerShell (pwsh) or Python directly (or any forwarded file/search MCP tools available in this session). "
+    "Keep the final JSON handoff concise (short summary, key file paths, compact verification notes) and finish writing it well before timeout."
 )
 
 NESTED_SUBAGENT_PREFIX = (
     "[SUBAGENT ROLE DECLARATION / 子代理身份声明] "
     "You are running as a non-interactive delegated subagent (子代理/Worker) invoked by an external parent orchestrator (Antigravity), "
     "NOT the root/main agent (根主代理). Nested subagents are explicitly enabled for this run, but only use them when genuinely necessary. "
+    "Ignore unrelated global skills, plugins, or workspace-discovery checklists outside the explicit task scope; start executing directly on the requested paths. "
     "Before editing, read any specified `context_files` / reference docs and nearby existing files, strictly adhering to existing project architecture, naming conventions, and business behavior. "
-    "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`."
+    "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`. "
+    "Keep the final JSON handoff concise (short summary, key file paths, compact verification notes) and finish writing it well before timeout."
 )
 
 DEFAULT_DEVELOPER_INSTRUCTIONS = (
