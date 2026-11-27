@@ -138,6 +138,34 @@ class TestUpdater(unittest.TestCase):
         with self.assertRaises(ValueError):
             updater.check_for_updates(self.plugin, self.data, channel="nightly")
 
+    def test_api_rate_limit_falls_back_to_main_atom_feed(self) -> None:
+        atom_url = f"https://github.com/{self.repo}/commits/main.atom"
+        atom_xml = (
+            b'<?xml version="1.0" encoding="UTF-8"?><feed><entry>'
+            b"<id>tag:github.com,2008:Grit::Commit/" + self.commit.encode() + b"</id>"
+            b"<title>feat: rate-limit-free sync &amp; tests</title>"
+            b"<updated>2026-11-27T09:48:40Z</updated>"
+            b"</entry></feed>"
+        )
+        fetch = self.fetcher({
+            self.latest_url: (403, {}),
+            self.commit_url: (429, {}),
+            atom_url: (200, atom_xml),
+            self.manifest_url: (200, {"version": "1.6.0"}),
+        })
+        res_auto = updater.check_for_updates(self.plugin, self.data, force=True, channel="auto", fetcher=fetch)
+        self.assertTrue(res_auto["ok"])
+        self.assertEqual(res_auto["channel"], "main")
+        self.assertTrue(res_auto["update_available"])
+        self.assertEqual(res_auto["remote_version"], "1.6.0")
+        self.assertEqual(res_auto["remote_commit"], self.commit)
+        self.assertEqual(res_auto["notes"], "feat: rate-limit-free sync & tests")
+
+        res_main = updater.check_for_updates(self.plugin, self.data, force=True, channel="main", fetcher=fetch)
+        self.assertTrue(res_main["ok"])
+        self.assertEqual(res_main["channel"], "main")
+        self.assertEqual(res_main["remote_commit"], self.commit)
+
     def test_download_blocks_non_https_and_off_domain_redirects(self) -> None:
         url = "https://github.com/example/source"
         second = "https://objects.githubusercontent.com/example/source"

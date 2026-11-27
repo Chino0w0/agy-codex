@@ -743,15 +743,38 @@ class RunManager:
         with self._lock:
             return sum(1 for s in self._runs.values() if s.status == "running")
 
-    def infer_default_cwd(self) -> str:
-        recent = self.list_runs(limit=1, include_closed=True)
-        if recent and not recent[0].get("expired"):
-            cwd = recent[0].get("cwd")
-            try:
-                if isinstance(cwd, str) and cwd and Path(cwd).is_dir():
-                    return cwd
-            except OSError:
-                pass
+    def infer_default_cwd(self, parent_session_id: str | None = None) -> str:
+        worktrees_root = (self.data_dir / "worktrees").resolve()
+
+        def _pick_from(runs: list[dict[str, Any]]) -> str | None:
+            for item in runs:
+                if item.get("expired"):
+                    continue
+                wt = item.get("worktree")
+                candidates: list[Any] = []
+                if isinstance(wt, dict) and wt.get("base_repo"):
+                    candidates.append(wt.get("base_repo"))
+                candidates.append(item.get("cwd"))
+                for raw_cwd in candidates:
+                    if not isinstance(raw_cwd, str) or not raw_cwd.strip():
+                        continue
+                    try:
+                        p = Path(raw_cwd).resolve()
+                        if p.is_dir() and not p.is_relative_to(worktrees_root):
+                            return str(p)
+                    except (OSError, RuntimeError):
+                        continue
+            return None
+
+        if parent_session_id:
+            scoped = _pick_from(
+                self.list_runs(limit=10, include_closed=True, parent_session_id=parent_session_id)
+            )
+            if scoped:
+                return scoped
+        any_recent = _pick_from(self.list_runs(limit=10, include_closed=True))
+        if any_recent:
+            return any_recent
         try:
             cwd_path = Path.cwd()
             if cwd_path.is_dir() and not cwd_path.resolve().is_relative_to(PLUGIN_ROOT):
@@ -2717,7 +2740,7 @@ class McpServer:
                 "total_unclosed_runs": total_unclosed,
                 "other_sessions_runs": other_sessions,
                 "global_active_runs": global_active,
-                "default_cwd": self.manager.infer_default_cwd(),
+                "default_cwd": self.manager.infer_default_cwd(parent_session_id=scope_sid),
                 "enabled": bool(wb_cfg.get("enabled", True)),
                 "intercept_native_subagents": bool(wb_cfg.get("intercept_native_subagents", True)),
                 "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
@@ -2828,7 +2851,7 @@ class McpServer:
                     "total_unclosed_runs": total_unclosed,
                     "other_sessions_runs": other_sessions,
                     "global_active_runs": global_active,
-                    "default_cwd": self.manager.infer_default_cwd(),
+                    "default_cwd": self.manager.infer_default_cwd(parent_session_id=scope_sid),
                     "enabled": bool(wb_cfg.get("enabled", True)),
                     "intercept_native_subagents": bool(
                         wb_cfg.get("intercept_native_subagents", True)

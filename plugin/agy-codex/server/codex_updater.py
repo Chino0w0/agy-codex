@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import http.client
 import json
 import os
@@ -191,7 +192,13 @@ def _read_limited(response) -> bytes:
 def _fetch(url: str) -> tuple[int, bytes, dict[str, str]]:
     _validate_download_url(url)
     opener = urllib.request.build_opener(_GitHubRedirectHandler())
-    request = urllib.request.Request(url, headers={"User-Agent": "agy-codex-updater"})
+    headers = {"User-Agent": "agy-codex-updater"}
+    if url.startswith("https://api.github.com/"):
+        headers["Accept"] = "application/vnd.github+json"
+        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
     try:
         with opener.open(request, timeout=15) as response:
             _validate_download_url(response.geturl())
@@ -324,11 +331,49 @@ def _release_checksum(release: dict[str, Any], repo: str, tag: str, fetcher: Fet
     return next(iter(digests), None)
 
 
+def _remote_main_from_atom(repo: str, fetcher: Fetcher | None) -> tuple[dict[str, Any], str, str | None]:
+    """Rate-limit-free fallback using github.com main.atom + raw.githubusercontent.com."""
+    atom_url = f"https://github.com/{repo}/commits/main.atom"
+    status, raw, _ = _request(atom_url, fetcher)
+    _require_success(status)
+    text = raw.decode("utf-8", errors="replace")
+    entry_match = re.search(r"<entry\b[^>]*>(.*?)</entry>", text, re.DOTALL)
+    if not entry_match:
+        raise ValueError("GitHub Atom 未包含提交记录")
+    entry = entry_match.group(1)
+    sha_match = re.search(r"Commit/([0-9a-fA-F]{40})", entry)
+    if not sha_match:
+        raise ValueError("GitHub Atom 未包含有效的提交 SHA")
+    sha = sha_match.group(1).lower()
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", entry, re.DOTALL)
+    updated_match = re.search(r"<updated[^>]*>(.*?)</updated>", entry, re.DOTALL)
+    notes = html.unescape(title_match.group(1)).strip()[:1200] if title_match else ""
+    published_at = updated_match.group(1).strip() if updated_match else None
+    manifest = _request_json(f"https://raw.githubusercontent.com/{repo}/{sha}/plugin/agy-codex/plugin.json", fetcher)
+    version = str(manifest.get("version") or "")
+    _version_key(version)
+    return {
+        "channel": "main",
+        "remote_version": version,
+        "remote_commit": sha,
+        "remote_short_commit": sha[:7],
+        "latest_id": f"{version}@{sha[:7]}",
+        "release_url": f"https://github.com/{repo}/commit/{sha}",
+        "notes": notes,
+        "published_at": published_at,
+    }, f"https://codeload.github.com/{repo}/zip/{sha}", None
+
+
 def _remote_update(repo: str, channel: str, fetcher: Fetcher | None) -> tuple[dict[str, Any], str, str | None]:
     api_url = f"https://api.github.com/repos/{repo}"
     archive_url = f"https://codeload.github.com/{repo}/zip"
     if channel != "main":
         status, raw, _ = _request(f"{api_url}/releases/latest", fetcher)
+        if status in (403, 429) and channel == "auto":
+            try:
+                return _remote_main_from_atom(repo, fetcher)
+            except Exception:
+                _require_success(status)
         if status != 404:
             _require_success(status)
             release = _as_object(json.loads(raw))
@@ -344,7 +389,14 @@ def _remote_update(repo: str, channel: str, fetcher: Fetcher | None) -> tuple[di
                 "published_at": release.get("published_at"),
             }, f"{archive_url}/refs/tags/{urllib.parse.quote(tag, safe='')}", _release_checksum(release, repo, tag, fetcher)
 
-    head = _request_json(f"{api_url}/commits/main", fetcher)
+    status, raw, _ = _request(f"{api_url}/commits/main", fetcher)
+    if status in (403, 429):
+        try:
+            return _remote_main_from_atom(repo, fetcher)
+        except Exception:
+            _require_success(status)
+    _require_success(status)
+    head = _as_object(json.loads(raw))
     sha = str(head.get("sha") or "").lower()
     if not _COMMIT.fullmatch(sha):
         raise ValueError("GitHub main 未返回有效的提交 SHA")
