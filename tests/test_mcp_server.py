@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import json
 import os
+import queue
+import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -125,6 +129,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_protocol_and_visibility_separation(self) -> None:
         init = self.server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "agy-codex")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "1.1.2")
 
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
@@ -134,6 +139,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
             "wait_codex_task",
             "get_codex_task_status",
             "stop_codex_task",
+            "close_codex_task",
             "open_codex_panel",
         ):
             self.assertIn(model_tool, tools)
@@ -145,8 +151,12 @@ class TestMcpServerAndRunner(unittest.TestCase):
         for app_tool in (
             "get_run_events",
             "list_runs",
-            "list_local_sessions",
-            "get_local_session_detail",
+            "close_run",
+            "reopen_run",
+            "get_history",
+            "send_followup",
+            "toggle_codex_enabled",
+            "toggle_exclude_orchestrator",
             "get_stats",
             "get_workbench_config",
             "save_workbench_config",
@@ -156,6 +166,18 @@ class TestMcpServerAndRunner(unittest.TestCase):
         ):
             self.assertIn(app_tool, tools)
             self.assertEqual(tools[app_tool]["_meta"]["ui"]["visibility"], ["app"])
+
+        start_props = tools["start_codex_task"]["inputSchema"]["properties"]
+        for field_name in ("context_files", "acceptance_criteria", "non_goals"):
+            self.assertIn(field_name, start_props)
+
+        defined_names = {t["name"] for t in mcp_server.TOOLS_DEF}
+        for removed_tool in ("list_local_sessions", "get_local_session_detail"):
+            self.assertNotIn(removed_tool, tools)
+            self.assertNotIn(removed_tool, defined_names)
+
+        tab_prop = tools["open_codex_panel"]["inputSchema"]["properties"]["tab"]
+        self.assertIn("history", tab_prop.get("enum", []))
 
         self.assertIsNone(((tools["start_codex_task"].get("_meta") or {}).get("ui") or {}).get("resourceUri"))
         self.assertEqual(tools["open_codex_panel"]["_meta"]["ui"]["resourceUri"], mcp_server.APP_URI)
@@ -286,6 +308,20 @@ class TestMcpServerAndRunner(unittest.TestCase):
         cmd_ev = next(e for e in ev_fast["events"] if e["kind"] == "command")
         self.assertEqual(cmd_ev["display_command"], "pytest -q")
 
+        # Verify events.jsonl is stored separately and state.json does not embed events
+        run_dir = self.data_dir / "runs" / r_fast["run_id"]
+        state_disk = json.loads((run_dir / "state.json").read_text(encoding="utf-8"))
+        self.assertNotIn("events", state_disk)
+        events_file = run_dir / "events.jsonl"
+        self.assertTrue(events_file.is_file())
+        disk_events = [
+            json.loads(line)
+            for line in events_file.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(len(disk_events) >= 1)
+        self.assertEqual(len(ev_fast["events"]), len(disk_events))
+
     def test_list_codex_models_never_lists_hidden_models(self) -> None:
         (self.codex_home / "config.toml").write_text(
             '\n'.join(
@@ -376,6 +412,20 @@ class TestMcpServerAndRunner(unittest.TestCase):
             self.assertIn("features.multi_agent=false", joined)
             self.assertIn("SUBAGENT ROLE DECLARATION", joined)
 
+        ephemeral_cmd, _ = codex_run.build_codex_command(
+            str(self.fake_bin),
+            self.workdir,
+            self.root / "out-ephemeral.json",
+            codex_home=self.codex_home,
+            data_dir=self.data_dir,
+            persist=False,
+            check_git=False,
+        )
+        self.assertIn("--ephemeral", ephemeral_cmd)
+        self.assertIn("--thread-source", ephemeral_cmd)
+        ts_idx = ephemeral_cmd.index("--thread-source")
+        self.assertEqual(ephemeral_cmd[ts_idx + 1], "subagent")
+
     def test_strip_shell_wrapper_windows_paths_and_blocked_handoff(self) -> None:
         self.assertEqual(
             codex_run.strip_shell_wrapper(
@@ -460,6 +510,471 @@ class TestMcpServerAndRunner(unittest.TestCase):
         )["result"]["structuredContent"]
         self.assertEqual(waited["status"], "done")
         self.assertIn("Line 2 BODY_OK", waited["result"]["summary"])
+
+    def _call_tool_raw(self, req_id: int, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        return self.server.handle_request(
+            {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            }
+        )
+
+    def _assert_rejected(self, resp: dict[str, object]) -> str:
+        if "error" in resp:
+            err_obj = resp["error"]
+            msg = str(err_obj.get("message") or "")
+            self.assertTrue(len(msg) > 0)
+            return msg
+        result = resp.get("result") or {}
+        sc = result.get("structuredContent") or {}
+        is_err = bool(result.get("isError")) or sc.get("ok") is False
+        self.assertTrue(is_err, f"Expected tool call to be rejected, got: {resp!r}")
+        msg = str(sc.get("error") or sc.get("message") or "")
+        if not msg and isinstance(result.get("content"), list) and result["content"]:
+            msg = str(result["content"][0].get("text") or "")
+        self.assertTrue(len(msg) > 0)
+        return msg
+
+    def test_toggle_codex_enabled_blocks_and_reenables_start_codex_task(self) -> None:
+        disabled = self._call_tool_raw(60, "toggle_codex_enabled", {"enabled": False})["result"]["structuredContent"]
+        self.assertIs(disabled["enabled"], False)
+
+        blocked_resp = self._call_tool_raw(
+            61,
+            "start_codex_task",
+            {"prompt": "Should fail while disabled", "cwd": str(self.workdir)},
+        )
+        err_msg = self._assert_rejected(blocked_resp)
+        self.assertTrue(
+            any(tok in err_msg.lower() for tok in ("disabled", "paused", "enabled", "暂停", "关闭")),
+            f"Unexpected toggle block message: {err_msg!r}",
+        )
+
+        reenabled = self._call_tool_raw(62, "toggle_codex_enabled", {"enabled": True})["result"]["structuredContent"]
+        self.assertIs(reenabled["enabled"], True)
+
+        started = self._call_tool_raw(
+            63,
+            "start_codex_task",
+            {"prompt": "Allowed after re-enable", "cwd": str(self.workdir)},
+        )["result"]["structuredContent"]
+        waited = self._call_tool_raw(
+            64,
+            "wait_codex_task",
+            {"run_id": started["run_id"], "timeout": 10},
+        )["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "done")
+
+    def test_close_codex_task_history_grouping_running_guard_and_reopen(self) -> None:
+        finished_start = self._call_tool_raw(
+            70,
+            "start_codex_task",
+            {
+                "prompt": "Implement auth helper",
+                "cwd": str(self.workdir),
+                "title": "Auth refactor",
+                "role": "coding",
+                "conversation_id": "conv-123",
+                "conversation_title": "Main Feature Thread",
+            },
+        )["result"]["structuredContent"]
+        fast_id = finished_start["run_id"]
+        waited = self._call_tool_raw(71, "wait_codex_task", {"run_id": fast_id, "timeout": 10})["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "done")
+
+        slow_start = self._call_tool_raw(
+            72,
+            "start_codex_task",
+            {"prompt": "SLEEP_LONG running guard", "cwd": str(self.workdir)},
+        )["result"]["structuredContent"]
+        slow_id = slow_start["run_id"]
+
+        # Must refuse closing a still-running run
+        refused_resp = self._call_tool_raw(73, "close_codex_task", {"run_id": slow_id})
+        refused_msg = self._assert_rejected(refused_resp)
+        self.assertTrue(
+            any(tok in refused_msg.lower() for tok in ("running", "stop", "运行")),
+            f"Unexpected running close refusal message: {refused_msg!r}",
+        )
+        self._call_tool_raw(74, "stop_codex_task", {"run_id": slow_id})
+
+        # Closing finished run sets closed_by="agent" and removes it from default list_runs
+        closed = self._call_tool_raw(75, "close_codex_task", {"run_id": fast_id})["result"]["structuredContent"]
+        self.assertEqual(closed["closed_by"], "agent")
+        self.assertIsNotNone(closed.get("closed_at"))
+
+        active_runs = self._call_tool_raw(76, "list_runs", {})["result"]["structuredContent"]["runs"]
+        self.assertNotIn(fast_id, [r["run_id"] for r in active_runs])
+
+        all_runs = self._call_tool_raw(77, "list_runs", {"include_closed": True})["result"]["structuredContent"]["runs"]
+        self.assertIn(fast_id, [r["run_id"] for r in all_runs])
+
+        # Inspectable in get_history grouped by parent_session_id / parent_session_title
+        hist = self._call_tool_raw(78, "get_history", {})["result"]["structuredContent"]
+        groups = hist.get("groups") or []
+        group = next((g for g in groups if g.get("parent_session_id") == "conv-123"), None)
+        self.assertIsNotNone(group, f"Missing conv-123 group in history: {hist!r}")
+        self.assertEqual(group["parent_session_title"], "Main Feature Thread")
+        hist_run = next((r for r in group["runs"] if r["run_id"] == fast_id), None)
+        self.assertIsNotNone(hist_run)
+        self.assertEqual(hist_run["role"], "coding")
+        self.assertEqual(hist_run["closed_by"], "agent")
+        self.assertTrue(bool(hist_run.get("work_digest")))
+
+        # reopen_run restores the run to active monitor
+        reopened = self._call_tool_raw(79, "reopen_run", {"run_id": fast_id})["result"]["structuredContent"]
+        self.assertIsNone(reopened.get("closed_at"))
+        active_after = self._call_tool_raw(80, "list_runs", {})["result"]["structuredContent"]["runs"]
+        self.assertIn(fast_id, [r["run_id"] for r in active_after])
+
+    def test_concurrent_wait_does_not_block_ui_and_close_requests(self) -> None:
+        fast_start = self._call_tool_raw(
+            90,
+            "start_codex_task",
+            {"prompt": "Fast concurrent task", "cwd": str(self.workdir), "preset": "fast"},
+        )["result"]["structuredContent"]
+        fast_id = fast_start["run_id"]
+        fast_done = self._call_tool_raw(
+            91, "wait_codex_task", {"run_id": fast_id, "timeout": 10}
+        )["result"]["structuredContent"]
+        self.assertEqual(fast_done["status"], "done")
+
+        slow_start = self._call_tool_raw(
+            92,
+            "start_codex_task",
+            {"prompt": "SLEEP_LONG concurrent wait", "cwd": str(self.workdir), "mode": "read-only"},
+        )["result"]["structuredContent"]
+        slow_id = slow_start["run_id"]
+
+        req_r_fd, req_w_fd = os.pipe()
+        resp_r_fd, resp_w_fd = os.pipe()
+        r_stream = os.fdopen(req_r_fd, "r", encoding="utf-8", buffering=1)
+        req_writer = os.fdopen(req_w_fd, "w", encoding="utf-8", buffering=1)
+        w_stream = os.fdopen(resp_w_fd, "w", encoding="utf-8", buffering=1)
+        resp_reader = os.fdopen(resp_r_fd, "r", encoding="utf-8", buffering=1)
+
+        resp_q: queue.Queue[tuple[float, dict[str, object]]] = queue.Queue()
+
+        def read_responses() -> None:
+            for raw in resp_reader:
+                line = raw.strip()
+                if not line:
+                    continue
+                resp_q.put((time.monotonic(), json.loads(line)))
+
+        srv_thread = threading.Thread(
+            target=mcp_server.serve_stdio,
+            args=(self.server, r_stream, w_stream),
+            daemon=True,
+        )
+        reader_thread = threading.Thread(target=read_responses, daemon=True)
+        srv_thread.start()
+        reader_thread.start()
+
+        try:
+            t0 = time.monotonic()
+            requests = [
+                {
+                    "jsonrpc": "2.0",
+                    "id": 100,
+                    "method": "tools/call",
+                    "params": {"name": "wait_codex_task", "arguments": {"run_id": slow_id, "timeout": 10}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 101,
+                    "method": "tools/call",
+                    "params": {"name": "list_runs", "arguments": {}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 102,
+                    "method": "tools/call",
+                    "params": {"name": "get_run_events", "arguments": {"run_id": fast_id}},
+                },
+                {
+                    "jsonrpc": "2.0",
+                    "id": 103,
+                    "method": "tools/call",
+                    "params": {"name": "close_run", "arguments": {"run_id": fast_id}},
+                },
+            ]
+            req_writer.write(json.dumps(requests[0]) + "\n")
+            req_writer.flush()
+            time.sleep(0.05)
+            for req in requests[1:]:
+                req_writer.write(json.dumps(req) + "\n")
+            req_writer.flush()
+
+            arrival_order: list[int] = []
+            arrivals: dict[int, float] = {}
+            responses: dict[int, dict[str, object]] = {}
+            for _ in range(4):
+                ts, msg = resp_q.get(timeout=10.0)
+                rid = int(msg["id"])  # type: ignore[arg-type]
+                arrival_order.append(rid)
+                arrivals[rid] = ts - t0
+                responses[rid] = msg
+
+            for rid in (100, 101, 102, 103):
+                self.assertIn("result", responses[rid], f"Unexpected response for {rid}: {responses[rid]!r}")
+
+            self.assertEqual(responses[100]["result"]["structuredContent"]["status"], "done")
+            self.assertIn(fast_id, responses[103]["result"]["structuredContent"]["closed_ids"])
+            for interactive_id in (101, 102, 103):
+                self.assertLess(arrivals[interactive_id], 1.5)
+                self.assertLess(
+                    arrival_order.index(interactive_id),
+                    arrival_order.index(100),
+                    f"Interactive request {interactive_id} waited for wait_codex_task: order={arrival_order}",
+                )
+        finally:
+            try:
+                self._call_tool_raw(104, "stop_codex_task", {"run_id": slow_id})
+            except Exception:
+                pass
+            for stream in (req_writer, r_stream, w_stream, resp_reader):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            srv_thread.join(timeout=5.0)
+            reader_thread.join(timeout=5.0)
+
+    def test_running_state_persists_pid_and_survives_fresh_manager_read(self) -> None:
+        started = self._call_tool_raw(
+            110,
+            "start_codex_task",
+            {"prompt": "SLEEP_LONG pid persistence", "cwd": str(self.workdir), "mode": "read-only"},
+        )["result"]["structuredContent"]
+        run_id = started["run_id"]
+        state_path = self.data_dir / "runs" / run_id / "state.json"
+
+        try:
+            state_disk: dict[str, object] = {}
+            deadline = time.monotonic() + 2.5
+            while time.monotonic() < deadline:
+                if state_path.is_file():
+                    try:
+                        loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                        if isinstance(loaded, dict) and isinstance(loaded.get("pid"), int):
+                            state_disk = loaded
+                            break
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+
+            self.assertIsInstance(state_disk.get("pid"), int)
+            self.assertGreater(int(state_disk["pid"]), 0)  # type: ignore[arg-type]
+            for key in ("updated_at", "timeout_sec", "remaining_timeout_sec"):
+                self.assertIn(key, state_disk, f"Missing {key!r} in state.json: {state_disk!r}")
+
+            fresh_manager = mcp_server.RunManager(data_dir=self.data_dir, codex_home=self.codex_home)
+            fresh_runs = fresh_manager.list_runs(limit=20)
+            live_run = next((r for r in fresh_runs if r["run_id"] == run_id), None)
+            self.assertIsNotNone(live_run)
+            self.assertEqual(live_run["status"], "running")
+        finally:
+            self._call_tool_raw(111, "stop_codex_task", {"run_id": run_id})
+
+    def test_prompt_txt_full_retrieval_context_files_and_short_write_warning(self) -> None:
+        spec_file = self.workdir / "spec.md"
+        spec_file.write_text("# Contract Spec\nEndpoint: /api/v1/items\n", encoding="utf-8", newline="\n")
+
+        long_prompt = "Implement full workflow context. " + ("DETAIL_" * 90) + " TAIL_END_MARKER"
+        self.assertGreater(len(long_prompt), 500)
+
+        started = self._call_tool_raw(
+            120,
+            "start_codex_task",
+            {
+                "prompt": long_prompt,
+                "cwd": str(self.workdir),
+                "mode": "write",
+                "context_files": ["spec.md"],
+                "acceptance_criteria": ["python -m unittest passes"],
+                "non_goals": ["Do not touch frontend"],
+            },
+        )["result"]["structuredContent"]
+        run_id = started["run_id"]
+        waited = self._call_tool_raw(
+            121, "wait_codex_task", {"run_id": run_id, "timeout": 10}
+        )["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "done")
+
+        prompt_txt = self.data_dir / "runs" / run_id / "prompt.txt"
+        self.assertTrue(prompt_txt.is_file())
+        prompt_text = prompt_txt.read_text(encoding="utf-8")
+        self.assertIn("TAIL_END_MARKER", prompt_text)
+        self.assertIn("spec.md", prompt_text)
+        self.assertIn("python -m unittest passes", prompt_text)
+        self.assertIn("Do not touch frontend", prompt_text)
+
+        listed = self._call_tool_raw(122, "list_runs", {})["result"]["structuredContent"]["runs"]
+        run_item = next(r for r in listed if r["run_id"] == run_id)
+        self.assertNotIn("prompt", run_item)
+        self.assertLessEqual(len(run_item["prompt_preview"]), 180)
+        self.assertNotIn("TAIL_END_MARKER", run_item["prompt_preview"])
+
+        events_res = self._call_tool_raw(
+            123, "get_run_events", {"run_id": run_id}
+        )["result"]["structuredContent"]
+        self.assertIn("[READ-FIRST CONTEXT FILES]", events_res["prompt"])
+        self.assertIn("TAIL_END_MARKER", events_res["prompt"])
+
+        short_start = self._call_tool_raw(
+            124,
+            "start_codex_task",
+            {"prompt": "fix bug", "cwd": str(self.workdir), "mode": "write"},
+        )["result"]["structuredContent"]
+        self.assertTrue(
+            len(short_start.get("warnings") or []) >= 1,
+            f"Expected warning for short write prompt without context_files, got: {short_start!r}",
+        )
+        self._call_tool_raw(125, "wait_codex_task", {"run_id": short_start["run_id"], "timeout": 10})
+
+    def test_partial_handoff_status_and_toggle_exclude_orchestrator(self) -> None:
+        partial_py = self.root / "fake_partial.py"
+        partial_py.write_text(
+            "\n".join(
+                [
+                    "import json, sys",
+                    "from pathlib import Path",
+                    "args = sys.argv[1:]",
+                    "out_file = next((Path(args[i+1]) for i, a in enumerate(args) if a == '-o' and i + 1 < len(args)), None)",
+                    'payload = {"status": "partial", "summary": "only edited 1 of 2 files", "changed_files": ["a.py"], "verification": [], "risks": ["b.py pending"], "next_steps": ["finish b.py"]}',
+                    "if out_file: out_file.write_text(json.dumps(payload), encoding='utf-8')",
+                    'print(json.dumps({"type": "thread.started", "thread_id": "0199-partial-1"}), flush=True)',
+                    'print(json.dumps({"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": json.dumps(payload)}}), flush=True)',
+                ]
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        if os.name == "nt":
+            partial_bin = self.root / "fake_partial.cmd"
+            partial_bin.write_text(f'@echo off\r\n"{sys.executable}" "{partial_py}" %*\r\n', encoding="utf-8")
+        else:
+            partial_bin = self.root / "fake_partial.sh"
+            partial_bin.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{partial_py}" "$@"\n', encoding="utf-8")
+            partial_bin.chmod(0o755)
+        os.environ["CODEX_BIN"] = str(partial_bin)
+
+        started = self._call_tool_raw(
+            130,
+            "start_codex_task",
+            {"prompt": "partial check", "cwd": str(self.workdir)},
+        )["result"]["structuredContent"]
+        waited = self._call_tool_raw(
+            131, "wait_codex_task", {"run_id": started["run_id"], "timeout": 10}
+        )["result"]["structuredContent"]
+        self.assertEqual(waited["status"], "partial")
+        self.assertFalse(waited["ok"])
+
+        self._call_tool_raw(
+            132,
+            "save_workbench_config",
+            {
+                "exclude_orchestrator_models": True,
+                "defaults": {"model": "demo/custom-keep", "effort": "high"},
+                "mapping": {"retention_hours": 48, "max_concurrent_runs": 3},
+            },
+        )
+        toggled = self._call_tool_raw(
+            133, "toggle_exclude_orchestrator", {"enabled": False}
+        )["result"]["structuredContent"]
+        self.assertIs(toggled["exclude_orchestrator_models"], False)
+
+        wb_after = self._call_tool_raw(134, "get_workbench_config", {})["result"]["structuredContent"]
+        cfg = wb_after["workbench_config"]
+        self.assertIs(cfg["exclude_orchestrator_models"], False)
+        self.assertEqual(cfg["defaults"]["model"], "demo/custom-keep")
+        self.assertEqual(cfg["defaults"]["effort"], "high")
+        self.assertEqual(cfg["mapping"]["retention_hours"], 48)
+        self.assertEqual(cfg["mapping"]["max_concurrent_runs"], 3)
+
+    def test_stdio_get_workbench_config_and_doctor_no_deadlock(self) -> None:
+        env = os.environ.copy()
+        env["CODEX_HOME"] = str(self.codex_home)
+        env["CODEX_BIN"] = str(self.fake_bin)
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                str(SERVER_DIR / "mcp_server.py"),
+                "--data-dir",
+                str(self.data_dir),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        assert proc.stdin is not None and proc.stdout is not None
+
+        def rpc(payload: dict[str, object], timeout_sec: float = 5.0) -> dict[str, object]:
+            proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
+            proc.stdin.flush()
+            box: list[bytes] = []
+            reader = threading.Thread(
+                target=lambda: box.append(proc.stdout.readline()),
+                daemon=True,
+            )
+            reader.start()
+            reader.join(timeout_sec)
+            self.assertFalse(reader.is_alive(), f"Timed out waiting for stdio reply to {payload.get('method')}")
+            self.assertTrue(box and box[0], "Empty stdio response line")
+            return json.loads(box[0].decode("utf-8"))
+
+        try:
+            init_res = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": "2025-03-26"},
+                }
+            )
+            self.assertIn("result", init_res)
+
+            wb_res = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "get_workbench_config", "arguments": {"include_hidden": False}},
+                }
+            )
+            wb_sc = wb_res["result"]["structuredContent"]
+            self.assertIn("models", wb_sc)
+            self.assertIn("workbench_config", wb_sc)
+            self.assertIn("checks", wb_sc["doctor"])
+
+            doc_res = rpc(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "run_doctor", "arguments": {}},
+                }
+            )
+            doc_sc = doc_res["result"]["structuredContent"]
+            self.assertIn("checks", doc_sc)
+            self.assertTrue(doc_sc["checks"]["python"]["ok"])
+        finally:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            proc.terminate()
+            proc.wait(timeout=5)
+            for pipe in (proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
 
 
 if __name__ == "__main__":

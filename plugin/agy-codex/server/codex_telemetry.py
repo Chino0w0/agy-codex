@@ -12,13 +12,19 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from codex_catalog import atomic_write_text, get_codex_home, get_plugin_data_dir
+
+LEDGER_FILENAME = "stats-ledger.jsonl"
+_LEDGER_LOCK = threading.Lock()
+_LEDGER_LAST_SIG: dict[tuple[str, str], tuple[Any, ...]] = {}
 
 STATE_DB_RE = re.compile(r"^state_(\d+)\.sqlite$")
 THREAD_CANDIDATE_COLS = (
@@ -560,6 +566,207 @@ def get_local_session_detail(
     }
 
 
+def _truncate_compact(text: Any, limit: int) -> str:
+    clean = " ".join(str(text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3] + "..."
+
+
+def _normalize_ledger_record(run_summary: dict[str, Any]) -> dict[str, Any]:
+    run_id = str(run_summary.get("run_id") or "").strip()
+    status = str(run_summary.get("status") or "unknown")
+    mode = run_summary.get("mode")
+    cwd_str = str(run_summary.get("cwd") or "")
+    prompt_prev = str(run_summary.get("prompt_preview") or "")
+    res = run_summary.get("result")
+    digest = str(run_summary.get("work_digest") or "").strip()
+    if not digest:
+        if isinstance(res, dict) and res.get("summary"):
+            digest = _truncate_compact(res.get("summary"), 120)
+        elif run_summary.get("error"):
+            digest = _truncate_compact(run_summary.get("error"), 120)
+        elif prompt_prev:
+            digest = _truncate_compact(prompt_prev, 120)
+
+    title = str(run_summary.get("title") or "").strip() or _truncate_compact(prompt_prev or run_id, 24)
+    role = str(run_summary.get("role") or "").strip() or (
+        "只读探索" if mode == "read-only" else "代码实现"
+    )
+    parent_sid = str(run_summary.get("parent_session_id") or "").strip() or "default"
+    parent_stitle = str(run_summary.get("parent_session_title") or "").strip() or (
+        Path(cwd_str).name if cwd_str else "default"
+    )
+    usage = run_summary.get("usage")
+    if not isinstance(usage, dict):
+        usage = None
+
+    record: dict[str, Any] = {
+        "run_id": run_id,
+        "parent_session_id": parent_sid,
+        "parent_session_title": parent_stitle,
+        "title": title,
+        "role": role,
+        "work_digest": digest,
+        "status": status,
+        "model": run_summary.get("model"),
+        "provider": run_summary.get("provider"),
+        "effort": run_summary.get("effort"),
+        "mode": mode,
+        "started_at": run_summary.get("started_at"),
+        "finished_at": run_summary.get("finished_at"),
+        "duration_sec": run_summary.get("duration_sec"),
+        "tokens_used": run_summary.get("tokens_used"),
+        "usage": usage,
+        "closed": bool(run_summary.get("closed", False)),
+        "closed_at": run_summary.get("closed_at"),
+        "closed_by": run_summary.get("closed_by"),
+        "error": run_summary.get("error"),
+    }
+    if "timeout_sec" in run_summary:
+        raw_timeout = run_summary.get("timeout_sec")
+        if raw_timeout is None:
+            record["timeout_sec"] = None
+        elif not isinstance(raw_timeout, bool):
+            try:
+                record["timeout_sec"] = int(raw_timeout)
+            except (TypeError, ValueError):
+                pass
+    return record
+
+
+def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
+    """Append a compact terminal/archive record for a run to `stats-ledger.jsonl`."""
+    ddir = Path(data_dir)
+    record = _normalize_ledger_record(run_summary)
+    run_id = record["run_id"]
+    if not run_id:
+        return
+
+    ledger_path = ddir / LEDGER_FILENAME
+    sig = (
+        record["status"],
+        record["closed"],
+        record["closed_at"],
+        record["tokens_used"],
+        record["finished_at"],
+    )
+    cache_key = (str(ledger_path), run_id)
+    with _LEDGER_LOCK:
+        if _LEDGER_LAST_SIG.get(cache_key) == sig and ledger_path.is_file():
+            return
+        ddir.mkdir(parents=True, exist_ok=True)
+        with ledger_path.open("a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        _LEDGER_LAST_SIG[cache_key] = sig
+
+
+def read_ledger_records(data_dir: Path) -> list[dict[str, Any]]:
+    """Read `stats-ledger.jsonl`, deduplicating by `run_id` (latest wins) with `expired=True`."""
+    ledger_path = Path(data_dir) / LEDGER_FILENAME
+    if not ledger_path.is_file():
+        return []
+    try:
+        text = ledger_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+
+    by_id: dict[str, dict[str, Any]] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        norm = _normalize_ledger_record(obj)
+        rid = norm["run_id"]
+        if not rid:
+            continue
+        norm["source"] = str(obj.get("source") or "mcp")
+        norm["ok"] = norm["status"] == "done"
+        norm["expired"] = True
+        by_id[rid] = norm
+    return list(by_id.values())
+
+
+def prune_expired_runs(
+    runs_dir: Path,
+    data_dir: Path | None = None,
+    retention_hours: int = 24,
+    active_run_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Archive finished runs older than `retention_hours` to ledger before removing run folders."""
+    if data_dir is None:
+        ddir = Path(runs_dir)
+        rdir = ddir / "runs"
+    else:
+        rdir = Path(runs_dir)
+        ddir = Path(data_dir)
+    if not rdir.is_dir():
+        return {"pruned": 0}
+
+    active_ids = active_run_ids or set()
+    ttl_sec = max(1, int(retention_hours)) * 3600
+    now = time.time()
+    pruned = 0
+
+    for child in list(rdir.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.name in active_ids:
+            continue
+        state_path = child / "state.json"
+        if not state_path.is_file():
+            continue
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if data.get("status") == "running":
+            continue
+
+        ref_ts = data.get("closed_at") or data.get("finished_at") or data.get("started_at")
+        if not isinstance(ref_ts, (int, float)) or float(ref_ts) <= 0:
+            try:
+                ref_ts = state_path.stat().st_mtime
+            except OSError:
+                continue
+
+        if (now - float(ref_ts)) > ttl_sec:
+            data.setdefault("run_id", child.name)
+            append_ledger_record(ddir, data)
+            shutil.rmtree(child, ignore_errors=True)
+            pruned += 1
+
+    return {"pruned": pruned}
+
+
+def compute_archive_metrics(runs_dir: Path, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count closed non-expired runs and compute total byte size inside `runs_dir`."""
+    closed_count = sum(
+        1 for r in runs if (r.get("closed") or r.get("closed_at")) and not r.get("expired")
+    )
+    total_bytes = 0
+    rdir = Path(runs_dir)
+    if rdir.is_dir():
+        for root, _, files in os.walk(rdir):
+            for fname in files:
+                try:
+                    total_bytes += (Path(root) / fname).stat().st_size
+                except OSError:
+                    pass
+    return {
+        "archive_24h_count": closed_count,
+        "archive_storage_bytes": total_bytes,
+    }
+
+
 def _cutoff_timestamp(time_range: str) -> float | None:
     now = datetime.now()
     if time_range == "today":
@@ -583,7 +790,7 @@ def compute_stats(
     codex_home: Path | str | None = None,
     data_dir: Path | str | None = None,
     *,
-    scope: str = "all",
+    scope: str = "antigravity",
     time_range: str = "7d",
     model: str = "",
     provider: str = "",
@@ -594,13 +801,31 @@ def compute_stats(
     if time_range not in ("today", "7d", "30d", "all"):
         raise ValueError("Invalid time_range; expected 'today', '7d', '30d', or 'all'.")
 
+    ddir = get_plugin_data_dir(data_dir)
     cutoff = _cutoff_timestamp(time_range)
     m_filter = model.strip()
     p_filter = provider.strip()
 
+    merged_plugin_runs: list[dict[str, Any]] = []
+    if scope in ("all", "antigravity"):
+        by_run_id: dict[str, dict[str, Any]] = {}
+        for rec in read_ledger_records(ddir):
+            rid = str(rec.get("run_id") or "").strip()
+            if rid:
+                by_run_id[rid] = rec
+        for r in plugin_runs:
+            rid = str(r.get("run_id") or "").strip()
+            if rid:
+                by_run_id[rid] = r
+            else:
+                merged_plugin_runs.append(r)
+        merged_plugin_runs.extend(by_run_id.values())
+    else:
+        merged_plugin_runs = list(plugin_runs)
+
     plugin_session_ids = {
         str(r.get("session_id")).strip()
-        for r in plugin_runs
+        for r in merged_plugin_runs
         if isinstance(r.get("session_id"), str) and str(r.get("session_id")).strip()
     }
 
@@ -617,7 +842,7 @@ def compute_stats(
     selected_items: list[dict[str, Any]] = []
 
     if scope in ("all", "antigravity"):
-        for r in plugin_runs:
+        for r in merged_plugin_runs:
             ts = float(r.get("started_at") or 0)
             if cutoff is not None and ts < cutoff:
                 continue
@@ -627,15 +852,20 @@ def compute_stats(
                 continue
             if p_filter and rprov != p_filter:
                 continue
+            rrole = str(
+                r.get("role") or ("只读探索" if r.get("mode") == "read-only" else "代码实现")
+            )
             selected_items.append(
                 {
                     "kind": "plugin",
                     "id": r.get("run_id") or "",
+                    "parent_session_id": str(r.get("parent_session_id") or "default"),
                     "ts": ts,
                     "status": str(r.get("status") or "unknown"),
                     "model": rmodel or "(default)",
                     "provider": rprov or "(default)",
                     "effort": str(r.get("effort") or "(default)"),
+                    "role": rrole,
                     "tokens_used": int(r.get("tokens_used") or 0),
                     "usage": r.get("usage") if isinstance(r.get("usage"), dict) else None,
                     "duration_sec": r.get("duration_sec"),
@@ -654,6 +884,7 @@ def compute_stats(
                 continue
             if p_filter and sprov != p_filter:
                 continue
+            srole = str(s.get("agent_role") or ("subagent" if s.get("is_subagent") else "user"))
             selected_items.append(
                 {
                     "kind": "codex_local",
@@ -663,6 +894,7 @@ def compute_stats(
                     "model": smodel or "(unknown)",
                     "provider": sprov or "(default)",
                     "effort": str(s.get("effort") or "(default)"),
+                    "role": srole,
                     "tokens_used": int(s.get("tokens_used") or 0),
                     "usage": s.get("usage") if isinstance(s.get("usage"), dict) else None,
                 }
@@ -675,6 +907,7 @@ def compute_stats(
     done_count = 0
     error_count = 0
     cancelled_count = 0
+    antigravity_sessions: set[str] = set()
 
     total_tokens = 0
     input_tokens = 0
@@ -691,25 +924,38 @@ def compute_stats(
     model_map: dict[str, dict[str, Any]] = {}
     provider_map: dict[str, dict[str, Any]] = {}
     effort_map: dict[str, dict[str, Any]] = {}
+    role_map: dict[str, dict[str, Any]] = {}
     recent_errors: list[dict[str, Any]] = []
 
     for item in selected_items:
         is_plugin = item["kind"] == "plugin"
         if is_plugin:
             plugin_count += 1
+            psid = item.get("parent_session_id")
+            if psid:
+                antigravity_sessions.add(psid)
             st = item["status"]
             if st == "running":
                 running_count += 1
             elif st == "done":
                 done_count += 1
-            elif st in ("error", "blocked"):
+            elif st in ("error", "blocked", "partial"):
                 error_count += 1
+                fallback_err = (
+                    "Worker reported blocked"
+                    if st == "blocked"
+                    else (
+                        "Worker reported status=partial"
+                        if st == "partial"
+                        else "Unknown error"
+                    )
+                )
                 recent_errors.append(
                     {
                         "run_id": item["id"],
                         "model": item["model"],
                         "ts": item["ts"],
-                        "error": str(item.get("error") or ("Worker reported blocked" if st == "blocked" else "Unknown error")),
+                        "error": str(item.get("error") or fallback_err),
                     }
                 )
             elif st == "cancelled":
@@ -763,7 +1009,7 @@ def compute_stats(
             dbucket["count"] += 1
             if is_plugin:
                 dbucket["plugin_count"] += 1
-                if item.get("status") in ("error", "blocked"):
+                if item.get("status") in ("error", "blocked", "partial"):
                     dbucket["errors"] += 1
             else:
                 dbucket["local_count"] += 1
@@ -775,6 +1021,7 @@ def compute_stats(
             (model_map, item["model"]),
             (provider_map, item["provider"]),
             (effort_map, item["effort"]),
+            (role_map, item["role"]),
         ):
             b = dim_map.setdefault(
                 dim_key,
@@ -795,7 +1042,7 @@ def compute_stats(
             b["input_tokens"] += in_t
             b["cached_tokens"] += c_t
             b["output_tokens"] += out_t
-            if is_plugin and item.get("status") in ("error", "blocked"):
+            if is_plugin and item.get("status") in ("error", "blocked", "partial"):
                 b["errors"] += 1
             if is_plugin and isinstance(item.get("duration_sec"), (int, float)):
                 b["dur_sum"] += float(item["duration_sec"])
@@ -833,6 +1080,7 @@ def compute_stats(
 
     daily_list = sorted(daily_map.values(), key=lambda d: d["date"])
     recent_errors.sort(key=lambda e: e["ts"], reverse=True)
+    archive_metrics = compute_archive_metrics(ddir / "runs", merged_plugin_runs)
 
     return {
         "scope": scope,
@@ -840,6 +1088,9 @@ def compute_stats(
         "overview": {
             "total_items": len(selected_items),
             "plugin_run_count": plugin_count,
+            "session_count": len(antigravity_sessions),
+            "archive_24h_count": archive_metrics["archive_24h_count"],
+            "archive_storage_bytes": archive_metrics["archive_storage_bytes"],
             "local_user_session_count": local_user_count,
             "local_subagent_count": local_subagent_count,
             "running_count": running_count,
@@ -861,6 +1112,7 @@ def compute_stats(
         "by_model": finalize_dim(model_map),
         "by_provider": finalize_dim(provider_map),
         "by_effort": finalize_dim(effort_map),
+        "by_role": finalize_dim(role_map),
         "recent_errors": recent_errors[:20],
         "warnings": warnings,
     }

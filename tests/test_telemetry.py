@@ -273,6 +273,285 @@ class TestTelemetry(unittest.TestCase):
         self.assertIsNone(stats_local["overview"]["success_rate"])
         self.assertIsNone(stats_local["overview"]["avg_duration_sec"])
 
+    def test_default_antigravity_scope_ignores_sqlite_and_tracks_sessions_roles_archive(self) -> None:
+        now = time.time()
+        # Seed a local SQLite DB with a large token count; default scope="antigravity" must ignore it
+        db_path = self.codex_home / "state_5.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT,
+                created_at INTEGER,
+                updated_at INTEGER,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
+                source TEXT,
+                model_provider TEXT,
+                cwd TEXT,
+                title TEXT,
+                tokens_used INTEGER,
+                model TEXT,
+                reasoning_effort TEXT,
+                thread_source TEXT
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "thr-local-ignored",
+                "",
+                int(now - 30),
+                int(now - 10),
+                int((now - 30) * 1000),
+                int((now - 10) * 1000),
+                "cli",
+                "openai",
+                "E:\\Demo",
+                "Local CLI session",
+                99999,
+                "gpt-5.2-codex",
+                "high",
+                "user",
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        runs_dir = self.data_dir / "runs"
+        plugin_runs = [
+            {
+                "run_id": "r-a1",
+                "status": "done",
+                "started_at": now - 120,
+                "finished_at": now - 100,
+                "closed_at": now - 90,
+                "duration_sec": 20.0,
+                "model": "m1",
+                "provider": "p1",
+                "effort": "high",
+                "role": "coding",
+                "parent_session_id": "conv-a",
+                "parent_session_title": "Session A",
+                "tokens_used": 1000,
+                "usage": {
+                    "input_tokens": 800,
+                    "cached_input_tokens": 400,
+                    "output_tokens": 200,
+                    "reasoning_output_tokens": 30,
+                },
+            },
+            {
+                "run_id": "r-a2",
+                "status": "done",
+                "started_at": now - 80,
+                "finished_at": now - 60,
+                "closed_at": now - 50,
+                "duration_sec": 20.0,
+                "model": "m1",
+                "provider": "p1",
+                "effort": "medium",
+                "role": "review",
+                "parent_session_id": "conv-a",
+                "parent_session_title": "Session A",
+                "tokens_used": 600,
+                "usage": {
+                    "input_tokens": 500,
+                    "cached_input_tokens": 250,
+                    "output_tokens": 100,
+                    "reasoning_output_tokens": 10,
+                },
+            },
+            {
+                "run_id": "r-b1",
+                "status": "done",
+                "started_at": now - 40,
+                "finished_at": now - 20,
+                "duration_sec": 20.0,
+                "model": "m2",
+                "provider": "p1",
+                "effort": "low",
+                "role": "coding",
+                "parent_session_id": "conv-b",
+                "parent_session_title": "Session B",
+                "tokens_used": 500,
+            },
+        ]
+        for run in plugin_runs:
+            rdir = runs_dir / run["run_id"]
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "state.json").write_text(json.dumps(run), encoding="utf-8", newline="\n")
+            (rdir / "events.jsonl").write_text('{"seq":1,"kind":"status"}\n', encoding="utf-8", newline="\n")
+
+        # Default scope must be "antigravity"
+        stats = codex_telemetry.compute_stats(
+            plugin_runs, self.codex_home, self.data_dir, time_range="7d"
+        )
+        self.assertEqual(stats["scope"], "antigravity")
+        ov = stats["overview"]
+        self.assertEqual(ov["plugin_run_count"], 3)
+        self.assertEqual(ov["local_user_session_count"], 0)
+        self.assertEqual(ov["local_subagent_count"], 0)
+        self.assertEqual(ov["total_tokens"], 2100)
+        self.assertEqual(ov["session_count"], 2)
+        self.assertGreaterEqual(ov["archive_24h_count"], 2)
+        self.assertGreater(ov["archive_storage_bytes"], 0)
+
+        by_role = {row["name"]: row for row in stats["by_role"]}
+        self.assertIn("coding", by_role)
+        self.assertIn("review", by_role)
+        self.assertEqual(by_role["coding"]["count"], 2)
+        self.assertEqual(by_role["coding"]["tokens"], 1500)
+        self.assertEqual(by_role["review"]["count"], 1)
+        self.assertEqual(by_role["review"]["tokens"], 600)
+
+        # Ensure zero cost/price fields anywhere in stats keys
+        def collect_keys(obj: object) -> set[str]:
+            keys: set[str] = set()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    keys.add(str(k).lower())
+                    keys.update(collect_keys(v))
+            elif isinstance(obj, list):
+                for item in obj:
+                    keys.update(collect_keys(item))
+            return keys
+
+        all_keys = collect_keys(stats)
+        for forbidden in ("cost", "price", "usd", "amount"):
+            self.assertFalse(any(forbidden in k for k in all_keys), f"Unexpected cost key matching {forbidden}")
+
+    def test_ledger_append_and_read_dedup_by_run_id(self) -> None:
+        now = time.time()
+        codex_telemetry.append_ledger_record(
+            self.data_dir,
+            {
+                "run_id": "run-dup",
+                "status": "done",
+                "started_at": now - 100,
+                "tokens_used": 1000,
+                "role": "coding",
+            },
+        )
+        codex_telemetry.append_ledger_record(
+            self.data_dir,
+            {
+                "run_id": "run-dup",
+                "status": "done",
+                "started_at": now - 100,
+                "tokens_used": 2200,
+                "role": "coding",
+            },
+        )
+        codex_telemetry.append_ledger_record(
+            self.data_dir,
+            {
+                "run_id": "run-other",
+                "status": "error",
+                "started_at": now - 50,
+                "tokens_used": 300,
+                "role": "debug",
+            },
+        )
+
+        records = codex_telemetry.read_ledger_records(self.data_dir)
+        self.assertEqual(len(records), 2)
+        by_id = {r["run_id"]: r for r in records}
+        self.assertEqual(by_id["run-dup"]["tokens_used"], 2200)
+        self.assertEqual(by_id["run-other"]["status"], "error")
+
+    def test_prune_expired_runs_archives_to_ledger_and_compute_stats_includes_it(self) -> None:
+        now = time.time()
+        runs_dir = self.data_dir / "runs"
+
+        expired_run = {
+            "run_id": "run-expired",
+            "status": "done",
+            "started_at": now - 30 * 3600,
+            "finished_at": now - 29 * 3600,
+            "duration_sec": 15.0,
+            "model": "m-old",
+            "provider": "p1",
+            "effort": "medium",
+            "role": "coding",
+            "parent_session_id": "conv-old",
+            "tokens_used": 1500,
+        }
+        fresh_run = {
+            "run_id": "run-fresh",
+            "status": "done",
+            "started_at": now - 2 * 3600,
+            "finished_at": now - 1 * 3600,
+            "duration_sec": 8.0,
+            "model": "m-new",
+            "provider": "p1",
+            "effort": "high",
+            "role": "review",
+            "parent_session_id": "conv-new",
+            "tokens_used": 500,
+        }
+        running_old_run = {
+            "run_id": "run-running-old",
+            "status": "running",
+            "started_at": now - 48 * 3600,
+            "model": "m-new",
+            "provider": "p1",
+            "effort": "high",
+            "role": "coding",
+            "parent_session_id": "conv-new",
+            "tokens_used": 200,
+        }
+
+        for r in (expired_run, fresh_run, running_old_run):
+            rdir = runs_dir / r["run_id"]
+            rdir.mkdir(parents=True, exist_ok=True)
+            (rdir / "state.json").write_text(json.dumps(r), encoding="utf-8", newline="\n")
+            (rdir / "events.jsonl").write_text('{"seq":1,"kind":"status"}\n', encoding="utf-8", newline="\n")
+
+        codex_telemetry.prune_expired_runs(self.data_dir, retention_hours=24)
+
+        self.assertFalse((runs_dir / "run-expired").exists())
+        self.assertTrue((runs_dir / "run-fresh").is_dir())
+        self.assertTrue((runs_dir / "run-running-old").is_dir())
+        self.assertTrue((self.data_dir / "stats-ledger.jsonl").is_file())
+
+        ledger = codex_telemetry.read_ledger_records(self.data_dir)
+        self.assertTrue(any(r.get("run_id") == "run-expired" for r in ledger))
+
+        stats = codex_telemetry.compute_stats(
+            [fresh_run, running_old_run], self.codex_home, self.data_dir, time_range="7d"
+        )
+        self.assertEqual(stats["overview"]["plugin_run_count"], 3)
+        self.assertEqual(stats["overview"]["total_tokens"], 2200)
+
+    def test_partial_status_counted_as_non_done_issue(self) -> None:
+        now = time.time()
+        plugin_runs = [
+            {
+                "run_id": "run-partial-1",
+                "status": "partial",
+                "started_at": now - 30,
+                "duration_sec": 9.5,
+                "model": "m1",
+                "provider": "p1",
+                "effort": "high",
+                "tokens_used": 900,
+                "error": "Only updated backend; tests pending",
+            }
+        ]
+        stats = codex_telemetry.compute_stats(
+            plugin_runs, self.codex_home, self.data_dir, scope="antigravity", time_range="7d"
+        )
+        self.assertEqual(stats["overview"]["done_count"], 0)
+        self.assertEqual(stats["overview"]["error_count"], 1)
+        self.assertEqual(stats["overview"]["success_rate"], 0.0)
+        self.assertTrue(
+            any(err.get("run_id") == "run-partial-1" for err in stats["recent_errors"]),
+            f"Expected run-partial-1 in recent_errors, got: {stats['recent_errors']!r}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
