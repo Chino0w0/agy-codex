@@ -147,6 +147,7 @@ export interface ListRunsPayload {
   closed_24h_count?: number;
   max_concurrent_runs: number;
   enabled?: boolean;
+  intercept_native_subagents?: boolean;
   exclude_orchestrator_models?: boolean;
   retention_hours?: number;
 }
@@ -259,6 +260,7 @@ export interface PresetEntry {
 
 export interface WorkbenchConfig {
   enabled?: boolean;
+  intercept_native_subagents?: boolean;
   exclude_orchestrator_models?: boolean;
   retention_hours?: number;
   defaults: {
@@ -275,6 +277,7 @@ export interface WorkbenchConfig {
     context_window_policy: "same_model_only" | "always_forward" | "never_forward";
     extra_whitelist_keys: string[];
     forwarded_mcp_servers: string[];
+    native_passthrough_subagents?: string[];
     allow_nested_subagents: boolean;
     max_concurrent_runs: number;
     retention_hours?: number;
@@ -319,7 +322,9 @@ export interface WorkbenchPayload {
   max_concurrent_runs: number;
   retention_hours?: number;
   enabled?: boolean;
+  intercept_native_subagents?: boolean;
   exclude_orchestrator_models?: boolean;
+  native_passthrough_subagents?: string[];
   catalog_mode: string;
   catalog_path?: string | null;
   catalog_loaded: boolean;
@@ -347,6 +352,12 @@ export interface ToggleExcludeOrchestratorPayload {
   workbench_config?: WorkbenchConfig;
 }
 
+export interface ToggleInterceptNativePayload {
+  enabled?: boolean;
+  intercept_native_subagents?: boolean;
+  workbench_config?: WorkbenchConfig;
+}
+
 export type ServerToolName =
   | "get_run_events"
   | "list_runs"
@@ -360,5 +371,6 @@ export type ServerToolName =
   | "save_workbench_config"
   | "toggle_codex_enabled"
   | "toggle_exclude_orchestrator"
+  | "toggle_intercept_native_subagents"
   | "run_doctor"
   | "preview_resolved_command";

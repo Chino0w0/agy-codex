@@ -33,7 +33,7 @@ SUBAGENT_ROLE_PREFIX = (
     "Execute this task directly yourself with zero nested subagent spawning. "
     "Before editing, read any specified `context_files` / reference docs and nearby existing files, strictly adhering to existing project architecture, naming conventions, and business behavior. "
     "If business rules are unclear, prerequisites are missing, or existing code conflicts with the task contract, do NOT guess or silently alter unspecified interface fields: immediately return `status: \"blocked\"` and list the exact ambiguities in `risks`. "
-    "If an optional MCP tool referenced in AGENTS.md (such as `fastctx` or `runtime_identity`) is unavailable in this session, "
+    "If an optional MCP tool referenced in AGENTS.md (such as desktop or custom MCP tools) is unavailable in this session, "
     "silently use built-in tools without wasting turns searching for missing tools. "
     "On Windows inside a restricted sandbox, if Git Bash or WSL bash.exe fails with signal-pipe or access errors, "
     "use native PowerShell (pwsh) or Python directly (or any forwarded file/search MCP tools available in this session)."
@@ -142,6 +142,7 @@ DEFAULT_PRESETS: dict[str, dict[str, Any]] = {
 
 DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
     "enabled": True,
+    "intercept_native_subagents": True,
     "exclude_orchestrator_models": True,
     "defaults": {
         "model": None,
@@ -157,6 +158,7 @@ DEFAULT_WORKBENCH_CONFIG: dict[str, Any] = {
         "context_window_policy": "same_model_only",  # same_model_only | always_forward | never_forward
         "extra_whitelist_keys": [],
         "forwarded_mcp_servers": [],
+        "native_passthrough_subagents": ["browser", "image-generator"],
         "allow_nested_subagents": False,
         "max_concurrent_runs": 5,
         "retention_hours": 24,
@@ -310,6 +312,8 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
 
     if "enabled" in raw and raw.get("enabled") is not None:
         cfg["enabled"] = bool(raw.get("enabled"))
+    if "intercept_native_subagents" in raw and raw.get("intercept_native_subagents") is not None:
+        cfg["intercept_native_subagents"] = bool(raw.get("intercept_native_subagents"))
     if "exclude_orchestrator_models" in raw and raw.get("exclude_orchestrator_models") is not None:
         cfg["exclude_orchestrator_models"] = bool(raw.get("exclude_orchestrator_models"))
 
@@ -341,7 +345,9 @@ def _normalize_workbench_config(raw: Any) -> dict[str, Any]:
         cwp = _clean_optional_str(raw_mapping.get("context_window_policy"))
         if cwp in ("same_model_only", "always_forward", "never_forward"):
             cfg["mapping"]["context_window_policy"] = cwp
-        for field_key in ("extra_whitelist_keys", "forwarded_mcp_servers"):
+        for field_key in ("extra_whitelist_keys", "forwarded_mcp_servers", "native_passthrough_subagents"):
+            if field_key not in raw_mapping:
+                continue
             raw_list = raw_mapping.get(field_key)
             if isinstance(raw_list, list):
                 cleaned_list: list[str] = []
@@ -463,7 +469,7 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
     current = load_workbench_config(data_dir)
     merged = copy.deepcopy(current)
 
-    for bool_key in ("enabled", "exclude_orchestrator_models"):
+    for bool_key in ("enabled", "intercept_native_subagents", "exclude_orchestrator_models"):
         if bool_key in payload:
             if not isinstance(payload[bool_key], bool):
                 raise ValueError(f"'{bool_key}' must be a boolean.")
@@ -516,6 +522,7 @@ def save_workbench_config(payload: dict[str, Any], data_dir: Path | str | None =
     for field_key, label in (
         ("extra_whitelist_keys", "extra whitelist key"),
         ("forwarded_mcp_servers", "forwarded_mcp_servers entry"),
+        ("native_passthrough_subagents", "native_passthrough_subagents entry"),
     ):
         for item_k in raw_mapping.get(field_key) or []:
             if not isinstance(item_k, str) or not EXTRA_KEY_RE.match(item_k.strip()):
@@ -856,7 +863,11 @@ def discover_models_and_config(
 
     return {
         "enabled": bool(wb_cfg.get("enabled", True)),
+        "intercept_native_subagents": bool(wb_cfg.get("intercept_native_subagents", True)),
         "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
+        "native_passthrough_subagents": list(
+            (wb_cfg.get("mapping") or {}).get("native_passthrough_subagents") or []
+        ),
         "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
         "models": filtered,
         "all_models_count": len(all_models),

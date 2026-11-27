@@ -123,6 +123,34 @@ def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
         {"path": "mcp_config.json", "sha256": sha256_file(target_plugin / "mcp_config.json")},
     ]
 
+    src_hooks = src_plugin / "hooks.json"
+    if src_hooks.is_file():
+        hooks_cfg = json.loads(src_hooks.read_text(encoding="utf-8"))
+        if os.name == "nt" and isinstance(hooks_cfg, dict):
+            def _adapt_cmd(node: Any) -> Any:
+                if isinstance(node, dict):
+                    return {
+                        k: (
+                            f"python {v[8:]}"
+                            if k == "command" and isinstance(v, str) and v.startswith("python3 ")
+                            else _adapt_cmd(v)
+                        )
+                        for k, v in node.items()
+                    }
+                if isinstance(node, list):
+                    return [_adapt_cmd(item) for item in node]
+                return node
+
+            hooks_cfg = _adapt_cmd(hooks_cfg)
+        (target_plugin / "hooks.json").write_text(
+            json.dumps(hooks_cfg, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        receipt_files.append(
+            {"path": "hooks.json", "sha256": sha256_file(target_plugin / "hooks.json")}
+        )
+
     for sub in ("assets", "rules", "skills", "server"):
         src_sub = src_plugin / sub
         if src_sub.is_dir():
@@ -130,7 +158,7 @@ def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
             for f in sub_files:
                 receipt_files.append({"path": f"{sub}/{f['path']}", "sha256": f["sha256"]})
 
-    for script_name in ("mcp_server.py", "codex_run.py"):
+    for script_name in ("mcp_server.py", "codex_run.py", "routing_hook.py"):
         make_executable(target_plugin / "server" / script_name)
 
     receipt = {
