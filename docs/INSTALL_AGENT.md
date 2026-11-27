@@ -10,10 +10,11 @@
    - **Windows (PowerShell)**：`powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1`（或 `python install.py`）
    - **macOS / Linux**：`sh ./install.sh`（或 `python3 install.py`）
 4. 安装完成后，脚本会自动执行 `doctor` 环境自检并输出 JSON 报告，核对：
-   - `~/.gemini/config/plugins/agy-codex/plugin.json` 已就位；
-   - `python`、`codex_bin`、`config`、`schema` 检查通过（若未登录 Codex 或缺失配置，将 `hint` 清晰告知用户，不要自行捏造凭据）。
-5. 保留用户所有其他插件、账户设置、聊天记录及已有 `~/.codex/worker.config.toml`；不要强制关闭正在承载当前对话的 Antigravity 客户端，也不必手动编辑 `~/.gemini/config/config.json`。
-6. 若 Antigravity 正在运行，新安装的插件会自动被发现；如覆盖升级了已运行中的 MCP Server，可提示用户在 **MCP Servers** 设置中刷新 `agy-codex`（或重新打开 Antigravity）。
+   - `~/.gemini/config/plugins/agy-codex/plugin.json`、`mcp_config.json` 与 `hooks.json` 已就位；
+   - `python`、`codex_bin`、`config`、`schema` 检查通过（若未登录 Codex 或缺失配置，将 `hint` 清晰告知用户，不要自行捏造凭据；钩子会在 Codex 未就绪时自动降级放行原生子代理）。
+5. 开箱即用说明：安装即默认启用通用子代理走 Codex 联动（`enabled=true`, `intercept_native_subagents=true`），可在插件顶部或四个面板右上角的「Codex 联动」按钮随时一键关闭/开启；`browser`、`image-generator` 等原生专有子代理会自动放行。
+6. 保留用户所有其他插件、账户设置、聊天记录及已有 `~/.codex/worker.config.toml`；不要强制关闭正在承载当前对话的 Antigravity 客户端，也不必手动编辑 `~/.gemini/config/config.json`。
+7. 若 Antigravity 正在运行，新安装的插件会自动被发现；如覆盖升级了已运行中的 MCP Server，可提示用户在 **MCP Servers** 设置中刷新 `agy-codex`（或重新打开 Antigravity）。
 
 ## 卸载步骤
 

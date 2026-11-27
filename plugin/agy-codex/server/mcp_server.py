@@ -1756,6 +1756,18 @@ TOOLS_DEF: list[dict[str, Any]] = [
         "_meta": {"ui": {"visibility": ["app"]}},
     },
     {
+        "name": "toggle_intercept_native_subagents",
+        "title": "Toggle Default Native Subagent Takeover",
+        "description": "App-only: toggle whether Agy Codex hooks redirect general native subagent calls by default when enabled.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["enabled"],
+            "properties": {"enabled": {"type": "boolean"}},
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
         "name": "get_stats",
         "title": "Get Unified Usage Stats",
         "description": "App-only: aggregate token, cache hit, duration, and breakdown stats across plugin runs.",
@@ -1791,6 +1803,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "additionalProperties": False,
             "properties": {
                 "enabled": {"type": "boolean"},
+                "intercept_native_subagents": {"type": "boolean"},
                 "exclude_orchestrator_models": {"type": "boolean"},
                 "defaults": {"type": "object"},
                 "mapping": {"type": "object"},
@@ -1877,7 +1890,7 @@ class McpServer:
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
                     },
-                    "serverInfo": {"name": "agy-codex", "version": "1.1.2"},
+                    "serverInfo": {"name": "agy-codex", "version": "1.2.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -2000,6 +2013,7 @@ class McpServer:
                 "runs": runs,
                 "selected_run_id": selected,
                 "enabled": bool(wb_cfg.get("enabled", True)),
+                "intercept_native_subagents": bool(wb_cfg.get("intercept_native_subagents", True)),
                 "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
                 "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
                 "closed_24h_count": closed_24h,
@@ -2039,7 +2053,12 @@ class McpServer:
                 {
                     "runs": runs,
                     "enabled": bool(wb_cfg.get("enabled", True)),
-                    "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
+                    "intercept_native_subagents": bool(
+                        wb_cfg.get("intercept_native_subagents", True)
+                    ),
+                    "exclude_orchestrator_models": bool(
+                        wb_cfg.get("exclude_orchestrator_models", True)
+                    ),
                     "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
                     "closed_24h_count": closed_24h,
                     "active_runs": sum(1 for r in runs if r.get("status") == "running"),
@@ -2108,6 +2127,21 @@ class McpServer:
                 {
                     "exclude_orchestrator_models": bool(
                         saved.get("exclude_orchestrator_models", True)
+                    ),
+                    "workbench_config": saved,
+                }
+            )
+
+        if name == "toggle_intercept_native_subagents":
+            if "enabled" not in arguments or not isinstance(arguments.get("enabled"), bool):
+                raise ValueError("'enabled' boolean is required.")
+            saved = codex_catalog.save_workbench_config(
+                {"intercept_native_subagents": bool(arguments["enabled"])}, ddir
+            )
+            return self._tool_ok(
+                {
+                    "intercept_native_subagents": bool(
+                        saved.get("intercept_native_subagents", True)
                     ),
                     "workbench_config": saved,
                 }

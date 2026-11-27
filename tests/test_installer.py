@@ -63,6 +63,8 @@ class TestInstaller(unittest.TestCase):
 
         installed = self.plugins_dir / "agy-codex"
         self.assertTrue((installed / "plugin.json").is_file())
+        self.assertTrue((installed / "hooks.json").is_file())
+        self.assertTrue((installed / "server" / "routing_hook.py").is_file())
         self.assertTrue((installed / "rules" / "AGENTS.md").is_file())
         self.assertTrue((installed / "skills" / "codex-dispatch" / "SKILL.md").is_file())
         self.assertTrue((installed / ".agy-codex-install.json").is_file())
@@ -71,6 +73,16 @@ class TestInstaller(unittest.TestCase):
         mcp_cfg = json.loads((installed / "mcp_config.json").read_text(encoding="utf-8"))
         expected_cmd = "python" if os.name == "nt" else "python3"
         self.assertEqual(mcp_cfg["mcpServers"]["codex"]["command"], expected_cmd)
+
+        hooks_cfg = json.loads((installed / "hooks.json").read_text(encoding="utf-8"))
+        router = hooks_cfg["agy-codex-router"]
+        self.assertTrue(router["enabled"])
+        self.assertTrue(router["SessionStart"][0]["command"].startswith(f"{expected_cmd} server/routing_hook.py"))
+        self.assertTrue(
+            router["PreToolUse"][0]["hooks"][0]["command"].startswith(
+                f"{expected_cmd} server/routing_hook.py"
+            )
+        )
 
         # Preserves existing worker.config.toml & plugin data
         self.assertIn("custom user worker", existing_worker.read_text(encoding="utf-8"))

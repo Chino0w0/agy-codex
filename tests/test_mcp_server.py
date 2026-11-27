@@ -129,7 +129,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_protocol_and_visibility_separation(self) -> None:
         init = self.server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "agy-codex")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "1.1.2")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "1.2.0")
 
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
@@ -894,6 +894,22 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.assertEqual(cfg["defaults"]["effort"], "high")
         self.assertEqual(cfg["mapping"]["retention_hours"], 48)
         self.assertEqual(cfg["mapping"]["max_concurrent_runs"], 3)
+
+        toggled_int = self._call_tool_raw(
+            135, "toggle_intercept_native_subagents", {"enabled": False}
+        )["result"]["structuredContent"]
+        self.assertIs(toggled_int["intercept_native_subagents"], False)
+
+        saved_pass = self._call_tool_raw(
+            136,
+            "save_workbench_config",
+            {"mapping": {"native_passthrough_subagents": ["browser", "custom-native"]}},
+        )["result"]["structuredContent"]
+        self.assertEqual(
+            saved_pass["workbench_config"]["mapping"]["native_passthrough_subagents"],
+            ["browser", "custom-native"],
+        )
+        self.assertIs(saved_pass["workbench_config"]["intercept_native_subagents"], False)
 
     def test_stdio_get_workbench_config_and_doctor_no_deadlock(self) -> None:
         env = os.environ.copy()

@@ -12,20 +12,20 @@ description: >-
 
 让 **Antigravity** 担任架构规划、任务拆解、Code Review 与最终验收者，将有界执行任务精准派给本机 **Codex CLI** 中指定的模型与推理档位。
 
-## 何时派给 Codex vs Antigravity 亲自处理
+## 何时派给 Codex vs Antigravity 亲自/原生处理
 
-- **派给 Codex**：边界清晰的模块实现、样板/脚本生成、有明确复现步骤的 Bug 修复、独立只读代码调研，或需要跨模型视角验证的任务。
-- **Antigravity 亲自做**：1–2 行的极小修改、需要浏览器交互或用户多轮澄清的流程、全局架构决策与最终 `git diff` 审查验收。
+- **默认一律派给 Codex**（开关 `enabled=true` 且就绪时）：边界清晰的模块实现、样板/脚本生成、有明确复现步骤的 Bug 修复、独立只读代码调研（含原本走 `research` 的任务）、以及跨模型验证/审查任务。
+- **Antigravity 亲自/原生处理**：1–2 行的极小修改、需要 `browser` / `image-generator` 等 Antigravity 专有子代理的交互任务、全局架构决策与最终 `git diff` 审查验收。
 - **可随时开关尊重用户**：当用户或工具返回 Codex 子代理已暂停（`enabled=false`）时，立刻改用 Antigravity 原生子 Agent 完成任务，不得强行绕过开关。
 
 ## 标准派发流程
 
-### 1. 模型与预设发现（首次或不确定时必做）
+### 1. 模型与预设发现（合规默认优先沿用）
 调用 `list_codex_models(query=..., provider=...)` 获取：
 - 可见模型（`visibility != "hide"`，含 `custom_models`、`model_catalog_json`、`models_cache.json` 与 `config.toml`）、支持的 `supported_reasoning_levels` 与 `context_window`；
 - 已脱敏的 `providers`、`presets`（默认包含 `explore` / `coding` / `frontend` / `review` / `debug` / `fast`，含各自 `when_to_use`）与 `excluded_models`（不要主动把已排除模型当默认值或回退候选）。
 - **Orchestrator 防嵌套排除**：遵循 `exclude_orchestrator_models=true`，绝不选择 Orchestrator 编排类模型作为 Codex 子代理目标。
-- **用户选型优先**：如果用户在当前请求中没有明确指定具体模型，且所用 `preset` 与 `workbench_config.defaults.model` 也未绑定具体模型（均为 `null`），派发 `start_codex_task` 前先展示可见候选模型与支持档位让用户选定（或建议用「模型与配置」预设绑定），再按用户选择执行。
+- **合规默认模型优先**：解析顺序为「用户当轮指定模型 -> `preset.model` -> 工作台 `defaults.model` -> 用户 `~/.codex/config.toml` 合规默认模型（`effective_defaults.model` 且未被排除/非 Orchestrator）」。能解析出合规模型时直接派发；仅当四层均未解析出合规模型时，才先列候选模型与档位让用户选定后再派发 `start_codex_task`。
 
 ### 2. 单任务粒度、档位纪律与六段式自包含业务上下文
 
