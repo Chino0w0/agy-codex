@@ -71,10 +71,17 @@ export interface IdentityInfo {
   preset?: string | null;
 }
 
+export interface WorktreeInfo {
+  path: string;
+  branch: string;
+  base_repo: string;
+  cleanup_command: string;
+}
+
 export interface RunSnapshot {
   run_id: string;
   source?: "mcp" | "cli";
-  status: "running" | "done" | "error" | "cancelled" | "blocked";
+  status: "running" | "done" | "partial" | "error" | "cancelled" | "blocked";
   cwd: string;
   mode: string;
   config_mode: string;
@@ -83,68 +90,77 @@ export interface RunSnapshot {
   effort?: string | null;
   preset?: string | null;
   persist?: boolean;
+  pid?: number | null;
   requested?: IdentityInfo;
   effective?: IdentityInfo;
   observed?: { model?: string | null; effort?: string | null };
   warnings?: string[];
+  prompt?: string | null;
   prompt_preview?: string;
   started_at?: number;
+  updated_at?: number;
   finished_at?: number | null;
   elapsed_sec?: number;
   duration_sec?: number | null;
+  timeout_sec?: number;
+  remaining_timeout_sec?: number | null;
   session_id?: string | null;
   tokens_used?: number | null;
   usage?: UsageInfo | null;
-  worktree?: { path: string; branch: string; base_repo: string; cleanup_command: string } | null;
+  worktree?: WorktreeInfo | null;
   result?: HandoffResult | string | null;
   error?: string | null;
   events?: TimelineEvent[];
   latest_seq?: number;
-}
-
-export interface LocalSessionSummary {
-  thread_id: string;
-  source: "codex_local";
-  thread_kind: string;
-  is_subagent: boolean;
-  parent_thread_id?: string | null;
-  child_threads?: Array<{ child_thread_id: string; status: string }>;
-  model?: string | null;
-  provider?: string | null;
-  effort?: string | null;
-  cwd: string;
-  git_branch?: string;
+  // v1.1 lifecycle & Antigravity linkage fields
   title?: string;
-  originator?: string;
-  created_at?: number;
-  updated_at?: number;
-  tokens_used?: number;
-  usage?: UsageInfo | null;
-  last_token_usage?: UsageInfo | null;
-  model_context_window?: number | null;
+  role?: string;
+  work_digest?: string;
+  parent_session_id?: string | null;
+  parent_session_title?: string | null;
+  closed?: boolean;
+  closed_at?: number | null;
+  closed_by?: string | null;
+  expired?: boolean;
+  ttl_remaining_sec?: number | null;
 }
 
-export interface LocalSessionDetail extends LocalSessionSummary {
-  context_percent?: number | null;
-  context_raw_ratio?: number | null;
-  child_details?: Array<{
-    thread_id: string;
-    status: string;
-    title: string;
-    model?: string | null;
-    effort?: string | null;
-    thread_kind?: string;
-    tokens_used?: number;
-  }>;
-  snippets?: Array<{ role: string; text: string }>;
-  warnings?: string[];
+export interface HistorySessionGroup {
+  session_id: string;
+  title: string;
+  workspace?: string;
+  updated_at?: number | string | null;
+  active_count: number;
+  closed_count: number;
+  runs: RunSnapshot[];
+}
+
+export interface HistoryPayload {
+  sessions: HistorySessionGroup[];
+  total_runs: number;
+  retention_hours?: number;
+}
+
+export interface ListRunsPayload {
+  runs: RunSnapshot[];
+  active_runs: number;
+  closed_24h_count?: number;
+  max_concurrent_runs: number;
+  enabled?: boolean;
+  exclude_orchestrator_models?: boolean;
+  retention_hours?: number;
+}
+
+export interface CloseRunPayload {
+  closed_ids?: string[];
+  runs?: RunSnapshot[];
+  active_runs?: number;
+  closed_24h_count?: number;
 }
 
 export interface StatsOverview {
   total_items: number;
   plugin_run_count: number;
-  local_user_session_count: number;
-  local_subagent_count: number;
   running_count: number;
   done_count: number;
   error_count: number;
@@ -156,9 +172,12 @@ export interface StatsOverview {
   output_tokens: number;
   reasoning_output_tokens: number;
   cache_hit_rate: number | null;
-  cache_coverage_count: number;
+  cache_coverage_count?: number;
   avg_duration_sec: number | null;
   total_duration_sec: number;
+  session_count?: number;
+  archive_24h_count?: number;
+  archive_storage_bytes?: number;
 }
 
 export interface StatsDimRow {
@@ -171,22 +190,23 @@ export interface StatsDimRow {
   cache_hit_rate: number | null;
   errors: number;
   avg_duration_sec: number | null;
+  success_rate?: number | null;
 }
 
 export interface StatsPayload {
-  scope: "all" | "antigravity" | "codex_local";
+  scope: "antigravity";
   range: "today" | "7d" | "30d" | "all";
   overview: StatsOverview;
   daily: Array<{
     date: string;
     count: number;
-    plugin_count: number;
-    local_count: number;
+    plugin_count?: number;
     tokens: number;
     cached_tokens: number;
     errors: number;
   }>;
   by_model: StatsDimRow[];
+  by_role?: StatsDimRow[];
   by_provider: StatsDimRow[];
   by_effort: StatsDimRow[];
   recent_errors: Array<{ run_id: string; model: string; ts: number; error: string }>;
@@ -203,6 +223,9 @@ export interface CatalogModel {
   context_window?: number | null;
   source: string;
   excluded?: boolean;
+  tool_mode?: string | null;
+  supports_search_tool?: boolean | null;
+  orchestrator_excluded?: boolean;
 }
 
 export interface ProviderInfo {
@@ -235,6 +258,9 @@ export interface PresetEntry {
 }
 
 export interface WorkbenchConfig {
+  enabled?: boolean;
+  exclude_orchestrator_models?: boolean;
+  retention_hours?: number;
   defaults: {
     model?: string | null;
     provider?: string | null;
@@ -251,6 +277,7 @@ export interface WorkbenchConfig {
     forwarded_mcp_servers: string[];
     allow_nested_subagents: boolean;
     max_concurrent_runs: number;
+    retention_hours?: number;
   };
   excluded_models: string[];
   custom_models: Array<{
@@ -290,6 +317,9 @@ export interface WorkbenchPayload {
   mcp_servers?: McpServerInfo[];
   presets: Record<string, PresetEntry>;
   max_concurrent_runs: number;
+  retention_hours?: number;
+  enabled?: boolean;
+  exclude_orchestrator_models?: boolean;
   catalog_mode: string;
   catalog_path?: string | null;
   catalog_loaded: boolean;
@@ -310,3 +340,25 @@ export interface CommandPreviewPayload {
   warnings: string[];
   redacted_overrides?: Record<string, unknown>;
 }
+
+export interface ToggleExcludeOrchestratorPayload {
+  enabled?: boolean;
+  exclude_orchestrator_models?: boolean;
+  workbench_config?: WorkbenchConfig;
+}
+
+export type ServerToolName =
+  | "get_run_events"
+  | "list_runs"
+  | "get_history"
+  | "close_run"
+  | "reopen_run"
+  | "cancel_run"
+  | "send_followup"
+  | "get_stats"
+  | "get_workbench_config"
+  | "save_workbench_config"
+  | "toggle_codex_enabled"
+  | "toggle_exclude_orchestrator"
+  | "run_doctor"
+  | "preview_resolved_command";

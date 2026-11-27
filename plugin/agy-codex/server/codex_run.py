@@ -118,7 +118,31 @@ def build_exec_env() -> dict[str, str]:
     env["PATH"] = os.pathsep.join(path_parts)
     env.setdefault("PYTHONUTF8", "1")
     env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    raw_git_count = env.get("GIT_CONFIG_COUNT")
+    try:
+        git_count = max(0, int(str(raw_git_count).strip())) if raw_git_count is not None else 0
+    except ValueError:
+        git_count = 0
+    has_safe_dir = any(
+        (env.get(f"GIT_CONFIG_KEY_{i}") or "").strip().lower() == "safe.directory"
+        and env.get(f"GIT_CONFIG_VALUE_{i}") == "*"
+        for i in range(git_count)
+    )
+    if not has_safe_dir:
+        env[f"GIT_CONFIG_KEY_{git_count}"] = "safe.directory"
+        env[f"GIT_CONFIG_VALUE_{git_count}"] = "*"
+        env["GIT_CONFIG_COUNT"] = str(git_count + 1)
+
     return env
+
+
+def _silent_subprocess_kwargs() -> dict[str, Any]:
+    """Detach child stdin so worker threads never deadlock on Windows stdio pipes."""
+    kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL}
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kwargs
 
 
 def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> None:
@@ -135,7 +159,7 @@ def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> N
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 timeout=5,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **_silent_subprocess_kwargs(),
             )
             return
         except Exception:
@@ -178,6 +202,7 @@ def run_git(cwd: Path, args: list[str], timeout: int = 10) -> subprocess.Complet
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        **_silent_subprocess_kwargs(),
     )
 
 
@@ -293,6 +318,35 @@ def truncate_text(text: str, limit: int = 100) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: limit - 3] + "..."
+
+
+SHORT_TITLE_PREFIX_RE = re.compile(
+    r"^(?:\[[^\]\r\n]*\]|(?:任务|目标|task|goal)\s*[:：])\s*",
+    re.IGNORECASE,
+)
+
+
+def derive_short_title(prompt: str, limit: int = 16) -> str:
+    """Derive a concise title by stripping stacked boilerplate prefixes and collapsing whitespace."""
+    raw = str(prompt or "").strip()
+    if not raw:
+        return ""
+    cleaned = raw
+    while cleaned:
+        match = SHORT_TITLE_PREFIX_RE.match(cleaned)
+        if not match:
+            break
+        cleaned = cleaned[match.end() :].lstrip()
+    if not cleaned:
+        cleaned = raw
+    collapsed = " ".join(cleaned.split())
+    if limit <= 0:
+        return ""
+    if len(collapsed) <= limit:
+        return collapsed
+    if limit > 3:
+        return collapsed[: limit - 3] + "..."
+    return collapsed[:limit]
 
 
 def strip_shell_wrapper(command: str) -> str:
@@ -440,6 +494,7 @@ def build_codex_command(
     search: bool = False,
     add_dir: list[str] | None = None,
     allow_ephemeral: bool = True,
+    allow_thread_source: bool = True,
     allow_schema: bool = True,
     allow_extra_dirs: bool = True,
     allow_search: bool = True,
@@ -535,6 +590,8 @@ def build_codex_command(
             cmd.extend(["--add-dir", str(Path(extra_dir).resolve())])
     if check_git and not is_git_repo(cwd):
         cmd.append("--skip-git-repo-check")
+    if allow_thread_source and subcommand == "exec":
+        cmd.extend(["--thread-source", "subagent"])
     if allow_ephemeral and not persist:
         cmd.append("--ephemeral")
     if allow_schema and not raw and DEFAULT_SCHEMA.is_file():
@@ -552,15 +609,28 @@ class PanelStateSyncer:
     def __init__(self, runs_dir: Path, meta: dict[str, Any]) -> None:
         self.run_id = str(meta["run_id"])
         self.state_path = runs_dir / self.run_id / "state.json"
+        self.events_path = runs_dir / self.run_id / "events.jsonl"
         self.started_at = float(meta.get("started_at") or time.time())
+        self._last_state_write = 0.0
         self.events: list[dict[str, Any]] = []
         self.seq = 0
+        prompt_str = str(meta.get("prompt") or "")
+        cwd_str = str(meta.get("cwd") or ".")
         self.state: dict[str, Any] = {
             "run_id": self.run_id,
             "source": "cli",
             "pid": None,
             "ok": False,
             "status": "running",
+            "title": meta.get("title") or derive_short_title(prompt_str, 16),
+            "role": meta.get("role")
+            or ("只读探索" if meta.get("mode") == "read-only" else "代码实现"),
+            "work_digest": truncate_text(prompt_str, 120),
+            "parent_session_id": meta.get("parent_session_id") or "default",
+            "parent_session_title": meta.get("parent_session_title") or Path(cwd_str).name,
+            "closed": False,
+            "closed_at": None,
+            "closed_by": None,
             "cwd": meta.get("cwd"),
             "mode": meta.get("mode"),
             "config_mode": meta.get("config_mode"),
@@ -573,7 +643,7 @@ class PanelStateSyncer:
             "effective": meta.get("effective"),
             "observed": {"model": None, "effort": None},
             "warnings": meta.get("warnings") or [],
-            "prompt_preview": str(meta.get("prompt") or "")[:180],
+            "prompt_preview": prompt_str[:180],
             "started_at": self.started_at,
             "finished_at": None,
             "elapsed_sec": 0.0,
@@ -589,15 +659,19 @@ class PanelStateSyncer:
             "output_file": meta.get("output_file"),
         }
 
-    def write(self) -> None:
+    def write(self, *, force: bool = False) -> None:
+        now_mono = time.monotonic()
+        if not force and (now_mono - self._last_state_write) < 0.25:
+            return
         try:
             self.state_path.parent.mkdir(parents=True, exist_ok=True)
             if self.state["duration_sec"] is None:
                 self.state["elapsed_sec"] = round(max(0.0, time.time() - self.started_at), 2)
-            payload = {**self.state, "events": self.events, "seq": self.seq}
+            payload = {**self.state, "seq": self.seq}
             codex_catalog.atomic_write_text(
                 self.state_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
             )
+            self._last_state_write = time.monotonic()
         except OSError:
             pass
 
@@ -606,6 +680,12 @@ class PanelStateSyncer:
         payload["seq"] = self.seq
         payload.setdefault("ts", round(max(0.0, time.time() - self.started_at), 2))
         self.events.append(payload)
+        try:
+            self.events_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.events_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def was_cancelled_externally(self) -> bool:
         try:
@@ -677,7 +757,7 @@ def run_codex(
     write_prompt_to_stdin(proc, stdin_prompt)
     if syncer is not None:
         syncer.state["pid"] = proc.pid
-        syncer.write()
+        syncer.write(force=True)
 
     def on_timeout() -> None:
         nonlocal timed_out
@@ -718,7 +798,7 @@ def run_codex(
                             if syncer is not None:
                                 syncer.state["session_id"] = tid
                                 syncer.append_event({"kind": "session", "session_id": tid})
-                                syncer.write()
+                                syncer.write(force=True)
                     elif etype in ("item.started", "item.completed"):
                         item = event.get("item") or {}
                         item_id = str(item.get("id") or "")
@@ -841,14 +921,14 @@ def run_codex(
                         if syncer is not None:
                             syncer.state["error"] = str(msg)
                             syncer.append_event({"kind": "error", "message": str(msg)})
-                            syncer.write()
+                            syncer.write(force=True)
                     continue
 
             if "ERROR" in stripped or "fatal" in stripped.lower():
                 emit_progress(quiet, truncate_text(stripped, 160))
                 if syncer is not None:
                     syncer.append_event({"kind": "log", "text": stripped})
-                    syncer.write()
+                    syncer.write(force=True)
 
         if timed_out and proc.poll() is None:
             try:
@@ -935,6 +1015,7 @@ def run_codex(
             else:
                 err_msg = syncer.state.get("error") or handoff_summary or "Worker reported status=failed."
 
+        digest_src = handoff_summary or err_msg or str(syncer.state.get("work_digest") or "")
         syncer.state.update(
             {
                 "pid": None,
@@ -942,6 +1023,7 @@ def run_codex(
                 "status": final_status,
                 "model": resolved_model,
                 "observed": {"model": obs_model, "effort": obs_effort},
+                "work_digest": truncate_text(digest_src, 120),
                 "finished_at": time.time(),
                 "duration_sec": duration_sec,
                 "elapsed_sec": duration_sec,
@@ -953,7 +1035,7 @@ def run_codex(
                 "error": err_msg,
             }
         )
-        syncer.write()
+        syncer.write(force=True)
     else:
         if timed_out or exit_code != 0:
             final_status = "error"
@@ -1057,6 +1139,7 @@ def doctor_report(
             errors="replace",
             env=env,
             timeout=10,
+            **_silent_subprocess_kwargs(),
         )
         ver_str = (ver_proc.stdout or ver_proc.stderr).strip()
         codex_ok = ver_proc.returncode == 0
@@ -1160,7 +1243,15 @@ def doctor_report(
     git_ver: str | None = None
     if git_bin:
         try:
-            gp = subprocess.run([git_bin, "--version"], capture_output=True, text=True, timeout=5)
+            gp = subprocess.run(
+                [git_bin, "--version"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                **_silent_subprocess_kwargs(),
+            )
             git_ok = gp.returncode == 0
             git_ver = gp.stdout.strip()
         except Exception:

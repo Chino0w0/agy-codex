@@ -1,169 +1,223 @@
-import type { StatsPayload } from "../types";
-import { escapeHtml, formatDuration, formatNumber, formatTimestamp, renderDailySvgChart } from "../utils";
+import type { StatsDimRow, StatsPayload } from "../types";
+import {
+  escapeHtml,
+  formatBytes,
+  formatDuration,
+  formatNumber,
+  formatTimestamp,
+  renderCodexToggleButton,
+  renderDailySvgChart,
+} from "../utils";
 
 export interface StatsViewState {
-  scope: "all" | "antigravity" | "codex_local";
   range: "today" | "7d" | "30d" | "all";
   stats: StatsPayload | null;
   loading: boolean;
+  loadError?: string | null;
+  enabled: boolean;
 }
 
-export function renderStatsTab(st: StatsViewState): string {
-  const filterHtml = `<div class="filter-bar" style="margin-bottom:8px">
-    <div style="display:flex;gap:5px;flex-wrap:wrap">
-      ${(
-        [
-          ["all", "全部 Codex"],
-          ["antigravity", "仅 Antigravity"],
-          ["codex_local", "仅本机 Codex"],
-        ] as const
-      )
-        .map(
-          ([k, label]) =>
-            `<button class="pill${st.scope === k ? " active" : ""}" data-stats-scope="${k}">${label}</button>`,
-        )
-        .join("")}
-    </div>
-    <div style="display:flex;gap:5px;flex-wrap:wrap;margin-left:auto">
-      ${(
-        [
-          ["today", "今天"],
-          ["7d", "近 7 天"],
-          ["30d", "近 30 天"],
-          ["all", "全部"],
-        ] as const
-      )
-        .map(
-          ([k, label]) =>
-            `<button class="pill${st.range === k ? " active" : ""}" data-stats-range="${k}">${label}</button>`,
-        )
-        .join("")}
+function renderDimBreakdown(
+  rows: StatsDimRow[],
+  totalCount: number,
+  emptyText: string,
+  fillClass: string,
+): string {
+  if (!rows || rows.length === 0) {
+    return `<div class="empty-hint">${escapeHtml(emptyText)}</div>`;
+  }
+  const denom = Math.max(1, totalCount, ...rows.map((r) => r.count));
+  return `<div class="breakdown-list">
+    ${rows
+      .slice(0, 12)
+      .map((row) => {
+        const pct = Math.round((row.count / denom) * 100);
+        const sRate =
+          typeof row.success_rate === "number"
+            ? `${row.success_rate}%`
+            : row.count > 0
+              ? `${Math.round(((row.count - (row.errors || 0)) / row.count) * 100)}%`
+              : "-";
+        const avgDur =
+          row.avg_duration_sec !== null && row.avg_duration_sec !== undefined
+            ? `均 ${formatDuration(row.avg_duration_sec)}`
+            : "";
+        const cacheTxt =
+          row.cache_hit_rate !== null && row.cache_hit_rate !== undefined
+            ? `缓存 ${row.cache_hit_rate}%`
+            : "";
+        const meta = [
+          `${row.count} 次`,
+          `成功 ${sRate}`,
+          avgDur,
+          cacheTxt,
+          row.tokens > 0 ? `${formatNumber(row.tokens)} tok` : "",
+        ]
+          .filter(Boolean)
+          .join(" | ");
+        return `<div class="breakdown-item">
+          <div class="breakdown-row-head">
+            <span class="breakdown-name">${escapeHtml(row.name)}</span>
+            <span class="breakdown-meta tabular-nums">${escapeHtml(meta)}</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill ${fillClass}" style="width:${pct}%"></div>
+          </div>
+        </div>`;
+      })
+      .join("")}
+  </div>`;
+}
+
+export function renderStatsView(st: StatsViewState): string {
+  const ranges: Array<{ key: StatsViewState["range"]; label: string }> = [
+    { key: "today", label: "今日" },
+    { key: "7d", label: "近 7 天" },
+    { key: "30d", label: "近 30 天" },
+    { key: "all", label: "全部" },
+  ];
+
+  const headerHtml = `<div class="stats-header">
+    <div class="trace-muted">仅统计 Antigravity 与 Codex 联动子 Agent 数据（永久账本 stats-ledger.jsonl，不含费用估算）</div>
+    <div class="stats-header-right">
+      ${renderCodexToggleButton(st.enabled, "inline")}
+      <div class="seg-group" role="group" aria-label="统计周期">
+        ${ranges
+          .map(
+            (rg) =>
+              `<button type="button" class="seg-btn${st.range === rg.key ? " is-active" : ""}" data-stats-range="${rg.key}">${escapeHtml(rg.label)}</button>`,
+          )
+          .join("")}
+      </div>
     </div>
   </div>`;
 
   if (!st.stats) {
-    return `${filterHtml}<div class="empty-hint">${st.loading ? "正在聚合统计数据..." : "暂无统计数据。"}</div>`;
+    if (st.loadError) {
+      return `<div class="scroll-y custom-scroll">
+        <div class="page-stack">
+          ${headerHtml}
+          <div class="load-error-card">
+            <div>加载统计数据失败: ${escapeHtml(st.loadError)}</div>
+            <div class="load-error-actions">
+              <button type="button" id="retry-stats-btn" class="btn btn-primary btn-sm">重试加载</button>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+    return `<div class="scroll-y custom-scroll">
+      ${headerHtml}
+      <div class="empty-hint">${st.loading ? "正在聚合联动统计数据..." : "暂无联动统计数据。"}</div>
+    </div>`;
   }
 
   const s = st.stats;
   const ov = s.overview;
-  const maxModelTok = Math.max(1, ...s.by_model.map((m) => m.tokens));
+  const dispatchCount = ov.plugin_run_count ?? ov.total_items ?? 0;
+  const issueCount = (ov.error_count || 0) + (ov.cancelled_count || 0);
+  const sessionCount = ov.session_count ?? 0;
+  const archive24h = ov.archive_24h_count ?? 0;
+  const archiveBytes = ov.archive_storage_bytes ?? 0;
 
   const warnHtml =
     s.warnings && s.warnings.length > 0
-      ? `<div class="banner-warn" style="margin-bottom:8px">${s.warnings.map((w) => escapeHtml(w)).join("<br/>")}</div>`
+      ? `<div class="banner-warn">${s.warnings.map((w) => escapeHtml(w)).join("<br/>")}</div>`
       : "";
 
-  const kpiHtml = `<div class="kpi-grid">
+  const kpiHtml = `<div class="stats-kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label">总任务 / 会话</div>
-      <div class="kpi-val">${ov.total_items}</div>
-      <div class="kpi-sub">插件 ${ov.plugin_run_count} · 本地 ${ov.local_user_session_count} (+${ov.local_subagent_count} 子线程)</div>
+      <div class="kpi-label">累计联动派发</div>
+      <div class="kpi-val tabular-nums">${dispatchCount} 次</div>
+      <div class="kpi-sub">${sessionCount > 0 ? `跨越 ${sessionCount} 个 Antigravity 会话` : `进行中 ${ov.running_count} 个`}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">累计 Token</div>
-      <div class="kpi-val">${formatNumber(ov.total_tokens)}</div>
-      <div class="kpi-sub">输入 ${formatNumber(ov.input_tokens)} · 输出 ${formatNumber(ov.output_tokens)}</div>
+      <div class="kpi-label">任务成功率</div>
+      <div class="kpi-val tabular-nums">${ov.success_rate !== null ? `${ov.success_rate}%` : "-"}</div>
+      <div class="kpi-sub is-success">完成 ${ov.done_count} / 受阻异常 ${issueCount}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">缓存命中率</div>
-      <div class="kpi-val">${ov.cache_hit_rate !== null ? `${ov.cache_hit_rate}%` : "-"}</div>
-      <div class="kpi-sub">命中 ${formatNumber(ov.cached_input_tokens)} (${ov.cache_coverage_count} 样本)</div>
+      <div class="kpi-label">联动 Token 用量</div>
+      <div class="kpi-val tabular-nums">${formatNumber(ov.total_tokens || 0)}</div>
+      <div class="kpi-sub">平均缓存命中 ${ov.cache_hit_rate !== null ? `${ov.cache_hit_rate}%` : "-"}</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label">插件成功率 / 平均耗时</div>
-      <div class="kpi-val">${ov.success_rate !== null ? `${ov.success_rate}%` : "-"}</div>
-      <div class="kpi-sub">${ov.avg_duration_sec !== null ? `均值 ${formatDuration(ov.avg_duration_sec)}` : "仅插件任务口径"}</div>
+      <div class="kpi-label">24h 可追溯归档</div>
+      <div class="kpi-val tabular-nums">${archive24h} 条可查</div>
+      <div class="kpi-sub">临时日志 ${formatBytes(archiveBytes)}</div>
     </div>
   </div>`;
 
   const trendHtml = `<div class="section-card">
     <div class="section-title">
-      <span>每日 Token 趋势 (近 14 个活跃日)</span>
-      <span class="trace-meta">蓝色=总输入/输出 · 绿色=缓存命中</span>
+      <span>Token 消耗与缓存命中趋势</span>
+      <div class="chart-legend">
+        <span class="legend-item"><span class="legend-swatch is-info"></span>总输入/输出</span>
+        <span class="legend-item"><span class="legend-swatch is-success"></span>缓存命中</span>
+      </div>
     </div>
     ${renderDailySvgChart(s.daily)}
   </div>`;
 
-  const modelRows =
-    s.by_model.length === 0
-      ? `<div class="empty-hint">暂无模型分布记录。</div>`
-      : `<table class="data-table">
-          <thead>
-            <tr>
-              <th>模型</th>
-              <th>次数</th>
-              <th>Token 占比</th>
-              <th>缓存命中</th>
-              <th>失败</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${s.by_model
-              .slice(0, 15)
-              .map((m) => {
-                const pct = Math.round((m.tokens / maxModelTok) * 100);
-                return `<tr>
-                  <td><code>${escapeHtml(m.name)}</code></td>
-                  <td>${m.count}</td>
-                  <td style="min-width:120px">
-                    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
-                      <span>${formatNumber(m.tokens)}</span>
-                    </div>
-                    <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
-                  </td>
-                  <td>${m.cache_hit_rate !== null ? `${m.cache_hit_rate}%` : "-"}</td>
-                  <td>${m.errors > 0 ? `<span class="badge badge-err">${m.errors}</span>` : "0"}</td>
-                </tr>`;
-              })
-              .join("")}
-          </tbody>
-        </table>`;
-
-  const dimChips = `<div class="section-card">
-    <div class="section-title"><span>Provider 与推理档位分布</span></div>
-    <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:6px">
-      <span class="trace-meta">Provider:</span>
-      ${s.by_provider.map((p) => `<span class="badge">${escapeHtml(p.name)}: ${p.count} (${formatNumber(p.tokens)})</span>`).join("") || `<span class="trace-meta">-</span>`}
+  const breakdownHtml = `<div class="stats-breakdown-grid">
+    <div class="section-card">
+      <div class="section-title"><span>按 Codex 模型分布</span></div>
+      ${renderDimBreakdown(s.by_model || [], dispatchCount, "暂无模型分布记录。", "is-info")}
     </div>
-    <div style="display:flex;flex-wrap:wrap;gap:6px">
-      <span class="trace-meta">Effort:</span>
-      ${s.by_effort.map((e) => `<span class="badge badge-info">${escapeHtml(e.name)}: ${e.count} (${formatNumber(e.tokens)})</span>`).join("") || `<span class="trace-meta">-</span>`}
+    <div class="section-card">
+      <div class="section-title"><span>按子 Agent 角色分布</span></div>
+      ${renderDimBreakdown(s.by_role || [], dispatchCount, "暂无角色分布记录。", "is-success")}
     </div>
   </div>`;
 
-  const errHtml =
-    s.recent_errors.length > 0
+  const providerEffortHtml =
+    (s.by_provider && s.by_provider.length > 0) || (s.by_effort && s.by_effort.length > 0)
       ? `<div class="section-card">
-          <div class="section-title"><span>最近报错 (${s.recent_errors.length})</span></div>
-          ${s.recent_errors
-            .slice(0, 8)
-            .map(
-              (er) => `<div class="snippet-item" style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start">
-                <div style="min-width:0;flex:1">
-                  <div class="trace-meta">
-                    <span class="badge badge-err">${escapeHtml(er.model)}</span>
-                    <span>${formatTimestamp(er.ts)}</span>
-                  </div>
-                  <div style="margin-top:3px;color:var(--color-text-danger,#f85149);word-break:break-word">${escapeHtml(er.error)}</div>
-                </div>
-                <button class="btn btn-sm" data-copy="${escapeHtml(er.error)}">复制</button>
-              </div>`,
-            )
-            .join("")}
+          <div class="section-title"><span>Provider 与推理档位分布</span></div>
+          <div class="chip-row">
+            <span class="trace-muted">Provider:</span>
+            ${(s.by_provider || []).map((p) => `<span class="badge">${escapeHtml(p.name)}: ${p.count} (${formatNumber(p.tokens)})</span>`).join("") || `<span class="trace-muted">-</span>`}
+          </div>
+          <div class="chip-row" style="margin-top:6px">
+            <span class="trace-muted">Effort:</span>
+            ${(s.by_effort || []).map((e) => `<span class="badge badge-info">${escapeHtml(e.name)}: ${e.count} (${formatNumber(e.tokens)})</span>`).join("") || `<span class="trace-muted">-</span>`}
+          </div>
         </div>`
       : "";
 
-  return `<div class="scroll-y">
-    ${filterHtml}
-    ${warnHtml}
-    ${kpiHtml}
-    ${trendHtml}
-    <div class="section-card">
-      <div class="section-title"><span>按模型用量分布</span></div>
-      ${modelRows}
+  const errHtml =
+    s.recent_errors && s.recent_errors.length > 0
+      ? `<div class="section-card">
+          <div class="section-title"><span>最近报错 (${s.recent_errors.length})</span></div>
+          <div class="error-list">
+            ${s.recent_errors
+              .slice(0, 8)
+              .map(
+                (er) => `<div class="snippet-item">
+                  <div class="snippet-main">
+                    <div class="snippet-meta">
+                      <span class="badge badge-err">${escapeHtml(er.model)}</span>
+                      <span class="trace-muted">${escapeHtml(formatTimestamp(er.ts))}</span>
+                    </div>
+                    <div class="snippet-err-msg">${escapeHtml(er.error)}</div>
+                  </div>
+                  <button type="button" class="btn btn-sm" data-copy="${escapeHtml(er.error)}">复制</button>
+                </div>`,
+              )
+              .join("")}
+          </div>
+        </div>`
+      : "";
+
+  return `<div class="scroll-y custom-scroll">
+    <div class="page-stack">
+      ${headerHtml}
+      ${warnHtml}
+      ${kpiHtml}
+      ${trendHtml}
+      ${breakdownHtml}
+      ${providerEffortHtml}
+      ${errHtml}
     </div>
-    ${dimChips}
-    ${errHtml}
   </div>`;
 }

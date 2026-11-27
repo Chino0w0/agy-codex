@@ -4,9 +4,10 @@
 Exposes:
 - Model-visible tools:
   `list_codex_models`, `start_codex_task`, `wait_codex_task`,
-  `get_codex_task_status`, `stop_codex_task`, `open_codex_panel`
+  `get_codex_task_status`, `stop_codex_task`, `close_codex_task`, `open_codex_panel`
 - App-only tools (zero model token overhead):
-  `get_run_events`, `list_runs`, `list_local_sessions`, `get_local_session_detail`,
+  `get_run_events`, `list_runs`, `get_history`, `close_run`, `reopen_run`,
+  `send_followup`, `toggle_codex_enabled`, `toggle_exclude_orchestrator`,
   `get_stats`, `get_workbench_config`, `save_workbench_config`,
   `preview_resolved_command`, `run_doctor`, `cancel_run`
 - UI resource: `ui://agy-codex/app.html` (`text/html;profile=mcp-app`)
@@ -15,6 +16,8 @@ Exposes:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import json
 import os
 import subprocess
@@ -45,6 +48,7 @@ def _is_pid_alive(pid: int | None) -> bool:
         try:
             res = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -104,17 +108,29 @@ class RunState:
     effort: str | None
     preset: str | None
     prompt: str
+    prompt_preview: str = ""
     persist: bool = False
     resume_session_id: str | None = None
+    title: str = ""
+    role: str = ""
+    parent_session_id: str = "default"
+    parent_session_title: str = ""
+    closed: bool = False
+    closed_at: float | None = None
+    closed_by: str | None = None
+    expired: bool = False
     worktree: dict[str, str] | None = None
     requested: dict[str, Any] = field(default_factory=dict)
     effective: dict[str, Any] = field(default_factory=dict)
     observed: dict[str, Any] = field(default_factory=lambda: {"model": None, "effort": None})
     warnings: list[str] = field(default_factory=list)
-    status: str = "running"  # running | done | error | cancelled
+    status: str = "running"  # running | done | partial | blocked | error | cancelled
+    pid: int | None = None
     started_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     finished_at: float | None = None
     duration_sec: float | None = None
+    timeout_sec: int = 600
     exit_code: int | None = None
     session_id: str | None = None
     tokens_used: int | None = None
@@ -127,6 +143,7 @@ class RunState:
         }
     )
     saw_usage: bool = False
+    _snapshot_usage: dict[str, int] | None = field(default=None, repr=False)
     result: Any = None
     error: str | None = None
     log_file: str = ""
@@ -134,6 +151,7 @@ class RunState:
     events: list[dict[str, Any]] = field(default_factory=list)
     seq: int = 0
     last_agent_message: str = ""
+    _last_state_write: float = field(default=0.0, repr=False)
     process: subprocess.Popen[str] | None = field(default=None, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -144,11 +162,36 @@ class RunState:
             if self.duration_sec is not None
             else round(max(0.0, time.time() - self.started_at), 2)
         )
+        remaining_timeout = (
+            max(0, int(round(self.timeout_sec - elapsed)))
+            if (self.status == "running" and self.timeout_sec > 0)
+            else None
+        )
+        preview = self.prompt_preview or self.prompt[:180]
+        digest_src = ""
+        if isinstance(self.result, dict):
+            digest_src = str(self.result.get("summary") or "")
+        if not digest_src and self.error:
+            digest_src = str(self.error)
+        if not digest_src:
+            digest_src = preview or self.prompt
+        work_digest = codex_run.truncate_text(digest_src, 120)
+
         return {
             "run_id": self.run_id,
             "source": "mcp",
+            "pid": self.pid,
             "ok": self.status == "done" and (self.exit_code == 0 or self.exit_code is None),
             "status": self.status,
+            "title": self.title or codex_run.derive_short_title(preview or self.prompt, 16),
+            "role": self.role or ("只读探索" if self.mode == "read-only" else "代码实现"),
+            "work_digest": work_digest,
+            "parent_session_id": self.parent_session_id or "default",
+            "parent_session_title": self.parent_session_title or Path(self.cwd).name,
+            "closed": self.closed,
+            "closed_at": self.closed_at,
+            "closed_by": self.closed_by,
+            "expired": self.expired,
             "cwd": self.cwd,
             "mode": self.mode,
             "config_mode": self.config_mode,
@@ -161,15 +204,18 @@ class RunState:
             "effective": self.effective,
             "observed": self.observed,
             "warnings": self.warnings,
-            "prompt_preview": self.prompt[:180],
+            "prompt_preview": preview,
             "started_at": self.started_at,
+            "updated_at": self.updated_at,
             "finished_at": self.finished_at,
             "elapsed_sec": elapsed,
             "duration_sec": self.duration_sec,
+            "timeout_sec": self.timeout_sec,
+            "remaining_timeout_sec": remaining_timeout,
             "exit_code": self.exit_code,
             "session_id": self.session_id,
             "tokens_used": self.tokens_used,
-            "usage": self.usage if self.saw_usage else None,
+            "usage": self.usage if self.saw_usage else self._snapshot_usage,
             "worktree": self.worktree,
             "result": self.result,
             "error": self.error,
@@ -187,36 +233,115 @@ class RunManager:
         self.runs_dir = data_dir / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
         self._runs: dict[str, RunState] = {}
+        self._summary_cache: dict[str, tuple[int, dict[str, Any]]] = {}
+        self._last_prune_ts: float = 0.0
         self._lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+        self._prune_lock = threading.Lock()
         self._any_done_cond = threading.Condition(self._lock)
 
     def _state_path(self, run_id: str) -> Path:
         return self.runs_dir / run_id / "state.json"
 
-    def _persist_state(self, state: RunState) -> None:
+    def _events_path(self, run_id: str) -> Path:
+        return self.runs_dir / run_id / "events.jsonl"
+
+    def _prompt_path(self, run_id: str) -> Path:
+        return self.runs_dir / run_id / "prompt.txt"
+
+    def _persist_state(self, state: RunState, *, force: bool = False) -> None:
+        now_mono = time.monotonic()
+        if not force and (now_mono - state._last_state_write) < 0.25:
+            return
         payload = state.to_summary_dict()
-        payload["events"] = state.events
         payload["seq"] = state.seq
         target = self._state_path(state.run_id)
         codex_catalog.atomic_write_text(
             target, json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         )
+        state._last_state_write = time.monotonic()
+        with self._cache_lock:
+            self._summary_cache.pop(state.run_id, None)
 
     def _load_persisted_state(self, run_id: str) -> dict[str, Any] | None:
         path = self._state_path(run_id)
-        if not path.is_file():
+        try:
+            st = path.stat()
+        except OSError:
+            with self._cache_lock:
+                self._summary_cache.pop(run_id, None)
             return None
+
+        with self._cache_lock:
+            cached = self._summary_cache.get(run_id)
+            if cached is not None and cached[0] == st.st_mtime_ns:
+                return copy.deepcopy(cached[1])
+
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else None
         except Exception:
             return None
+        if not isinstance(data, dict):
+            return None
+        summary = dict(data)
+        summary.pop("events", None)
+        summary.setdefault("expired", False)
+        summary.setdefault("closed", False)
+        summary.setdefault("closed_at", None)
+        summary.setdefault("closed_by", None)
+        with self._cache_lock:
+            self._summary_cache[run_id] = (st.st_mtime_ns, summary)
+        return copy.deepcopy(summary)
+
+    def _maybe_prune_expired(self, *, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self._last_prune_ts) < 900.0:
+            return
+        with self._prune_lock:
+            now = time.time()
+            if not force and (now - self._last_prune_ts) < 900.0:
+                return
+            self._last_prune_ts = now
+            try:
+                wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
+                retention_hours = int((wb_cfg.get("mapping") or {}).get("retention_hours", 24))
+                with self._lock:
+                    active_ids = {rid for rid, st in self._runs.items() if st.status == "running"}
+                res = codex_telemetry.prune_expired_runs(
+                    self.runs_dir,
+                    self.data_dir,
+                    retention_hours=retention_hours,
+                    active_run_ids=active_ids,
+                )
+                if res.get("pruned"):
+                    with self._lock:
+                        gone = [
+                            rid
+                            for rid, st in self._runs.items()
+                            if st.status != "running" and not (self.runs_dir / rid).exists()
+                        ]
+                        for rid in gone:
+                            self._runs.pop(rid, None)
+                    if gone:
+                        with self._cache_lock:
+                            for rid in gone:
+                                self._summary_cache.pop(rid, None)
+            except Exception:
+                pass
 
     def active_count(self) -> int:
         with self._lock:
             return sum(1 for s in self._runs.values() if s.status == "running")
 
     def start_run(self, params: dict[str, Any]) -> RunState:
+        self._maybe_prune_expired()
+        wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
+        if not wb_cfg.get("enabled", True):
+            raise ValueError(
+                "Codex subagent dispatch is paused in Agy Codex settings (enabled=false). "
+                "Delegate this subtask using Antigravity native subagents, or re-enable Codex subagents in Agy Codex."
+            )
+
         prompt = str(params.get("prompt") or "").strip()
         if not prompt:
             raise ValueError("'prompt' is required.")
@@ -260,11 +385,40 @@ class RunManager:
         add_dir = [str(d) for d in raw_add_dir if isinstance(d, str) and d.strip()]
         timeout = int(params.get("timeout") or 600)
 
+        def _clean_str_list(raw_val: Any) -> list[str]:
+            if not isinstance(raw_val, list):
+                return []
+            return [str(item).strip() for item in raw_val if isinstance(item, str) and item.strip()]
+
+        context_files = _clean_str_list(params.get("context_files"))
+        acceptance_criteria = _clean_str_list(params.get("acceptance_criteria"))
+        non_goals = _clean_str_list(params.get("non_goals"))
+
+        sections: list[str] = []
+        if context_files:
+            sections.append(
+                "[READ-FIRST CONTEXT FILES]\n" + "\n".join(f"- {f}" for f in context_files)
+            )
+        if acceptance_criteria:
+            sections.append(
+                "[ACCEPTANCE CRITERIA]\n" + "\n".join(f"- {c}" for c in acceptance_criteria)
+            )
+        if non_goals:
+            sections.append(
+                "[NON-GOALS & BOUNDARIES]\n" + "\n".join(f"- {g}" for g in non_goals)
+            )
+        if sections:
+            sections.append(f"[TASK]\n{prompt}")
+            effective_prompt = "\n\n".join(sections)
+        else:
+            effective_prompt = prompt
+
         run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         run_dir = self.runs_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         log_file = run_dir / "codex.log"
         output_file = run_dir / ("output.txt" if raw else "output.json")
+        codex_catalog.atomic_write_text(self._prompt_path(run_id), effective_prompt)
 
         codex_bin = codex_run.find_codex_bin()
         codex_home = codex_catalog.get_codex_home(self.codex_home)
@@ -300,6 +454,7 @@ class RunManager:
             search=search if not resume_sid_str else False,
             add_dir=add_dir if not resume_sid_str else [],
             allow_ephemeral=(resume_sid_str is None),
+            allow_thread_source=(resume_sid_str is None),
             allow_schema=not raw,
             allow_extra_dirs=(resume_sid_str is None),
             allow_search=(resume_sid_str is None),
@@ -314,13 +469,38 @@ class RunManager:
 
         eff = meta["effective"]
         warnings = list(meta.get("warnings") or [])
-        wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
+        if eff.get("mode") == "write" and len(prompt) < 80 and not context_files:
+            warnings.append(
+                "Write task prompt is short (< 80 chars) without context_files; consider providing reference files and acceptance_criteria to avoid guesswork."
+            )
         max_conc = int((wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5))
         cur_active = self.active_count()
         if cur_active >= max_conc:
             warnings.append(
                 f"Active runs ({cur_active}) reached max_concurrent_runs ({max_conc}); consider rolling wait/cleanup."
             )
+
+        preset_label = None
+        if eff.get("preset"):
+            p_obj = (wb_cfg.get("presets") or {}).get(eff["preset"])
+            if isinstance(p_obj, dict):
+                preset_label = codex_catalog._clean_optional_str(p_obj.get("label"))
+        title_str = codex_catalog._clean_optional_str(params.get("title")) or codex_run.derive_short_title(
+            prompt, 16
+        )
+        role_str = (
+            codex_catalog._clean_optional_str(params.get("role"))
+            or preset_label
+            or ("只读探索" if eff.get("mode") == "read-only" else "代码实现")
+        )
+        parent_session_id = (
+            codex_catalog._clean_optional_str(params.get("conversation_id"))
+            or codex_catalog._clean_optional_str(os.environ.get("ANTIGRAVITY_CONVERSATION_ID"))
+            or f"ws:{initial_cwd.name}"
+        )
+        parent_session_title = (
+            codex_catalog._clean_optional_str(params.get("conversation_title")) or initial_cwd.name
+        )
 
         state = RunState(
             run_id=run_id,
@@ -331,24 +511,30 @@ class RunManager:
             provider=eff.get("provider"),
             effort=eff.get("effort"),
             preset=eff.get("preset"),
-            prompt=prompt,
+            prompt=effective_prompt,
+            prompt_preview=prompt[:180],
             persist=persist,
             resume_session_id=resume_sid_str,
+            title=title_str,
+            role=role_str,
+            parent_session_id=parent_session_id,
+            parent_session_title=parent_session_title,
             worktree=worktree_info,
             requested=meta.get("requested") or {},
             effective=eff,
             warnings=warnings,
+            timeout_sec=timeout,
             log_file=str(log_file),
             output_file=str(output_file),
         )
         with self._lock:
             self._runs[run_id] = state
         with state.lock:
-            self._persist_state(state)
+            self._persist_state(state, force=True)
 
         thread = threading.Thread(
             target=self._execute_worker,
-            args=(state, cmd, log_file, output_file, timeout, prompt),
+            args=(state, cmd, log_file, output_file, timeout, effective_prompt),
             daemon=True,
         )
         thread.start()
@@ -356,9 +542,17 @@ class RunManager:
 
     def _append_event(self, state: RunState, event_payload: dict[str, Any]) -> None:
         state.seq += 1
+        state.updated_at = time.time()
         event_payload["seq"] = state.seq
-        event_payload.setdefault("ts", round(time.time() - state.started_at, 2))
+        event_payload.setdefault("ts", round(state.updated_at - state.started_at, 2))
         state.events.append(event_payload)
+        ev_path = self._events_path(state.run_id)
+        try:
+            ev_path.parent.mkdir(parents=True, exist_ok=True)
+            with ev_path.open("a", encoding="utf-8", newline="\n") as fh:
+                fh.write(json.dumps(event_payload, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
 
     def _notify_done(self, state: RunState) -> None:
         state.done_event.set()
@@ -404,12 +598,17 @@ class RunManager:
                 state.duration_sec = round(state.finished_at - state.started_at, 2)
                 state.exit_code = 1
                 self._append_event(state, {"kind": "error", "message": state.error})
-                self._persist_state(state)
+                self._persist_state(state, force=True)
+                summary = state.to_summary_dict()
+            codex_telemetry.append_ledger_record(self.data_dir, summary)
             self._notify_done(state)
             return
 
         with state.lock:
             state.process = proc
+            state.pid = proc.pid
+            state.updated_at = time.time()
+            self._persist_state(state, force=True)
 
         def on_timeout() -> None:
             nonlocal timed_out
@@ -470,8 +669,16 @@ class RunManager:
                 except OSError:
                     pass
 
+        if not log_file.parent.exists():
+            self._notify_done(state)
+            return
+
         combined_log = "".join(log_lines)
-        log_file.write_text(combined_log, encoding="utf-8", newline="\n")
+        try:
+            log_file.write_text(combined_log, encoding="utf-8", newline="\n")
+        except FileNotFoundError:
+            self._notify_done(state)
+            return
 
         raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
         if not raw_output and state.last_agent_message:
@@ -482,7 +689,9 @@ class RunManager:
 
         with state.lock:
             state.process = None
+            state.pid = None
             state.finished_at = time.time()
+            state.updated_at = state.finished_at
             state.duration_sec = round(state.finished_at - state.started_at, 2)
             state.exit_code = 124 if timed_out else (proc.returncode if proc.returncode is not None else 1)
             state.result = parsed_result
@@ -496,6 +705,12 @@ class RunManager:
                 state.session_id = fallback["session_id"]
             if state.saw_usage:
                 state.tokens_used = state.usage["input_tokens"] + state.usage["output_tokens"]
+            elif state._snapshot_usage:
+                state.usage = dict(state._snapshot_usage)
+                state.saw_usage = True
+                snap_tok = state.usage["input_tokens"] + state.usage["output_tokens"]
+                if snap_tok > 0:
+                    state.tokens_used = snap_tok
             elif fallback.get("tokens_used"):
                 state.tokens_used = fallback["tokens_used"]
 
@@ -517,6 +732,12 @@ class RunManager:
                         state.status = "blocked"
                         if not state.error:
                             state.error = handoff_summary or "Worker reported status=blocked."
+                    elif handoff_status == "partial":
+                        state.status = "partial"
+                        if not state.error:
+                            state.error = (
+                                handoff_summary or "Worker reported status=partial (incomplete)."
+                            )
                     elif handoff_status == "failed":
                         state.status = "error"
                         if not state.error:
@@ -527,12 +748,16 @@ class RunManager:
                     state.status = "error"
                     if not state.error:
                         state.error = f"codex exited with code {state.exit_code}"
-            self._persist_state(state)
+            self._persist_state(state, force=True)
+            final_summary = state.to_summary_dict()
+        codex_telemetry.append_ledger_record(self.data_dir, final_summary)
         self._notify_done(state)
 
     def _handle_json_event(self, state: RunState, evt: dict[str, Any]) -> None:
         etype = evt.get("type")
+        force_write = False
         with state.lock:
+            state.updated_at = time.time()
             if isinstance(evt.get("model"), str) and evt["model"].strip():
                 state.observed["model"] = evt["model"].strip()
             if isinstance(evt.get("reasoning_effort"), str) and evt["reasoning_effort"].strip():
@@ -542,6 +767,7 @@ class RunManager:
                 if isinstance(tid, str) and tid:
                     state.session_id = tid
                     self._append_event(state, {"kind": "session", "session_id": tid})
+                    force_write = True
             elif etype in ("item.started", "item.completed"):
                 item = evt.get("item") or {}
                 item_id = str(item.get("id") or "")
@@ -632,19 +858,75 @@ class RunManager:
                 )
                 state.error = str(msg)
                 self._append_event(state, {"kind": "error", "message": state.error})
-            self._persist_state(state)
+                force_write = True
 
-    def _normalize_persisted_state(self, data: dict[str, Any]) -> dict[str, Any]:
+            if etype != "turn.completed" and not state.saw_usage:
+                snap_u = evt.get("usage")
+                if not isinstance(snap_u, dict):
+                    payload_obj = evt.get("payload")
+                    info_obj = payload_obj.get("info") if isinstance(payload_obj, dict) else None
+                    if isinstance(info_obj, dict):
+                        snap_u = info_obj.get("total_token_usage") or info_obj.get(
+                            "last_token_usage"
+                        )
+                if isinstance(snap_u, dict):
+                    in_t = int(snap_u.get("input_tokens") or 0)
+                    c_t = int(snap_u.get("cached_input_tokens") or 0)
+                    out_t = int(snap_u.get("output_tokens") or 0)
+                    r_t = int(snap_u.get("reasoning_output_tokens") or 0)
+                    tot_t = int(snap_u.get("total_tokens") or (in_t + out_t))
+                    if in_t or c_t or out_t or r_t or tot_t:
+                        state._snapshot_usage = {
+                            "input_tokens": in_t,
+                            "cached_input_tokens": c_t,
+                            "output_tokens": out_t,
+                            "reasoning_output_tokens": r_t,
+                        }
+                        state.tokens_used = (in_t + out_t) if (in_t or out_t) else tot_t
+
+            self._persist_state(state, force=force_write)
+
+    def _normalize_persisted_state(
+        self, data: dict[str, Any], run_id: str | None = None
+    ) -> dict[str, Any]:
         if data.get("status") == "running":
             raw_pid = data.get("pid")
-            pid = raw_pid if isinstance(raw_pid, int) else None
-            if _is_pid_alive(pid):
+            pid = raw_pid if isinstance(raw_pid, int) and not isinstance(raw_pid, bool) else None
+            rid = str(run_id or data.get("run_id") or "").strip()
+            now = time.time()
+            recently_active = False
+            if rid:
+                cutoff = now - 45.0
+                for p in (self._events_path(rid), self._state_path(rid)):
+                    try:
+                        if p.is_file() and p.stat().st_mtime >= cutoff:
+                            recently_active = True
+                            break
+                    except OSError:
+                        pass
+            if _is_pid_alive(pid) or recently_active:
                 started_at = data.get("started_at")
+                elapsed = data.get("elapsed_sec")
                 if isinstance(started_at, (int, float)):
-                    data["elapsed_sec"] = round(max(0.0, time.time() - float(started_at)), 2)
+                    elapsed = round(max(0.0, now - float(started_at)), 2)
+                    data["elapsed_sec"] = elapsed
+                raw_timeout = data.get("timeout_sec")
+                if (
+                    isinstance(raw_timeout, (int, float))
+                    and not isinstance(raw_timeout, bool)
+                    and raw_timeout > 0
+                    and isinstance(elapsed, (int, float))
+                ):
+                    data["remaining_timeout_sec"] = max(
+                        0, int(round(float(raw_timeout) - float(elapsed)))
+                    )
+                else:
+                    data["remaining_timeout_sec"] = None
             else:
                 data["status"] = "error"
                 data["ok"] = False
+                data["pid"] = None
+                data["remaining_timeout_sec"] = None
                 data["error"] = "External CLI process exited unexpectedly."
         return data
 
@@ -659,7 +941,7 @@ class RunManager:
             raise ValueError(f"Unknown run_id: {run_id}")
         persisted.pop("events", None)
         persisted.pop("seq", None)
-        return self._normalize_persisted_state(persisted)
+        return self._normalize_persisted_state(persisted, run_id)
 
     def wait_runs(
         self,
@@ -675,26 +957,35 @@ class RunManager:
             raise ValueError("'wait_mode' must be 'all' or 'any'.")
 
         deadline = None if timeout <= 0 else (time.monotonic() + timeout)
-        with self._any_done_cond:
-            while True:
-                summaries = [self._get_summary_locked_safe(rid) for rid in run_ids]
-                finished_ids = [s["run_id"] for s in summaries if s.get("status") != "running"]
-                still_running_ids = [s["run_id"] for s in summaries if s.get("status") == "running"]
+        while True:
+            summaries = [self._get_summary(rid) for rid in run_ids]
+            finished_ids = [s["run_id"] for s in summaries if s.get("status") != "running"]
+            still_running_ids = [s["run_id"] for s in summaries if s.get("status") == "running"]
 
-                if not still_running_ids:
-                    timed_out = False
+            if not still_running_ids:
+                timed_out = False
+                break
+            if wait_mode == "any" and finished_ids:
+                timed_out = False
+                break
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    timed_out = True
                     break
-                if wait_mode == "any" and finished_ids:
-                    timed_out = False
-                    break
-                if deadline is not None:
-                    rem = deadline - time.monotonic()
-                    if rem <= 0:
-                        timed_out = True
+                wait_slice = min(rem, 0.5)
+            else:
+                wait_slice = 0.5
+
+            with self._any_done_cond:
+                in_mem_done = False
+                for rid in still_running_ids:
+                    st = self._runs.get(rid)
+                    if st is not None and st.done_event.is_set():
+                        in_mem_done = True
                         break
-                    self._any_done_cond.wait(timeout=min(rem, 0.5))
-                else:
-                    self._any_done_cond.wait(timeout=0.5)
+                if not in_mem_done:
+                    self._any_done_cond.wait(timeout=wait_slice)
 
         summaries = [self._get_summary(rid) for rid in run_ids]
         still_running_ids = [s["run_id"] for s in summaries if s.get("status") == "running"]
@@ -729,18 +1020,6 @@ class RunManager:
             ),
         }
 
-    def _get_summary_locked_safe(self, run_id: str) -> dict[str, Any]:
-        state = self._runs.get(run_id)
-        if state is not None:
-            with state.lock:
-                return state.to_summary_dict()
-        persisted = self._load_persisted_state(run_id)
-        if persisted is None:
-            raise ValueError(f"Unknown run_id: {run_id}")
-        persisted.pop("events", None)
-        persisted.pop("seq", None)
-        return self._normalize_persisted_state(persisted)
-
     def get_status(self, run_ids: list[str]) -> dict[str, Any]:
         """Non-blocking status check for one or more runs."""
         items: list[dict[str, Any]] = []
@@ -761,12 +1040,42 @@ class RunManager:
             "runs": items,
         }
 
+    def _read_persisted_events(self, run_id: str) -> list[dict[str, Any]]:
+        events_path = self._events_path(run_id)
+        all_events: list[dict[str, Any]] = []
+        if events_path.is_file():
+            try:
+                for raw_line in events_path.read_text(encoding="utf-8").splitlines():
+                    s = raw_line.strip()
+                    if not s:
+                        continue
+                    try:
+                        ev = json.loads(s)
+                        if isinstance(ev, dict):
+                            all_events.append(ev)
+                    except json.JSONDecodeError:
+                        continue
+                return all_events
+            except OSError:
+                pass
+        # Legacy v1.0 fallback: embedded "events" array in state.json
+        state_path = self._state_path(run_id)
+        if state_path.is_file():
+            try:
+                raw_state = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(raw_state, dict) and isinstance(raw_state.get("events"), list):
+                    return [ev for ev in raw_state["events"] if isinstance(ev, dict)]
+            except Exception:
+                pass
+        return []
+
     def get_run_events(self, run_id: str, since_seq: int = 0) -> dict[str, Any]:
         with self._lock:
             state = self._runs.get(run_id)
         if state is not None:
             with state.lock:
                 summary = state.to_summary_dict()
+                summary["prompt"] = state.prompt
                 events = [ev for ev in state.events if int(ev.get("seq", 0)) > since_seq]
                 latest_seq = state.seq
             summary["events"] = events
@@ -776,14 +1085,32 @@ class RunManager:
         persisted = self._load_persisted_state(run_id)
         if persisted is None:
             raise ValueError(f"Unknown run_id: {run_id}")
-        persisted = self._normalize_persisted_state(persisted)
-        all_events = persisted.pop("events", [])
-        latest_seq = int(persisted.pop("seq", len(all_events)))
+        persisted = self._normalize_persisted_state(persisted, run_id)
+        prompt_path = self._prompt_path(run_id)
+        full_prompt: str | None = None
+        if prompt_path.is_file():
+            try:
+                full_prompt = prompt_path.read_text(encoding="utf-8")
+            except OSError:
+                full_prompt = None
+        persisted["prompt"] = (
+            full_prompt if full_prompt is not None else persisted.get("prompt_preview")
+        )
+        all_events = self._read_persisted_events(run_id)
+        default_seq = int(all_events[-1].get("seq", len(all_events))) if all_events else 0
+        latest_seq = int(persisted.pop("seq", default_seq) or default_seq)
         persisted["events"] = [ev for ev in all_events if int(ev.get("seq", 0)) > since_seq]
         persisted["latest_seq"] = latest_seq
         return persisted
 
-    def list_runs(self, *, status: str = "all", limit: int = 40) -> list[dict[str, Any]]:
+    def list_runs(
+        self,
+        *,
+        status: str = "all",
+        limit: int = 40,
+        include_closed: bool = False,
+    ) -> list[dict[str, Any]]:
+        self._maybe_prune_expired()
         seen: dict[str, dict[str, Any]] = {}
         with self._lock:
             active_states = list(self._runs.values())
@@ -797,16 +1124,26 @@ class RunManager:
                     continue
                 persisted = self._load_persisted_state(child.name)
                 if persisted is not None:
-                    persisted = self._normalize_persisted_state(persisted)
+                    persisted = self._normalize_persisted_state(persisted, child.name)
                     persisted.pop("events", None)
                     persisted.pop("seq", None)
+                    persisted["expired"] = False
                     seen[child.name] = persisted
-                if len(seen) >= max(limit * 3, 120):
-                    break
 
-        items = sorted(seen.values(), key=lambda r: float(r.get("started_at") or 0), reverse=True)
+        items = list(seen.values())
+        if not include_closed:
+            items = [r for r in items if not r.get("closed")]
         if status and status != "all":
             items = [r for r in items if r.get("status") == status]
+        if include_closed:
+            items.sort(key=lambda r: -float(r.get("started_at") or 0))
+        else:
+            items.sort(
+                key=lambda r: (
+                    0 if r.get("status") == "running" else 1,
+                    -float(r.get("started_at") or 0),
+                )
+            )
         return items[:limit]
 
     def cancel_run(self, run_id: str) -> dict[str, Any]:
@@ -822,16 +1159,36 @@ class RunManager:
                     codex_run.terminate_process_tree(pid)
                 persisted["status"] = "cancelled"
                 persisted["ok"] = False
+                persisted["pid"] = None
+                persisted["remaining_timeout_sec"] = None
                 persisted["error"] = "Cancelled by user."
-                events = persisted.get("events")
-                if isinstance(events, list):
-                    next_seq = int(persisted.get("seq") or len(events)) + 1
-                    events.append({"kind": "error", "message": "Cancelled by user.", "seq": next_seq})
-                    persisted["seq"] = next_seq
+                now_ts = time.time()
+                persisted["finished_at"] = persisted.get("finished_at") or now_ts
+                persisted["updated_at"] = now_ts
+                next_seq = int(persisted.get("seq") or 0) + 1
+                err_ev = {
+                    "kind": "error",
+                    "message": "Cancelled by user.",
+                    "seq": next_seq,
+                    "ts": round(
+                        max(0.0, now_ts - float(persisted.get("started_at") or now_ts)), 2
+                    ),
+                }
+                persisted["seq"] = next_seq
+                ev_path = self._events_path(run_id)
+                try:
+                    ev_path.parent.mkdir(parents=True, exist_ok=True)
+                    with ev_path.open("a", encoding="utf-8", newline="\n") as fh:
+                        fh.write(json.dumps(err_ev, ensure_ascii=False) + "\n")
+                except OSError:
+                    pass
                 codex_catalog.atomic_write_text(
                     self._state_path(run_id),
                     json.dumps(persisted, ensure_ascii=False, indent=2) + "\n",
                 )
+                with self._cache_lock:
+                    self._summary_cache.pop(run_id, None)
+                codex_telemetry.append_ledger_record(self.data_dir, persisted)
             persisted.pop("events", None)
             persisted.pop("seq", None)
             return persisted
@@ -841,13 +1198,296 @@ class RunManager:
             if state.status != "running":
                 return state.to_summary_dict()
             state.status = "cancelled"
+            state.pid = None
             state.error = "Cancelled by user."
+            state.finished_at = state.finished_at or time.time()
+            state.duration_sec = round(max(0.0, state.finished_at - state.started_at), 2)
             self._append_event(state, {"kind": "error", "message": "Cancelled by user."})
-            self._persist_state(state)
+            self._persist_state(state, force=True)
+            summary = state.to_summary_dict()
 
+        codex_telemetry.append_ledger_record(self.data_dir, summary)
         codex_run.terminate_process_tree(proc)
         self._notify_done(state)
-        return state.to_summary_dict()
+        return summary
+
+    def close_runs(
+        self,
+        run_ids: list[str],
+        *,
+        closed_by: str,
+        close_all_finished: bool = False,
+    ) -> dict[str, Any]:
+        skipped_running_ids: list[str] = []
+        targets: list[str] = []
+
+        if close_all_finished:
+            unclosed = self.list_runs(status="all", limit=1000, include_closed=False)
+            for item in unclosed:
+                rid = str(item.get("run_id") or "")
+                if not rid:
+                    continue
+                if item.get("status") == "running":
+                    skipped_running_ids.append(rid)
+                else:
+                    targets.append(rid)
+        else:
+            deduped: list[str] = []
+            for rid in run_ids:
+                s = str(rid or "").strip()
+                if s and s not in deduped:
+                    deduped.append(s)
+            if not deduped:
+                raise ValueError("Provide 'run_id', 'run_ids', or 'close_all_finished=true'.")
+            for rid in deduped:
+                summary = self._get_summary(rid)
+                if summary.get("status") == "running":
+                    skipped_running_ids.append(rid)
+                else:
+                    targets.append(rid)
+            if not targets and skipped_running_ids:
+                raise ValueError("Cannot close running task(s); call stop_codex_task first.")
+
+        now = time.time()
+        closed_ids: list[str] = []
+        for rid in targets:
+            with self._lock:
+                state = self._runs.get(rid)
+            if state is not None:
+                with state.lock:
+                    if state.status == "running":
+                        skipped_running_ids.append(rid)
+                        continue
+                    state.closed = True
+                    state.closed_at = now
+                    state.closed_by = closed_by
+                    self._persist_state(state, force=True)
+                    summary = state.to_summary_dict()
+            else:
+                persisted = self._load_persisted_state(rid)
+                if persisted is None:
+                    continue
+                persisted = self._normalize_persisted_state(persisted, rid)
+                if persisted.get("status") == "running":
+                    skipped_running_ids.append(rid)
+                    continue
+                persisted["closed"] = True
+                persisted["closed_at"] = now
+                persisted["closed_by"] = closed_by
+                codex_catalog.atomic_write_text(
+                    self._state_path(rid),
+                    json.dumps(persisted, ensure_ascii=False, indent=2) + "\n",
+                )
+                with self._cache_lock:
+                    self._summary_cache.pop(rid, None)
+                summary = persisted
+
+            codex_telemetry.append_ledger_record(self.data_dir, summary)
+            closed_ids.append(rid)
+
+        return {
+            "closed_ids": closed_ids,
+            "skipped_running_ids": skipped_running_ids,
+            "closed_by": closed_by,
+            "closed_at": now if closed_ids else None,
+        }
+
+    def reopen_run(self, run_id: str) -> dict[str, Any]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            raise ValueError("'run_id' is required.")
+
+        with self._lock:
+            state = self._runs.get(rid)
+        if state is not None:
+            with state.lock:
+                state.closed = False
+                state.closed_at = None
+                state.closed_by = None
+                self._persist_state(state, force=True)
+                summary = state.to_summary_dict()
+            codex_telemetry.append_ledger_record(self.data_dir, summary)
+            return summary
+
+        persisted = self._load_persisted_state(rid)
+        if persisted is None:
+            ledger_ids = {
+                rec.get("run_id") for rec in codex_telemetry.read_ledger_records(self.data_dir)
+            }
+            if rid in ledger_ids:
+                raise ValueError(f"Run {rid!r} has expired and cannot be reopened.")
+            raise ValueError(f"Unknown run_id: {rid}")
+
+        persisted = self._normalize_persisted_state(persisted, rid)
+        persisted["closed"] = False
+        persisted["closed_at"] = None
+        persisted["closed_by"] = None
+        persisted["expired"] = False
+        codex_catalog.atomic_write_text(
+            self._state_path(rid),
+            json.dumps(persisted, ensure_ascii=False, indent=2) + "\n",
+        )
+        with self._cache_lock:
+            self._summary_cache.pop(rid, None)
+        codex_telemetry.append_ledger_record(self.data_dir, persisted)
+        persisted.pop("events", None)
+        persisted.pop("seq", None)
+        return persisted
+
+    def send_followup(self, run_id: str, prompt: str) -> RunState:
+        rid = str(run_id or "").strip()
+        if not rid:
+            raise ValueError("'run_id' is required.")
+        followup_prompt = str(prompt or "").strip()
+        if not followup_prompt:
+            raise ValueError("'prompt' is required.")
+
+        summary = self._get_summary(rid)
+        if summary.get("status") == "running":
+            raise ValueError(f"Run {rid!r} is still running; wait for completion before follow-up.")
+        session_id = str(summary.get("session_id") or "").strip()
+        if not summary.get("persist") or not session_id:
+            raise ValueError(
+                f"Run {rid!r} cannot be resumed (requires persist=True and a valid session_id)."
+            )
+
+        orig_title = str(summary.get("title") or "").strip()
+        if orig_title:
+            next_title = (
+                orig_title
+                if "(续)" in orig_title
+                else codex_run.truncate_text(f"{orig_title} (续)", 32)
+            )
+        else:
+            next_title = codex_run.truncate_text(followup_prompt, 24)
+
+        return self.start_run(
+            {
+                "prompt": followup_prompt,
+                "cwd": summary.get("cwd") or ".",
+                "model": summary.get("model"),
+                "provider": summary.get("provider"),
+                "effort": summary.get("effort"),
+                "preset": summary.get("preset"),
+                "mode": summary.get("mode"),
+                "config_mode": summary.get("config_mode"),
+                "role": summary.get("role"),
+                "title": next_title,
+                "conversation_id": summary.get("parent_session_id"),
+                "conversation_title": summary.get("parent_session_title"),
+                "persist": True,
+                "session_id": session_id,
+            }
+        )
+
+    def get_history(
+        self,
+        *,
+        query: str = "",
+        filter_mode: str = "all",
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        self._maybe_prune_expired()
+        fmode = str(filter_mode or "all").strip()
+        if fmode not in ("all", "closed", "active", "issue"):
+            raise ValueError("Invalid filter_mode; expected 'all', 'closed', 'active', or 'issue'.")
+
+        disk_runs = self.list_runs(status="all", limit=500, include_closed=True)
+        ledger_runs = codex_telemetry.read_ledger_records(self.data_dir)
+
+        by_id: dict[str, dict[str, Any]] = {}
+        for rec in ledger_runs:
+            rid = str(rec.get("run_id") or "").strip()
+            if rid:
+                by_id[rid] = rec
+        for r in disk_runs:
+            rid = str(r.get("run_id") or "").strip()
+            if rid:
+                r_copy = dict(r)
+                r_copy["expired"] = False
+                by_id[rid] = r_copy
+
+        items = list(by_id.values())
+        if fmode == "closed":
+            items = [r for r in items if bool(r.get("closed"))]
+        elif fmode == "active":
+            items = [r for r in items if not bool(r.get("closed")) and not bool(r.get("expired"))]
+        elif fmode == "issue":
+            items = [r for r in items if r.get("status") in ("error", "blocked", "cancelled")]
+
+        q = query.strip().lower()
+        if q:
+            items = [
+                r
+                for r in items
+                if q in str(r.get("title") or "").lower()
+                or q in str(r.get("role") or "").lower()
+                or q in str(r.get("work_digest") or "").lower()
+                or q in str(r.get("prompt_preview") or "").lower()
+                or q in str(r.get("model") or "").lower()
+                or q in str(r.get("provider") or "").lower()
+                or q in str(r.get("run_id") or "").lower()
+                or q in str(r.get("parent_session_id") or "").lower()
+                or q in str(r.get("parent_session_title") or "").lower()
+                or q in str(r.get("error") or "").lower()
+                or q in str(r.get("cwd") or "").lower()
+            ]
+
+        items.sort(key=lambda r: float(r.get("started_at") or 0), reverse=True)
+        sliced = items[:limit]
+
+        grouped: dict[str, dict[str, Any]] = {}
+        for r in sliced:
+            pid = str(r.get("parent_session_id") or "default")
+            ptitle = str(r.get("parent_session_title") or pid)
+            cwd_str = str(r.get("cwd") or "")
+            grp = grouped.get(pid)
+            if grp is None:
+                grp = {
+                    "session_id": pid,
+                    "title": ptitle,
+                    "parent_session_id": pid,
+                    "parent_session_title": ptitle,
+                    "workspace": Path(cwd_str).name if cwd_str else ptitle,
+                    "updated_at": float(r.get("started_at") or 0),
+                    "latest_started_at": float(r.get("started_at") or 0),
+                    "run_count": 0,
+                    "active_count": 0,
+                    "running_count": 0,
+                    "closed_count": 0,
+                    "issue_count": 0,
+                    "total_tokens": 0,
+                    "runs": [],
+                }
+                grouped[pid] = grp
+            grp["runs"].append(r)
+            grp["run_count"] += 1
+            if r.get("status") == "running":
+                grp["running_count"] += 1
+            if not r.get("closed"):
+                grp["active_count"] += 1
+            if r.get("closed"):
+                grp["closed_count"] += 1
+            if r.get("status") in ("error", "blocked", "cancelled"):
+                grp["issue_count"] += 1
+            grp["total_tokens"] += int(r.get("tokens_used") or 0)
+            ts = float(r.get("started_at") or 0)
+            if ts > grp["latest_started_at"]:
+                grp["latest_started_at"] = ts
+                grp["updated_at"] = ts
+                if ptitle:
+                    grp["parent_session_title"] = ptitle
+                    grp["title"] = ptitle
+
+        sessions = sorted(grouped.values(), key=lambda g: g["latest_started_at"], reverse=True)
+        wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
+        retention_hours = int((wb_cfg.get("mapping") or {}).get("retention_hours", 24))
+        return {
+            "sessions": sessions,
+            "groups": sessions,
+            "total_runs": len(sliced),
+            "retention_hours": retention_hours,
+        }
 
 
 TOOLS_DEF: list[dict[str, Any]] = [
@@ -876,6 +1516,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
         "description": (
             "Start a bounded OpenAI Codex CLI worker asynchronously with whitelist config isolation "
             "(no inline chat card; call open_codex_panel to open/update live progress in the right side pane). "
+            "Pass context_files, acceptance_criteria, and non_goals for self-contained business context. "
             "Supports model, provider, extended effort, role preset, and git worktree isolation. Returns run_id immediately."
         ),
         "inputSchema": {
@@ -885,6 +1526,21 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "properties": {
                 "prompt": {"type": "string", "description": "Self-contained bounded task contract for Codex."},
                 "cwd": {"type": "string", "description": "Absolute working directory path."},
+                "context_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of file/doc paths the worker should read first before editing.",
+                },
+                "acceptance_criteria": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional concrete acceptance criteria the worker must satisfy and verify.",
+                },
+                "non_goals": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional explicit boundaries and out-of-scope items not to alter.",
+                },
                 "mode": {"type": "string", "enum": ["write", "read-only"], "description": "Sandbox policy."},
                 "config_mode": {"type": "string", "enum": ["isolated", "profile", "inherit"], "description": "Config isolation mode."},
                 "model": {"type": "string", "description": "Optional Codex model slug override."},
@@ -898,6 +1554,10 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "add_dir": {"type": "array", "items": {"type": "string"}, "description": "Additional writable directories."},
                 "raw": {"type": "boolean", "default": False, "description": "Disable JSON output schema."},
                 "timeout": {"type": "integer", "default": 600, "description": "Execution timeout in seconds."},
+                "title": {"type": "string", "description": "Optional short task title for panel/history display."},
+                "role": {"type": "string", "description": "Optional subagent role label (e.g. '只读探索', '代码实现', '独立审查')."},
+                "conversation_id": {"type": "string", "description": "Optional parent Antigravity conversation ID for history grouping."},
+                "conversation_title": {"type": "string", "description": "Optional parent Antigravity conversation title."},
             },
         },
     },
@@ -944,10 +1604,27 @@ TOOLS_DEF: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "close_codex_task",
+        "title": "Close Codex Task(s)",
+        "description": (
+            "Archive finished Codex task(s) from the active workbench monitor "
+            "(cannot close running tasks; call stop_codex_task first)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "run_id": {"type": "string", "description": "Single finished run_id to close."},
+                "run_ids": {"type": "array", "items": {"type": "string"}, "description": "Multiple finished run_ids to close."},
+                "close_all_finished": {"type": "boolean", "default": False, "description": "Close all finished unclosed runs."},
+            },
+        },
+    },
+    {
         "name": "open_codex_panel",
         "title": "Agy Codex",
         "description": (
-            "Open or update the Agy Codex 3-tab workbench (Subagents Monitor, Usage Stats, Models & Config) "
+            "Open or update the Agy Codex 4-tab workbench (Subagents Monitor, History, Usage Stats, Models & Config) "
             "in the right side pane (aux_pane) instead of inline in chat. Call right after start_codex_task "
             "with tab='subagents' and run_id to focus live execution."
         ),
@@ -955,7 +1632,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "tab": {"type": "string", "enum": ["subagents", "stats", "models"], "default": "subagents"},
+                "tab": {"type": "string", "enum": ["subagents", "history", "stats", "models"], "default": "subagents"},
                 "run_id": {"type": "string", "description": "Optional run_id to focus initially."},
             },
         },
@@ -992,46 +1669,101 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "properties": {
                 "status": {"type": "string", "default": "all"},
                 "limit": {"type": "integer", "default": 40},
+                "include_closed": {"type": "boolean", "default": False},
             },
         },
         "_meta": {"ui": {"visibility": ["app"]}},
     },
     {
-        "name": "list_local_sessions",
-        "title": "List Local Codex Sessions",
-        "description": "App-only: list read-only local Codex CLI/Desktop sessions from state_*.sqlite.",
+        "name": "get_history",
+        "title": "Get Codex Run History",
+        "description": "App-only: fetch Antigravity Codex runs (24h active + expired ledger) grouped by parent session.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
                 "query": {"type": "string", "default": ""},
-                "limit": {"type": "integer", "default": 50},
-                "include_subagents": {"type": "boolean", "default": True},
+                "filter": {"type": "string", "enum": ["all", "closed", "active", "issue"], "default": "all"},
+                "limit": {"type": "integer", "default": 80},
             },
         },
         "_meta": {"ui": {"visibility": ["app"]}},
     },
     {
-        "name": "get_local_session_detail",
-        "title": "Get Local Codex Session Detail",
-        "description": "App-only: fetch local Codex session metadata, context bar, spawn tree, and recent snippets.",
+        "name": "close_run",
+        "title": "Close Codex Run(s)",
+        "description": "App-only: archive finished run(s) from the active monitor.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["thread_id"],
-            "properties": {"thread_id": {"type": "string"}},
+            "properties": {
+                "run_id": {"type": "string"},
+                "run_ids": {"type": "array", "items": {"type": "string"}},
+                "close_all_finished": {"type": "boolean", "default": False},
+            },
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "reopen_run",
+        "title": "Reopen Closed Codex Run",
+        "description": "App-only: restore a non-expired closed run back to the active monitor.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id"],
+            "properties": {"run_id": {"type": "string"}},
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "send_followup",
+        "title": "Send Follow-up to Persisted Run",
+        "description": "App-only: resume a finished persist=true Codex run with a follow-up prompt.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["run_id", "prompt"],
+            "properties": {
+                "run_id": {"type": "string"},
+                "prompt": {"type": "string"},
+            },
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "toggle_codex_enabled",
+        "title": "Toggle Codex Subagent Dispatch",
+        "description": "App-only: pause or enable Codex subagent dispatch in workbench settings.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["enabled"],
+            "properties": {"enabled": {"type": "boolean"}},
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "toggle_exclude_orchestrator",
+        "title": "Toggle Exclude Orchestrator Models",
+        "description": "App-only: toggle excluding orchestrator models in workbench settings.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["enabled"],
+            "properties": {"enabled": {"type": "boolean"}},
         },
         "_meta": {"ui": {"visibility": ["app"]}},
     },
     {
         "name": "get_stats",
         "title": "Get Unified Usage Stats",
-        "description": "App-only: aggregate token, cache hit, duration, and breakdown stats across plugin runs & local Codex.",
+        "description": "App-only: aggregate token, cache hit, duration, and breakdown stats across plugin runs.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "scope": {"type": "string", "enum": ["all", "antigravity", "codex_local"], "default": "all"},
+                "scope": {"type": "string", "enum": ["all", "antigravity", "codex_local"], "default": "antigravity"},
                 "range": {"type": "string", "enum": ["today", "7d", "30d", "all"], "default": "7d"},
                 "model": {"type": "string", "default": ""},
                 "provider": {"type": "string", "default": ""},
@@ -1053,11 +1785,13 @@ TOOLS_DEF: list[dict[str, Any]] = [
     {
         "name": "save_workbench_config",
         "title": "Save Workbench Config",
-        "description": "App-only: persist defaults, mapping policies, custom_models, excluded_models, and presets.",
+        "description": "App-only: persist enabled, exclude_orchestrator_models, defaults, mapping, custom_models, excluded_models, and presets.",
         "inputSchema": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
+                "enabled": {"type": "boolean"},
+                "exclude_orchestrator_models": {"type": "boolean"},
                 "defaults": {"type": "object"},
                 "mapping": {"type": "object"},
                 "custom_models": {"type": "array"},
@@ -1112,6 +1846,7 @@ class McpServer:
 
     def __init__(self, manager: RunManager) -> None:
         self.manager = manager
+        self.stdout_lock = threading.Lock()
 
     def _collect_run_ids(self, arguments: dict[str, Any]) -> list[str]:
         ids: list[str] = []
@@ -1142,7 +1877,7 @@ class McpServer:
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
                     },
-                    "serverInfo": {"name": "agy-codex", "version": "1.0.0"},
+                    "serverInfo": {"name": "agy-codex", "version": "1.1.2"},
                 }
             elif method == "ping":
                 result = {}
@@ -1240,11 +1975,21 @@ class McpServer:
                 raise ValueError("'run_id' is required.")
             return self._tool_ok(self.manager.cancel_run(run_id))
 
+        if name == "close_codex_task":
+            run_ids = self._collect_run_ids(arguments)
+            close_all = bool(arguments.get("close_all_finished", False))
+            res = self.manager.close_runs(
+                run_ids, closed_by="agent", close_all_finished=close_all
+            )
+            return self._tool_ok(res)
+
         if name == "open_codex_panel":
             tab = str(arguments.get("tab") or "subagents").strip()
-            if tab not in ("subagents", "stats", "models"):
+            if tab not in ("subagents", "history", "stats", "models"):
                 tab = "subagents"
             runs = self.manager.list_runs(limit=40)
+            all_disk = self.manager.list_runs(limit=500, include_closed=True)
+            closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
             selected = arguments.get("run_id")
             if not selected and runs:
                 selected = runs[0].get("run_id")
@@ -1254,6 +1999,10 @@ class McpServer:
                 "tab": tab,
                 "runs": runs,
                 "selected_run_id": selected,
+                "enabled": bool(wb_cfg.get("enabled", True)),
+                "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
+                "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
+                "closed_24h_count": closed_24h,
                 "active_runs": sum(1 for r in runs if r.get("status") == "running"),
                 "max_concurrent_runs": int(
                     (wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5)
@@ -1279,11 +2028,20 @@ class McpServer:
         if name == "list_runs":
             status = str(arguments.get("status") or "all")
             limit = int(arguments.get("limit") or 40)
-            runs = self.manager.list_runs(status=status, limit=limit)
+            include_closed = bool(arguments.get("include_closed", False))
+            runs = self.manager.list_runs(
+                status=status, limit=limit, include_closed=include_closed
+            )
+            all_disk = self.manager.list_runs(limit=500, include_closed=True)
+            closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
             wb_cfg = codex_catalog.load_workbench_config(ddir)
             return self._tool_ok(
                 {
                     "runs": runs,
+                    "enabled": bool(wb_cfg.get("enabled", True)),
+                    "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
+                    "retention_hours": int((wb_cfg.get("mapping") or {}).get("retention_hours", 24)),
+                    "closed_24h_count": closed_24h,
                     "active_runs": sum(1 for r in runs if r.get("status") == "running"),
                     "max_concurrent_runs": int(
                         (wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5)
@@ -1291,48 +2049,76 @@ class McpServer:
                 }
             )
 
-        if name == "list_local_sessions":
-            query = str(arguments.get("query") or "").strip().lower()
-            limit = int(arguments.get("limit") or 50)
-            include_sub = bool(arguments.get("include_subagents", True))
-            plugin_runs = self.manager.list_runs(limit=200)
-            plugin_sids = {
-                str(r.get("session_id")).strip()
-                for r in plugin_runs
-                if isinstance(r.get("session_id"), str) and str(r.get("session_id")).strip()
-            }
-            res = codex_telemetry.read_local_codex_sessions(chome, ddir, limit=max(limit * 3, 200))
-            sessions = [s for s in res["sessions"] if s["thread_id"] not in plugin_sids]
-            if not include_sub:
-                sessions = [s for s in sessions if not s.get("is_subagent")]
-            if query:
-                sessions = [
-                    s
-                    for s in sessions
-                    if query in str(s.get("title") or "").lower()
-                    or query in str(s.get("model") or "").lower()
-                    or query in str(s.get("cwd") or "").lower()
-                    or query in str(s.get("thread_id") or "").lower()
-                ]
+        if name == "get_history":
+            query = str(arguments.get("query") or "")
+            filter_mode = str(arguments.get("filter") or arguments.get("filter_mode") or "all")
+            limit = int(arguments.get("limit") or 80)
+            return self._tool_ok(
+                self.manager.get_history(query=query, filter_mode=filter_mode, limit=limit)
+            )
+
+        if name == "close_run":
+            run_ids = self._collect_run_ids(arguments)
+            close_all = bool(arguments.get("close_all_finished", False))
+            res = self.manager.close_runs(
+                run_ids, closed_by="user", close_all_finished=close_all
+            )
+            runs = self.manager.list_runs(limit=40)
+            all_disk = self.manager.list_runs(limit=500, include_closed=True)
+            closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
+            res["runs"] = runs
+            res["active_runs"] = sum(1 for r in runs if r.get("status") == "running")
+            res["closed_24h_count"] = closed_24h
+            return self._tool_ok(res)
+
+        if name == "reopen_run":
+            run_id = str(arguments.get("run_id") or "").strip()
+            if not run_id:
+                raise ValueError("'run_id' is required.")
+            return self._tool_ok(self.manager.reopen_run(run_id))
+
+        if name == "send_followup":
+            run_id = str(arguments.get("run_id") or "").strip()
+            prompt = str(arguments.get("prompt") or "").strip()
+            state = self.manager.send_followup(run_id, prompt)
+            with state.lock:
+                summary = state.to_summary_dict()
+            wb_cfg = codex_catalog.load_workbench_config(ddir)
+            summary["active_runs"] = self.manager.active_count()
+            summary["max_concurrent_runs"] = int(
+                (wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5)
+            )
+            return self._tool_ok(summary)
+
+        if name == "toggle_codex_enabled":
+            if "enabled" not in arguments or not isinstance(arguments.get("enabled"), bool):
+                raise ValueError("'enabled' boolean is required.")
+            saved = codex_catalog.save_workbench_config(
+                {"enabled": bool(arguments["enabled"])}, ddir
+            )
+            return self._tool_ok({"enabled": bool(saved.get("enabled", True)), "saved": saved})
+
+        if name == "toggle_exclude_orchestrator":
+            if "enabled" not in arguments or not isinstance(arguments.get("enabled"), bool):
+                raise ValueError("'enabled' boolean is required.")
+            saved = codex_catalog.save_workbench_config(
+                {"exclude_orchestrator_models": bool(arguments["enabled"])}, ddir
+            )
             return self._tool_ok(
                 {
-                    "sessions": sessions[:limit],
-                    "total_available": len(sessions),
-                    "db_path": res.get("db_path"),
-                    "warnings": res.get("warnings") or [],
+                    "exclude_orchestrator_models": bool(
+                        saved.get("exclude_orchestrator_models", True)
+                    ),
+                    "workbench_config": saved,
                 }
             )
 
-        if name == "get_local_session_detail":
-            tid = str(arguments.get("thread_id") or "").strip()
-            return self._tool_ok(codex_telemetry.get_local_session_detail(chome, ddir, tid))
-
         if name == "get_stats":
-            scope = str(arguments.get("scope") or "all")
+            scope = str(arguments.get("scope") or "antigravity")
             trange = str(arguments.get("range") or "7d")
             model = str(arguments.get("model") or "")
             provider = str(arguments.get("provider") or "")
-            runs = self.manager.list_runs(limit=1000)
+            runs = self.manager.list_runs(limit=1000, include_closed=True)
             stats = codex_telemetry.compute_stats(
                 runs,
                 chome,
@@ -1405,31 +2191,76 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def serve_stdio(
+    server: McpServer,
+    stdin_stream: Any,
+    stdout_stream: Any,
+    *,
+    max_workers: int = 16,
+) -> None:
+    """Read JSON-RPC lines from stdin_stream and dispatch valid requests concurrently."""
+    stdout_lock = getattr(server, "stdout_lock", None)
+    if stdout_lock is None:
+        stdout_lock = threading.Lock()
+        server.stdout_lock = stdout_lock
+
+    def _write_response(payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False) + "\n"
+        with stdout_lock:
+            stdout_stream.write(encoded)
+            stdout_stream.flush()
+
+    def _dispatch_request(req: dict[str, Any]) -> None:
+        req_id = req.get("id")
+        try:
+            resp = server.handle_request(req)
+        except Exception as exc:
+            if req_id is None:
+                return
+            resp = server._error(req_id, -32000, str(exc))
+        if resp is not None:
+            try:
+                _write_response(resp)
+            except Exception as exc:
+                print(
+                    f"[agy-codex] failed to write response for id={req_id}: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    worker_count = max(1, int(max_workers or 1))
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+    try:
+        for raw_line in stdin_stream:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError as exc:
+                _write_response(server._error(None, -32700, f"Parse error: {exc}"))
+                continue
+
+            if not isinstance(req, dict):
+                continue
+            executor.submit(_dispatch_request, req)
+    finally:
+        executor.shutdown(wait=True)
+
+
 def main() -> int:
+    for stream in (sys.stdin, sys.stdout):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
     args = parse_args()
     data_dir = codex_catalog.get_plugin_data_dir(args.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     manager = RunManager(data_dir=data_dir)
     server = McpServer(manager=manager)
-
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-        except json.JSONDecodeError as exc:
-            resp = server._error(None, -32700, f"Parse error: {exc}")
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
-            continue
-
-        if not isinstance(req, dict):
-            continue
-        resp = server.handle_request(req)
-        if resp is not None:
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+    serve_stdio(server, sys.stdin, sys.stdout)
     return 0
 
 

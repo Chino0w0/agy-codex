@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import tomllib
@@ -15,6 +16,7 @@ if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
 import codex_catalog  # noqa: E402
+import codex_run  # noqa: E402
 
 
 class TestCatalogAndWhitelist(unittest.TestCase):
@@ -385,6 +387,177 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertEqual(
             meta_fwd["redacted_overrides"]["mcp_servers.fastctx.env.API_KEY"], "<redacted>"
         )
+
+    def test_v11_workbench_defaults_validation_and_retention_clamping(self) -> None:
+        self.assertIs(codex_catalog.DEFAULT_WORKBENCH_CONFIG["enabled"], True)
+        self.assertIs(codex_catalog.DEFAULT_WORKBENCH_CONFIG["exclude_orchestrator_models"], True)
+        self.assertEqual(codex_catalog.DEFAULT_WORKBENCH_CONFIG["mapping"]["retention_hours"], 24)
+
+        saved_low = codex_catalog.save_workbench_config(
+            {
+                "enabled": False,
+                "exclude_orchestrator_models": False,
+                "mapping": {"retention_hours": 0},
+            },
+            self.data_dir,
+        )
+        self.assertIs(saved_low["enabled"], False)
+        self.assertIs(saved_low["exclude_orchestrator_models"], False)
+        self.assertEqual(saved_low["mapping"]["retention_hours"], 1)
+
+        reloaded_low = codex_catalog.load_workbench_config(self.data_dir)
+        self.assertIs(reloaded_low["enabled"], False)
+        self.assertIs(reloaded_low["exclude_orchestrator_models"], False)
+        self.assertEqual(reloaded_low["mapping"]["retention_hours"], 1)
+
+        saved_high = codex_catalog.save_workbench_config(
+            {"mapping": {"retention_hours": 999}},
+            self.data_dir,
+        )
+        self.assertEqual(saved_high["mapping"]["retention_hours"], 168)
+
+        saved_mid = codex_catalog.save_workbench_config(
+            {
+                "enabled": True,
+                "exclude_orchestrator_models": True,
+                "mapping": {"retention_hours": 72},
+            },
+            self.data_dir,
+        )
+        self.assertIs(saved_mid["enabled"], True)
+        self.assertIs(saved_mid["exclude_orchestrator_models"], True)
+        self.assertEqual(saved_mid["mapping"]["retention_hours"], 72)
+
+    def test_orchestrator_guard_and_catalog_metadata_preservation(self) -> None:
+        self.assertTrue(codex_catalog.is_orchestrator_model("demo/orchestrator-v1"))
+        self.assertFalse(codex_catalog.is_orchestrator_model("demo/gpt-5.2-codex"))
+
+        (self.codex_home / "config.toml").write_text(
+            '\n'.join(
+                [
+                    'model = "demo/coder-v1"',
+                    'model_provider = "gw"',
+                    'model_catalog_json = "models-catelog.local.json"',
+                    "",
+                    "[model_providers.gw]",
+                    'name = "Gateway"',
+                    'base_url = "https://gw.example.com/v1"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        (self.codex_home / "models-catelog.local.json").write_text(
+            json.dumps(
+                {
+                    "models": [
+                        {
+                            "slug": "demo/coder-v1",
+                            "display_name": "Coder V1",
+                            "visibility": "list",
+                            "tool_mode": "native",
+                            "supports_search_tool": True,
+                            "supported_reasoning_levels": ["low", "medium", "high"],
+                        },
+                        {
+                            "slug": "demo/orchestrator-v1",
+                            "display_name": "Team Orchestrator",
+                            "visibility": "list",
+                            "tool_mode": "xml",
+                            "supports_search_tool": False,
+                            "supported_reasoning_levels": ["medium", "high"],
+                        },
+                    ]
+                }
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+
+        disc = codex_catalog.discover_models_and_config(self.codex_home, self.data_dir)
+        coder = next(m for m in disc["models"] if m["slug"] == "demo/coder-v1")
+        self.assertFalse(coder.get("orchestrator_excluded"))
+        self.assertFalse(coder.get("excluded"))
+        self.assertEqual(coder.get("tool_mode"), "native")
+        self.assertIs(coder.get("supports_search_tool"), True)
+
+        orch = next(m for m in disc["models"] if m["slug"] == "demo/orchestrator-v1")
+        self.assertTrue(orch.get("orchestrator_excluded"))
+        self.assertTrue(orch.get("excluded"))
+        self.assertEqual(orch.get("tool_mode"), "xml")
+        self.assertIs(orch.get("supports_search_tool"), False)
+
+        with self.assertRaises(ValueError):
+            codex_catalog.resolve_effective_run_config(
+                self.codex_home,
+                self.data_dir,
+                cli_model="demo/orchestrator-v1",
+            )
+
+        codex_catalog.save_workbench_config({"exclude_orchestrator_models": False}, self.data_dir)
+        allowed = codex_catalog.resolve_effective_run_config(
+            self.codex_home,
+            self.data_dir,
+            cli_model="demo/orchestrator-v1",
+        )
+        self.assertEqual(allowed["effective"]["model"], "demo/orchestrator-v1")
+
+    def test_v111_subagent_prefix_exec_env_git_safe_directory_and_short_title(self) -> None:
+        prefix = codex_catalog.SUBAGENT_ROLE_PREFIX
+        prefix_lower = prefix.lower()
+        self.assertIn("before", prefix_lower)
+        self.assertIn("blocked", prefix_lower)
+        self.assertTrue(
+            any(tok in prefix_lower for tok in ("reference", "context")),
+            f"SUBAGENT_ROLE_PREFIX should instruct reading reference/context files: {prefix!r}",
+        )
+
+        git_keys = (
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_KEY_1",
+            "GIT_CONFIG_VALUE_1",
+        )
+        saved_env = {k: os.environ.get(k) for k in git_keys}
+        try:
+            for k in git_keys:
+                os.environ.pop(k, None)
+            env_fresh = codex_run.build_exec_env()
+            self.assertEqual(env_fresh["GIT_CONFIG_COUNT"], "1")
+            self.assertEqual(env_fresh["GIT_CONFIG_KEY_0"], "safe.directory")
+            self.assertEqual(env_fresh["GIT_CONFIG_VALUE_0"], "*")
+
+            os.environ["GIT_CONFIG_COUNT"] = "1"
+            os.environ["GIT_CONFIG_KEY_0"] = "user.name"
+            os.environ["GIT_CONFIG_VALUE_0"] = "Tester"
+            env_append = codex_run.build_exec_env()
+            self.assertEqual(env_append["GIT_CONFIG_COUNT"], "2")
+            self.assertEqual(env_append["GIT_CONFIG_KEY_0"], "user.name")
+            self.assertEqual(env_append["GIT_CONFIG_VALUE_0"], "Tester")
+            self.assertEqual(env_append["GIT_CONFIG_KEY_1"], "safe.directory")
+            self.assertEqual(env_append["GIT_CONFIG_VALUE_1"], "*")
+        finally:
+            for k, old_val in saved_env.items():
+                if old_val is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = old_val
+
+        self.assertEqual(codex_run.derive_short_title("任务：实现登录接口"), "实现登录接口")
+        self.assertEqual(codex_run.derive_short_title("[Tag] Fix auth bug"), "Fix auth bug")
+        self.assertEqual(
+            codex_run.derive_short_title("Task: Refactor cache layer", limit=32),
+            "Refactor cache layer",
+        )
+        default_capped = codex_run.derive_short_title("Task: Refactor cache layer")
+        self.assertLessEqual(len(default_capped), 16)
+        self.assertFalse(default_capped.startswith("Task:"))
+        capped = codex_run.derive_short_title("Task: " + ("X" * 120))
+        self.assertFalse(capped.startswith("Task:"))
+        self.assertGreater(len(capped), 0)
+        self.assertLessEqual(len(capped), 16)
 
 
 if __name__ == "__main__":
