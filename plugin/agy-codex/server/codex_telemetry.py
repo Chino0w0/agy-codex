@@ -16,6 +16,8 @@ import shutil
 import sqlite3
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -24,7 +26,7 @@ from codex_catalog import atomic_write_text, get_codex_home, get_plugin_data_dir
 
 LEDGER_FILENAME = "stats-ledger.jsonl"
 _LEDGER_LOCK = threading.Lock()
-_LEDGER_LAST_SIG: dict[tuple[str, str], tuple[Any, ...]] = {}
+_TERMINAL_STATUSES = frozenset({"done", "partial", "error", "blocked", "cancelled"})
 
 STATE_DB_RE = re.compile(r"^state_(\d+)\.sqlite$")
 THREAD_CANDIDATE_COLS = (
@@ -603,6 +605,8 @@ def _normalize_ledger_record(run_summary: dict[str, Any]) -> dict[str, Any]:
 
     record: dict[str, Any] = {
         "run_id": run_id,
+        "session_id": run_summary.get("session_id"),
+        "source": str(run_summary.get("source") or "mcp"),
         "parent_session_id": parent_sid,
         "parent_session_title": parent_stitle,
         "title": title,
@@ -635,65 +639,77 @@ def _normalize_ledger_record(run_summary: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+@contextmanager
+def _ledger_lock(path: Path) -> Iterator[None]:
+    deadline = time.monotonic() + 3.0
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except (FileExistsError, PermissionError):
+            try:
+                observed = path.stat()
+                if time.time() - observed.st_mtime > 15 and path.stat() == observed:
+                    path.unlink()
+                    continue
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out acquiring the stats ledger lock.")
+            time.sleep(0.03)
+        else:
+            try:
+                owned = os.fstat(fd)
+            finally:
+                os.close(fd)
+            break
+    try:
+        yield
+    finally:
+        for _ in range(5):
+            try:
+                if path.stat() == owned:
+                    path.unlink()
+                break
+            except FileNotFoundError:
+                break
+            except PermissionError:
+                time.sleep(0.01)
+
+
 def append_ledger_record(data_dir: Path, run_summary: dict[str, Any]) -> None:
-    """Upsert a compact terminal/archive record by `run_id` into `stats-ledger.jsonl`."""
+    """Upsert one compact record by run_id; raise on write failure."""
     ddir = Path(data_dir)
     record = _normalize_ledger_record(run_summary)
     run_id = record["run_id"]
     if not run_id:
         return
 
+    ddir.mkdir(parents=True, exist_ok=True)
     ledger_path = ddir / LEDGER_FILENAME
-    sig = (
-        record["status"],
-        record["closed"],
-        record["closed_at"],
-        record["tokens_used"],
-        record["finished_at"],
-    )
-    cache_key = (str(ledger_path), run_id)
     line_str = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
-    with _LEDGER_LOCK:
-        if _LEDGER_LAST_SIG.get(cache_key) == sig and ledger_path.is_file():
-            return
-        ddir.mkdir(parents=True, exist_ok=True)
-        replaced = False
-        if ledger_path.is_file():
+    with _LEDGER_LOCK, _ledger_lock(ddir / ".stats-ledger.lock"):
+        try:
+            existing = ledger_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            existing = ""
+        lines = []
+        insert_at = None
+        # JSONL 只以物理换行分隔；字符串内部允许 U+2028 和 U+2029。
+        for raw_line in existing.split("\n"):
+            if not raw_line.strip():
+                continue
             try:
-                existing_lines = ledger_path.read_text(encoding="utf-8").splitlines()
-            except OSError:
-                existing_lines = []
-            last_match_idx = -1
-            parsed_ids: list[str | None] = []
-            for idx, raw_line in enumerate(existing_lines):
-                s = raw_line.strip()
-                if not s:
-                    parsed_ids.append(None)
-                    continue
-                try:
-                    obj = json.loads(s)
-                    rid = str(obj.get("run_id") or "").strip() if isinstance(obj, dict) else ""
-                except json.JSONDecodeError:
-                    rid = ""
-                parsed_ids.append(rid)
-                if rid == run_id:
-                    last_match_idx = idx
-            if last_match_idx >= 0:
-                new_lines: list[str] = []
-                for idx, raw_line in enumerate(existing_lines):
-                    if not raw_line.strip():
-                        continue
-                    if parsed_ids[idx] == run_id:
-                        if idx == last_match_idx:
-                            new_lines.append(line_str)
-                        continue
-                    new_lines.append(raw_line)
-                atomic_write_text(ledger_path, "\n".join(new_lines) + "\n")
-                replaced = True
-        if not replaced:
-            with ledger_path.open("a", encoding="utf-8", newline="\n") as fh:
-                fh.write(line_str + "\n")
-        _LEDGER_LAST_SIG[cache_key] = sig
+                obj = json.loads(raw_line)
+            except json.JSONDecodeError:
+                obj = None
+            if isinstance(obj, dict) and str(obj.get("run_id") or "").strip() == run_id:
+                insert_at = len(lines)
+            else:
+                lines.append(raw_line)
+        lines.insert(len(lines) if insert_at is None else insert_at, line_str)
+        updated = "\n".join(lines) + "\n"
+        if updated != existing:
+            atomic_write_text(ledger_path, updated)
 
 
 def read_ledger_records(data_dir: Path) -> list[dict[str, Any]]:
@@ -707,7 +723,7 @@ def read_ledger_records(data_dir: Path) -> list[dict[str, Any]]:
         return []
 
     by_id: dict[str, dict[str, Any]] = {}
-    for raw_line in text.splitlines():
+    for raw_line in text.split("\n"):
         line = raw_line.strip()
         if not line:
             continue
@@ -721,7 +737,6 @@ def read_ledger_records(data_dir: Path) -> list[dict[str, Any]]:
         rid = norm["run_id"]
         if not rid:
             continue
-        norm["source"] = str(obj.get("source") or "mcp")
         norm["ok"] = norm["status"] == "done"
         norm["expired"] = True
         by_id[rid] = norm
@@ -750,7 +765,7 @@ def prune_expired_runs(
     pruned = 0
 
     for child in list(rdir.iterdir()):
-        if not child.is_dir():
+        if child.is_symlink() or not child.is_dir() or child.resolve().parent != rdir.resolve():
             continue
         if child.name in active_ids:
             continue
@@ -763,7 +778,7 @@ def prune_expired_runs(
             continue
         if not isinstance(data, dict):
             continue
-        if data.get("status") == "running":
+        if data.get("status") not in _TERMINAL_STATUSES:
             continue
 
         ref_ts = data.get("closed_at") or data.get("finished_at") or data.get("started_at")
@@ -774,10 +789,14 @@ def prune_expired_runs(
                 continue
 
         if (now - float(ref_ts)) > ttl_sec:
-            data.setdefault("run_id", child.name)
-            append_ledger_record(ddir, data)
-            shutil.rmtree(child, ignore_errors=True)
-            pruned += 1
+            data["run_id"] = child.name
+            try:
+                append_ledger_record(ddir, data)
+                shutil.rmtree(child)
+            except (OSError, UnicodeError):
+                continue
+            if not child.exists():
+                pruned += 1
 
     return {"pruned": pruned}
 
@@ -1068,6 +1087,7 @@ def compute_stats(
                     "cached_tokens": 0,
                     "output_tokens": 0,
                     "errors": 0,
+                    "done_count": 0,
                     "dur_sum": 0.0,
                     "dur_count": 0,
                 },
@@ -1077,8 +1097,11 @@ def compute_stats(
             b["input_tokens"] += in_t
             b["cached_tokens"] += c_t
             b["output_tokens"] += out_t
-            if is_plugin and item.get("status") in ("error", "blocked", "partial"):
-                b["errors"] += 1
+            if is_plugin:
+                if st == "done":
+                    b["done_count"] += 1
+                elif st in ("error", "blocked", "partial"):
+                    b["errors"] += 1
             if is_plugin and isinstance(item.get("duration_sec"), (int, float)):
                 b["dur_sum"] += float(item["duration_sec"])
                 b["dur_count"] += 1
@@ -1095,6 +1118,7 @@ def compute_stats(
         for val in d.values():
             in_sum = val["input_tokens"]
             dcnt = val["dur_count"]
+            terminal = val["done_count"] + val["errors"]
             rows.append(
                 {
                     "name": val["name"],
@@ -1107,6 +1131,8 @@ def compute_stats(
                     if in_sum > 0
                     else None,
                     "errors": val["errors"],
+                    "done_count": val["done_count"],
+                    "success_rate": round(val["done_count"] / terminal * 100.0, 1) if terminal else None,
                     "avg_duration_sec": round(val["dur_sum"] / dcnt, 2) if dcnt > 0 else None,
                 }
             )

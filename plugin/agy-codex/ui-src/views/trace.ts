@@ -17,6 +17,7 @@ import {
 
 export interface TraceViewState {
   timelineEntries: TimelineEvent[];
+  timelineRunId: string | null;
   expandedCmdIds: Set<string>;
   groupOpenOverrides: Map<string, boolean>;
   traceExpandedOverrides: Map<string, boolean>;
@@ -114,13 +115,14 @@ export function renderHandoffFlat(run: RunSnapshot): string {
     </div>`;
   }
 
-  const summaryHtml = res.summary
+  const summaryHtml = typeof res.summary === "string" && res.summary
     ? `<div class="handoff-summary prose-inline-code">${formatInlineMarkdown(res.summary)}</div>`
     : "";
 
+  const files = Array.isArray(res.changed_files) ? res.changed_files.filter((f) => typeof f === "string" && f.trim()) : [];
   const filesHtml =
-    Array.isArray(res.changed_files) && res.changed_files.length > 0
-      ? `<div class="file-row">${res.changed_files
+    files.length > 0
+      ? `<div class="file-row">${files
           .map(
             (f) =>
               `<button type="button" class="file-link" data-open-file="${escapeHtml(f)}" title="在侧边栏打开 ${escapeHtml(f)}"><span class="kind-update">~</span><span>${escapeHtml(shortFileName(f, run.cwd || "."))}</span></button>`,
@@ -128,21 +130,26 @@ export function renderHandoffFlat(run: RunSnapshot): string {
           .join("")}</div>`
       : "";
 
+  const checks = Array.isArray(res.verification)
+    ? res.verification.filter((v) => v && typeof v === "object" && !Array.isArray(v) &&
+        typeof v.command === "string" && typeof v.passed === "boolean")
+    : [];
   const verifyHtml =
-    Array.isArray(res.verification) && res.verification.length > 0
-      ? `<div class="verify-list">${res.verification
+    checks.length > 0
+      ? `<div class="verify-list">${checks
           .map((v) => {
             const cls = v.passed ? "exit-ok" : "exit-fail";
             const label = v.passed ? "PASS" : "FAIL";
-            const notes = v.notes ? `<span class="verify-note">${escapeHtml(v.notes)}</span>` : "";
+            const notes = typeof v.notes === "string" && v.notes ? `<span class="verify-note">${escapeHtml(v.notes)}</span>` : "";
             return `<div class="verify-item"><span class="exit-badge ${cls}">${label}</span><code class="verify-cmd">${escapeHtml(v.command)}</code>${notes}</div>`;
           })
           .join("")}</div>`
       : "";
 
+  const risks = Array.isArray(res.risks) ? res.risks.filter((r) => typeof r === "string" && r.trim()) : [];
   const risksHtml =
-    Array.isArray(res.risks) && res.risks.length > 0
-      ? `<div class="risks-box">${res.risks
+    risks.length > 0
+      ? `<div class="risks-box">${risks
           .map((r) => `<p class="risks-item">${escapeHtml(r)}</p>`)
           .join("")}</div>`
       : "";
@@ -181,12 +188,8 @@ export function renderTraceView(
   const promptOpen = st.promptExpandedIds.has(run.run_id);
 
   const remTimeoutSec =
-    run.status === "running"
-      ? typeof run.remaining_timeout_sec === "number"
-        ? Math.max(0, run.remaining_timeout_sec)
-        : typeof run.timeout_sec === "number" && run.timeout_sec > 0
-          ? Math.max(0, run.timeout_sec - elapsedSec)
-          : null
+    run.status === "running" && typeof run.timeout_sec === "number" && run.timeout_sec > 0
+      ? Math.max(0, run.remaining_timeout_sec ?? run.timeout_sec - elapsedSec)
       : null;
 
   // Auto-collapse execution rail when completed cleanly; auto-expand when running/blocked/error/partial
@@ -226,7 +229,7 @@ export function renderTraceView(
         <div>留存策略: <span class="prov-val">${escapeHtml(ttlText)}</span></div>
         ${
           typeof run.timeout_sec === "number" && run.timeout_sec > 0
-            ? `<div>超时限制: <span class="prov-val">${escapeHtml(formatDuration(run.timeout_sec))}${remTimeoutSec !== null ? ` (剩余 ${escapeHtml(formatDuration(remTimeoutSec))})` : ""}</span></div>`
+            ? `<div>超时限制: <span class="prov-val">${escapeHtml(formatDuration(run.timeout_sec))}${remTimeoutSec !== null ? ` (<span${!readOnly ? ' id="timeout-remaining-hint"' : ""}>超时剩余 ${escapeHtml(formatDuration(remTimeoutSec))}</span>)` : ""}</span></div>`
             : ""
         }
         ${
@@ -257,18 +260,29 @@ export function renderTraceView(
         }
       </div>
       <div class="trace-ctx-right">
-        <span id="${!readOnly && run.status === "running" ? "elapsed-timer" : ""}" class="tabular-nums">${escapeHtml(formatDuration(elapsedSec))}</span>
-        ${
-          remTimeoutSec !== null
-            ? `<span id="${!readOnly ? "timeout-remaining-hint" : ""}" class="tabular-nums ${remTimeoutSec < 180 ? "badge badge-warn" : "trace-muted"}">超时剩余 ${escapeHtml(formatDuration(remTimeoutSec))}</span>`
-            : ""
-        }
+        <span${!readOnly && run.status === "running" ? ' id="elapsed-timer"' : ""} class="tabular-nums">${run.status === "running" ? "已运行 " : ""}${escapeHtml(formatDuration(elapsedSec))}</span>
         ${tokenText ? `<span class="tabular-nums">${escapeHtml(tokenText)}</span>` : ""}
         <button type="button" class="btn btn-sm" data-toggle-prov="${escapeHtml(run.run_id)}">${provOpen ? "收起详情" : "详情"}</button>
       </div>
     </div>
+    ${run.status === "running" && run.in_flight_command
+      ? `<div class="trace-in-flight trace-muted" title="${escapeHtml(run.in_flight_command)}">正在执行: <code>${escapeHtml(run.in_flight_command)}</code></div>`
+      : ""}
     ${provenanceHtml}
   </div>`;
+
+  const healthLabel = run.health === "stalled" ? "输出停滞" : run.health === "loop_warning" ? "疑似循环" : "";
+  const healthBannerHtml = healthLabel
+    ? `<div class="health-alert-banner"><strong>${healthLabel}</strong>${run.health_reason ? `<span>${escapeHtml(run.health_reason)}</span>` : ""}
+        ${run.status === "running" ? `<span>预警本身不会停止任务；可继续观察，或${readOnly ? "前往活跃监控停止" : "点击底部「停止」"}。</span>` : ""}
+      </div>`
+    : "";
+  const recentErrors = run.status === "running" && Array.isArray(run.recent_errors)
+    ? run.recent_errors.filter((error) => typeof error === "string" && error.trim()).slice(-2)
+    : [];
+  const recentErrorsHtml = recentErrors.length
+    ? `<div class="health-alert-banner is-error"><strong>最近报错</strong><ul>${recentErrors.map((error) => `<li title="${escapeHtml(error)}">${escapeHtml(error)}</li>`).join("")}</ul></div>`
+    : "";
 
   const warnHtml =
     Array.isArray(run.warnings) && run.warnings.length > 0
@@ -286,13 +300,11 @@ export function renderTraceView(
       </div>`
     : "";
 
-  // Events source: in active mode use incremental timelineEntries; in readOnly history mode fallback to run.events if timelineEntries isn't for this run
-  const events =
-    st.timelineEntries.length > 0 || !readOnly
-      ? st.timelineEntries
-      : Array.isArray(run.events)
-        ? run.events
-        : [];
+  // 只读详情切换时，上一任务的时间线和展开状态不可用于新任务。
+  const timelineMatches = !readOnly || st.timelineRunId === run.run_id;
+  const events = timelineMatches ? st.timelineEntries : (run.events ?? []).filter((ev) => ev.kind !== "session" && ev.kind !== "turn_done");
+  const timelineLoading = !timelineMatches && !Array.isArray(run.events) && !run.expired;
+  const expandedCmdIds = timelineMatches ? st.expandedCmdIds : new Set<string>();
   const blocks = buildTimelineBlocks(events);
   let lastGroupIdx = -1;
   for (let i = blocks.length - 1; i >= 0; i--) {
@@ -327,12 +339,12 @@ export function renderTraceView(
             const { icon, title, hasRunning } = summarizeGroup(blk.events);
             const isLastGroup = bIdx === lastGroupIdx;
             const defaultOpen = hasRunning || isLastGroup || blk.events.length <= 4;
-            const isOpen = st.groupOpenOverrides.has(blk.id)
+            const isOpen = timelineMatches && st.groupOpenOverrides.has(blk.id)
               ? st.groupOpenOverrides.get(blk.id)!
               : defaultOpen;
             const innerHtml = isOpen
               ? `<div class="group-rail">${blk.events
-                  .map((ev, eIdx) => renderStepEvent(ev, eIdx, run.cwd || ".", st.expandedCmdIds))
+                  .map((ev, eIdx) => renderStepEvent(ev, eIdx, run.cwd || ".", expandedCmdIds))
                   .join("")}</div>`
               : "";
             return `<div class="group">
@@ -345,7 +357,9 @@ export function renderTraceView(
           .join("");
 
   const execRailHtml =
-    stepCount > 0 || run.status === "running" || run.expired
+    timelineLoading
+      ? `<div class="empty-hint">正在加载此任务的执行日志...</div>`
+      : stepCount > 0 || run.status === "running" || run.expired
       ? `<div class="exec-rail">
           <button type="button" class="rail-toggle-btn" data-toggle-trace="${escapeHtml(run.run_id)}">
             ${traceOpen ? ICONS.chevronDown : ICONS.chevron}
@@ -388,7 +402,7 @@ export function renderTraceView(
     footerHtml = `<div class="trace-footer">
       <div class="trace-footer-status">
         <span class="status-dot is-running" aria-hidden="true"></span>
-        <span id="running-footer-elapsed">子 Agent 执行中 (${escapeHtml(formatDuration(elapsedSec))})</span>
+        <span id="running-footer-elapsed">已运行 ${escapeHtml(formatDuration(elapsedSec))}</span>
       </div>
       <button type="button" class="btn btn-danger btn-sm" id="stop-run-btn" data-stop-run="${escapeHtml(run.run_id)}">停止</button>
     </div>`;
@@ -413,10 +427,11 @@ export function renderTraceView(
     </div>`;
   }
 
-  return `<div class="trace-shell">
+  return `<div class="trace-shell" data-trace-run="${escapeHtml(run.run_id)}" data-trace-mode="${readOnly ? "history" : "monitor"}">
     ${ctxBarHtml}
     <div class="trace-scroll-wrap">
       <div class="trace-scroll custom-scroll" id="timeline-box">
+        ${healthBannerHtml || recentErrorsHtml ? `<div class="trace-alerts">${healthBannerHtml}${recentErrorsHtml}</div>` : ""}
         ${warnHtml}
         ${feedbackHtml}
         ${promptCardHtml}

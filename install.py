@@ -14,12 +14,15 @@ import argparse
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 
 def parse_args() -> argparse.Namespace:
@@ -81,9 +84,195 @@ def copy_tree_clean(src: Path, dst: Path) -> list[dict[str, str]]:
     return receipt_files
 
 
+def _safe_print(msg: str, *, error: bool = False) -> None:
+    stream = sys.stderr if error else sys.stdout
+    try:
+        print(msg, file=stream, flush=True)
+    except UnicodeEncodeError:
+        encoding = stream.encoding or "ascii"
+        print(msg.encode(encoding, errors="replace").decode(encoding), file=stream, flush=True)
+
+
+def _is_link_or_reparse_point(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _validate_plugin_target(target: Path, source: Path) -> None:
+    if _is_link_or_reparse_point(target):
+        raise ValueError(f"Refusing to install over a symlink or reparse point: {target}")
+    resolved = target.resolve()
+    if resolved.is_relative_to(source) or source.is_relative_to(resolved):
+        raise ValueError(f"Refusing to install over the source plugin or an overlapping directory: {target}")
+    if not target.exists():
+        return
+    if not target.is_dir():
+        raise ValueError(f"Plugin destination is not a directory: {target}")
+    if not any(target.iterdir()):
+        return
+    receipt = target / ".agy-codex-install.json"
+    if not _is_link_or_reparse_point(receipt) and receipt.is_file():
+        return
+    meta = target / "plugin.json"
+    if not _is_link_or_reparse_point(meta) and meta.is_file():
+        try:
+            metadata = json.loads(meta.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            pass
+        else:
+            if isinstance(metadata, dict) and metadata.get("name") == "agy-codex":
+                return
+    raise ValueError(f"Refusing to replace a non-empty directory not marked as Agy Codex: {target}")
+
+
+def _rewrite_hook_commands(node: Any, py_cmd: str, script: Path) -> Any:
+    prefix = "python3 server/routing_hook.py "
+    if isinstance(node, dict):
+        result = {}
+        for key, value in node.items():
+            if key == "command" and isinstance(value, str) and value.startswith(prefix):
+                event = value[len(prefix):].strip()
+                if os.name == "nt":
+                    result[key] = f'"{py_cmd}" "{script}" {subprocess.list2cmdline([event])}'
+                else:
+                    result[key] = shlex.join((py_cmd, str(script), event))
+            else:
+                result[key] = _rewrite_hook_commands(value, py_cmd, script)
+        return result
+    if isinstance(node, list):
+        return [_rewrite_hook_commands(item, py_cmd, script) for item in node]
+    return node
+
+
+def _write_json(path: Path, payload: Any) -> None:
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+
+def _build_plugin(repo_root: Path, src_plugin: Path, stage: Path, target_plugin: Path) -> None:
+    plugin_meta = json.loads((src_plugin / "plugin.json").read_text(encoding="utf-8"))
+    shutil.copy2(src_plugin / "plugin.json", stage / "plugin.json")
+
+    py_cmd = sys.executable
+    mcp_cfg = json.loads((src_plugin / "mcp_config.json").read_text(encoding="utf-8"))
+    mcp_cfg["mcpServers"]["codex"]["command"] = py_cmd
+    _write_json(stage / "mcp_config.json", mcp_cfg)
+
+    receipt_files = [
+        {"path": name, "sha256": sha256_file(stage / name)}
+        for name in ("plugin.json", "mcp_config.json")
+    ]
+
+    src_hooks = src_plugin / "hooks.json"
+    if src_hooks.is_file():
+        hooks_cfg = json.loads(src_hooks.read_text(encoding="utf-8"))
+        script = target_plugin / "server" / "routing_hook.py"
+        _write_json(stage / "hooks.json", _rewrite_hook_commands(hooks_cfg, py_cmd, script))
+        receipt_files.append({"path": "hooks.json", "sha256": sha256_file(stage / "hooks.json")})
+
+    for sub in ("assets", "rules", "skills", "server"):
+        src_sub = src_plugin / sub
+        if src_sub.is_dir():
+            for entry in copy_tree_clean(src_sub, stage / sub):
+                receipt_files.append({"path": f"{sub}/{entry['path']}", "sha256": entry["sha256"]})
+
+    for script_name in ("mcp_server.py", "codex_run.py", "routing_hook.py"):
+        make_executable(stage / "server" / script_name)
+
+    receipt = {
+        "name": plugin_meta.get("name", "agy-codex"),
+        "version": plugin_meta.get("version", "1.0.0"),
+        "installedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "sourceRoot": str(repo_root),
+        "files": receipt_files,
+    }
+    _write_json(stage / ".agy-codex-install.json", receipt)
+
+
+def _clean_temp_tree(path: Path) -> None:
+    retries = 3 if os.name == "nt" else 0
+    for attempt in range(retries + 1):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            if attempt == retries:
+                _safe_print(f"Warning: Could not clean temporary directory {path}: {exc}", error=True)
+                return
+        time.sleep(0.1)
+
+
+def _sync_staged_in_place(stage: Path, target_plugin: Path) -> None:
+    """Atomically sync verified staged files into an in-use target folder (e.g. Windows CWD lock)."""
+    old_managed: set[str] = set()
+    old_receipt_path = target_plugin / ".agy-codex-install.json"
+    if old_receipt_path.is_file():
+        try:
+            old_data = json.loads(old_receipt_path.read_text(encoding="utf-8"))
+            for item in old_data.get("files") or []:
+                if isinstance(item, dict) and isinstance(item.get("path"), str):
+                    old_managed.add(item["path"])
+        except Exception:
+            pass
+
+    new_managed: set[str] = set()
+    staged_receipt = stage / ".agy-codex-install.json"
+    for root, _, files in os.walk(stage):
+        rel_root = Path(root).relative_to(stage)
+        dst_dir = target_plugin / rel_root
+        if _is_link_or_reparse_point(dst_dir):
+            raise ValueError(f"Refusing to sync into symlink or reparse point: {dst_dir}")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        for fname in files:
+            src_file = Path(root) / fname
+            if src_file == staged_receipt:
+                continue
+            rel_posix = (rel_root / fname).as_posix()
+            new_managed.add(rel_posix)
+            dst_file = dst_dir / fname
+            if _is_link_or_reparse_point(dst_file):
+                raise ValueError(f"Refusing to overwrite symlink or reparse point: {dst_file}")
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{fname}-", dir=dst_dir)
+            tmp_path = Path(tmp_name)
+            try:
+                os.close(fd)
+                shutil.copy2(src_file, tmp_path)
+                os.replace(tmp_path, dst_file)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+    for stale_rel in sorted(old_managed - new_managed):
+        stale_path = (target_plugin / stale_rel).resolve()
+        try:
+            if stale_path.is_relative_to(target_plugin.resolve()) and stale_path.is_file():
+                stale_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if staged_receipt.is_file():
+        fd, tmp_name = tempfile.mkstemp(prefix=".receipt-", dir=target_plugin)
+        tmp_path = Path(tmp_name)
+        try:
+            os.close(fd)
+            shutil.copy2(staged_receipt, tmp_path)
+            os.replace(tmp_path, old_receipt_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+
 def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
-    src_plugin = repo_root / "plugin" / "agy-codex"
+    src_plugin = (repo_root / "plugin" / "agy-codex").resolve()
+    plugins_dir = plugins_dir.resolve()
     target_plugin = plugins_dir / "agy-codex"
+    _validate_plugin_target(target_plugin, src_plugin)
 
     if not (src_plugin / "plugin.json").is_file():
         raise FileNotFoundError(f"Missing plugin.json at {src_plugin}")
@@ -95,85 +284,80 @@ def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
             "Run `npm install && npm run build` inside plugin/agy-codex/ui-src first."
         )
 
-    # Clean old installed runtime files while keeping directory safe
-    if target_plugin.exists():
-        for item in target_plugin.iterdir():
-            if item.is_dir():
-                shutil.rmtree(item)
-            else:
-                item.unlink()
-    target_plugin.mkdir(parents=True, exist_ok=True)
-
-    plugin_meta = json.loads((src_plugin / "plugin.json").read_text(encoding="utf-8"))
-    shutil.copy2(src_plugin / "plugin.json", target_plugin / "plugin.json")
-
-    mcp_cfg = json.loads((src_plugin / "mcp_config.json").read_text(encoding="utf-8"))
-    if os.name == "nt":
-        server_cfg = mcp_cfg.get("mcpServers", {}).get("codex")
-        if isinstance(server_cfg, dict) and server_cfg.get("command") == "python3":
-            server_cfg["command"] = "python"
-    (target_plugin / "mcp_config.json").write_text(
-        json.dumps(mcp_cfg, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-
-    receipt_files = [
-        {"path": "plugin.json", "sha256": sha256_file(target_plugin / "plugin.json")},
-        {"path": "mcp_config.json", "sha256": sha256_file(target_plugin / "mcp_config.json")},
-    ]
-
-    src_hooks = src_plugin / "hooks.json"
-    if src_hooks.is_file():
-        hooks_cfg = json.loads(src_hooks.read_text(encoding="utf-8"))
-        if os.name == "nt" and isinstance(hooks_cfg, dict):
-            def _adapt_cmd(node: Any) -> Any:
-                if isinstance(node, dict):
-                    return {
-                        k: (
-                            f"python {v[8:]}"
-                            if k == "command" and isinstance(v, str) and v.startswith("python3 ")
-                            else _adapt_cmd(v)
-                        )
-                        for k, v in node.items()
-                    }
-                if isinstance(node, list):
-                    return [_adapt_cmd(item) for item in node]
-                return node
-
-            hooks_cfg = _adapt_cmd(hooks_cfg)
-        (target_plugin / "hooks.json").write_text(
-            json.dumps(hooks_cfg, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-            newline="\n",
-        )
-        receipt_files.append(
-            {"path": "hooks.json", "sha256": sha256_file(target_plugin / "hooks.json")}
-        )
-
-    for sub in ("assets", "rules", "skills", "server"):
-        src_sub = src_plugin / sub
-        if src_sub.is_dir():
-            sub_files = copy_tree_clean(src_sub, target_plugin / sub)
-            for f in sub_files:
-                receipt_files.append({"path": f"{sub}/{f['path']}", "sha256": f["sha256"]})
-
-    for script_name in ("mcp_server.py", "codex_run.py", "routing_hook.py"):
-        make_executable(target_plugin / "server" / script_name)
-
-    receipt = {
-        "name": plugin_meta.get("name", "agy-codex"),
-        "version": plugin_meta.get("version", "1.0.0"),
-        "installedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "sourceRoot": str(repo_root),
-        "files": receipt_files,
-    }
-    (target_plugin / ".agy-codex-install.json").write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-        newline="\n",
-    )
+    plugins_dir.mkdir(parents=True, exist_ok=True)
+    stage_prefix = ".agy-codex-stage-"
+    stage = Path(tempfile.mkdtemp(prefix=f"{stage_prefix}{os.getpid()}-", dir=plugins_dir.parent))
+    backup = stage.with_name(".agy-codex-backup-" + stage.name.removeprefix(stage_prefix))
+    try:
+        _build_plugin(repo_root, src_plugin, stage, target_plugin)
+        _validate_plugin_target(target_plugin, src_plugin)
+        # 暂存全部完成后才移动旧版本；切换失败时恢复原安装。
+        had_old_plugin = target_plugin.exists()
+        synced_in_place = False
+        if had_old_plugin:
+            if os.path.lexists(backup):
+                raise FileExistsError(f"Plugin backup path is already occupied: {backup}")
+            try:
+                os.replace(target_plugin, backup)
+            except OSError as exc:
+                if os.name == "nt" and getattr(exc, "winerror", None) in (5, 32):
+                    _sync_staged_in_place(stage, target_plugin)
+                    _safe_print(
+                        "  -> Target folder is in use by a running process; updated plugin files atomically in place."
+                    )
+                    synced_in_place = True
+                else:
+                    raise
+        if not synced_in_place:
+            try:
+                os.replace(stage, target_plugin)
+            except OSError:
+                if had_old_plugin:
+                    try:
+                        if os.path.lexists(target_plugin):
+                            raise FileExistsError(f"Plugin destination is already occupied: {target_plugin}")
+                        os.replace(backup, target_plugin)
+                    except OSError as exc:
+                        raise OSError(
+                            f"Plugin switch and rollback failed; old installation retained at {backup}: {exc}"
+                        ) from exc
+                raise
+            if had_old_plugin:
+                _clean_temp_tree(backup)
+    finally:
+        if stage.exists():
+            _clean_temp_tree(stage)
     return target_plugin / "server" / "codex_run.py"
+
+
+def _validate_profile_target(target: Path) -> None:
+    if _is_link_or_reparse_point(target):
+        raise ValueError(f"Refusing to write worker profile to a symlink or reparse point: {target}")
+    if target.exists() and not target.is_file():
+        raise ValueError(f"Worker profile destination must be a regular file, not a directory or special file: {target}")
+
+
+def _install_profile(source: Path, target: Path, *, force: bool) -> None:
+    _validate_profile_target(target)
+    exists = target.is_file()
+    if exists and not force:
+        _safe_print(f"  -> Skipped: {target} already exists (re-run with --force to overwrite).")
+        return
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{target.name}-", dir=target.parent)
+    temp = Path(name)
+    try:
+        os.close(fd)
+        shutil.copy2(source, temp)
+        _validate_profile_target(target)
+        if target.is_file() and not force:
+            _safe_print(f"  -> Skipped: {target} already exists (re-run with --force to overwrite).")
+            return
+        os.replace(temp, target)
+        _safe_print(f"  -> Installed {target}")
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -191,35 +375,32 @@ def main() -> int:
 
     total_steps = 2 + (0 if args.skip_doctor else 1)
     step = 1
+    target_profile = codex_home / "worker.config.toml"
+    _validate_profile_target(target_profile)
 
-    print(f"[{step}/{total_steps}] Installing Agy Codex plugin to {plugins_dir / 'agy-codex'}")
+    _safe_print(f"[{step}/{total_steps}] Installing Agy Codex plugin to {plugins_dir / 'agy-codex'}")
     codex_run_path = install_plugin(repo_root, plugins_dir)
     step += 1
 
     legacy_plugin = plugins_dir / "codex-in-anti"
     if legacy_plugin.is_dir():
-        print(
+        _safe_print(
             f"  [note] Legacy plugin folder detected at {legacy_plugin} (left untouched; "
             "you may remove it manually if migrating)."
         )
 
-    target_profile = codex_home / "worker.config.toml"
-    print(f"[{step}/{total_steps}] Installing Codex worker profile to {target_profile}")
-    codex_home.mkdir(parents=True, exist_ok=True)
-    if target_profile.is_file() and not args.force:
-        print(f"  -> Skipped: {target_profile} already exists (re-run with --force to overwrite).")
-    else:
-        shutil.copy2(repo_root / "profiles" / "worker.config.toml", target_profile)
-        print(f"  -> Installed {target_profile}")
+    _safe_print(f"[{step}/{total_steps}] Installing Codex worker profile to {target_profile}")
+    _install_profile(repo_root / "profiles" / "worker.config.toml", target_profile, force=args.force)
     step += 1
 
     if args.skip_doctor:
-        print("Done! (Skipped doctor check.)")
+        _safe_print("Done! (Skipped doctor check.)")
         return 0
 
-    print(f"[{step}/{total_steps}] Running `codex_run.py doctor`")
+    _safe_print(f"[{step}/{total_steps}] Running `codex_run.py doctor`")
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
+    env["PYTHONIOENCODING"] = f"{sys.stdout.encoding or 'utf-8'}:replace"
     if args.data_dir:
         env["AGY_CODEX_DATA_DIR"] = str(Path(args.data_dir).expanduser())
     proc = subprocess.run([sys.executable, str(codex_run_path), "doctor"], env=env)
@@ -227,4 +408,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError, RuntimeError) as exc:
+        _safe_print(f"Installation failed: {exc}", error=True)
+        raise SystemExit(1) from None

@@ -3,7 +3,7 @@
 
 Reads workbench configuration (`enabled`, `intercept_native_subagents`,
 `exclude_orchestrator_models`, `native_passthrough_subagents`) and checks fast local
-Codex CLI readiness (<5ms, zero subprocess calls) so general subagent delegations
+Codex CLI readiness (zero subprocess calls) so general subagent delegations
 default to `agy-codex` MCP when enabled and fail open to native Antigravity
 subagents when disabled, overridden by the user, or not yet configured.
 """
@@ -34,15 +34,17 @@ BUILTIN_PASSTHROUGH_SUBAGENTS: frozenset[str] = frozenset(
     }
 )
 
+_NATIVE_TARGET = r"(?:(?:(?:the\s+)?Antigravity\s+)?native\s+subagents?|invoke_subagent)\b"
+_CHINESE_NATIVE_TARGET = r"(?:Antigravity\s*)?原生(?:子代理|子\s*agent|agent)?"
 USER_NATIVE_OVERRIDE_RE = re.compile(
-    r"(?:"
-    r"(?:不|别|勿|不要|停止|关闭|禁用|暂停)\s*(?:使用\s*)?codex"
-    r"|用\s*(?:antigravity\s*)?原生(?:子代理|子\s*agent|agent)"
-    r"|native\s+subagent"
-    r"|bypass\s+codex"
-    r"|use\s+invoke_subagent"
-    r"|without\s+codex"
-    r")",
+    # 先吞掉否定指令，避免其中的肯定子串作为单独指令命中。
+    r"\b(?:do\s+not|don['’]t|not|never)\s+(?:use|call|invoke|choose)\s+" + _NATIVE_TARGET
+    + r"|(?:不要|别|勿|不|禁止)\s*(?:使用|用|调用|选择)\s*" + _CHINESE_NATIVE_TARGET
+    + r"|(?P<override>"
+    + r"(?:不|别|勿|不要|停止|关闭|禁用|暂停)\s*(?:使用|用)?\s*codex\b"
+    + r"|(?:使用|用|调用)\s*" + _CHINESE_NATIVE_TARGET
+    + r"|\b(?:use|call|invoke|choose)\s+" + _NATIVE_TARGET
+    + r"|\b(?:bypass|without)\s+codex\b)",
     re.IGNORECASE,
 )
 
@@ -68,6 +70,8 @@ def _provider_has_auth(prov: dict[str, Any]) -> bool:
 def check_codex_readiness(
     codex_home: Path,
     data_dir: Path,
+    *,
+    workbench_config: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None, str | None]:
     """Check binary, credentials, and compliant default model without spawning processes."""
     try:
@@ -75,14 +79,17 @@ def check_codex_readiness(
     except FileNotFoundError:
         return False, "未检测到本地 codex CLI 可执行文件", None
 
-    base_cfg, _ = codex_catalog.load_toml_file(codex_home / "config.toml")
-    worker_cfg, _ = codex_catalog.load_toml_file(codex_home / "worker.config.toml")
-    wb_cfg = codex_catalog.load_workbench_config(data_dir)
+    try:
+        resolved = codex_catalog.resolve_effective_run_config(
+            codex_home, data_dir, workbench_config=workbench_config
+        )
+    except (RuntimeError, ValueError):
+        return False, "无法解析 Codex 默认配置", None
 
     auth_file = codex_home / "auth.json"
     auth_ready = auth_file.is_file() and auth_file.stat().st_size > 0
     env_ready = bool((os.environ.get("OPENAI_API_KEY") or "").strip())
-    providers = base_cfg.get("model_providers")
+    providers = resolved["base_cfg"].get("model_providers")
     provider_ready = isinstance(providers, dict) and any(
         isinstance(pval, dict) and _provider_has_auth(pval) for pval in providers.values()
     )
@@ -90,30 +97,7 @@ def check_codex_readiness(
     if not (auth_ready or env_ready or provider_ready):
         return False, "尚未检测到 Codex 登录凭据或自定义 Provider 配置", None
 
-    excluded = {str(m).strip() for m in (wb_cfg.get("excluded_models") or []) if str(m).strip()}
-    exclude_orch = bool(wb_cfg.get("exclude_orchestrator_models", True))
-
-    wb_defaults = wb_cfg.get("defaults") or {}
-    candidates = [
-        wb_defaults.get("model"),
-        worker_cfg.get("model"),
-        base_cfg.get("model"),
-    ]
-    safe_default_model: str | None = None
-    for cand in candidates:
-        if not isinstance(cand, str):
-            continue
-        model_slug = cand.strip()
-        if not model_slug:
-            continue
-        if model_slug in excluded:
-            continue
-        if exclude_orch and codex_catalog.is_orchestrator_model(model_slug):
-            continue
-        safe_default_model = model_slug
-        break
-
-    return True, None, safe_default_model
+    return True, None, resolved["effective"]["model"]
 
 
 def handle_session_start(
@@ -138,7 +122,9 @@ def handle_session_start(
             ]
         }
 
-    ready, reason, default_model = check_codex_readiness(codex_home, data_dir)
+    ready, reason, default_model = check_codex_readiness(
+        codex_home, data_dir, workbench_config=wb_cfg
+    )
     if not ready:
         return {
             "injectSteps": [
@@ -173,7 +159,7 @@ def handle_session_start(
         model_hint = (
             f"当前合规默认模型为 `{default_model}`（并发槽位上限 {max_conc}），"
             "常规委派可直接调用 `start_codex_task(prompt=..., cwd=..., preset='coding|explore|frontend|review|debug|fast')`，"
-            "无需先调 `list_codex_models` 或打断询问用户；`start_codex_task` 保持默认 `timeout=600`，"
+            "无需先调 `list_codex_models` 或打断询问用户；`start_codex_task` 可省略 `timeout`，未配置时不限总时长，"
             "轮询等待用 `wait_codex_task(..., timeout=120)`（超时返回 `wait_timed_out=true` 时继续等待，勿重复派发）。"
         )
     else:
@@ -244,10 +230,12 @@ def handle_pre_tool_use(
         return {"decision": "allow"}
 
     last_user_input = str(payload.get("lastUserInput") or "")
-    if last_user_input and USER_NATIVE_OVERRIDE_RE.search(last_user_input):
+    if any(match.group("override") for match in USER_NATIVE_OVERRIDE_RE.finditer(last_user_input)):
         return {"decision": "allow"}
 
-    ready, _, default_model = check_codex_readiness(codex_home, data_dir)
+    ready, _, default_model = check_codex_readiness(
+        codex_home, data_dir, workbench_config=wb_cfg
+    )
     if not ready:
         return {"decision": "allow"}
 
@@ -261,7 +249,7 @@ def handle_pre_tool_use(
         "decision": "deny",
         "reason": (
             f"当前「Codex 联动」处于开启状态，通用子代理 `{sub_label}` 已由 Agy Codex 默认接管。"
-            f"请改用 `agy-codex` MCP 的 `start_codex_task` 派发（保持默认 `timeout=600`）{model_guidance}，并在紧接着调用 "
+            f"请改用 `agy-codex` MCP 的 `start_codex_task` 派发（可省略 `timeout`，未配置时不限总时长）{model_guidance}，并在紧接着调用 "
             "`open_codex_panel(tab=\"subagents\", run_id=...)` 展示进度，完成后通过 "
             "`wait_codex_task(..., timeout=120)` 验收并在结束时调用 `close_codex_task`。"
             "若用户需要改回原生子代理，可在插件顶部随时关闭「Codex 联动」开关。"

@@ -104,6 +104,13 @@ export interface RunSnapshot {
   duration_sec?: number | null;
   timeout_sec?: number;
   remaining_timeout_sec?: number | null;
+  completed_commands?: number;
+  health?: "healthy" | "stalled" | "loop_warning" | "error";
+  health_reason?: string | null;
+  last_activity_at?: number | null;
+  idle_sec?: number | null;
+  in_flight_command?: string | null;
+  recent_errors?: string[];
   session_id?: string | null;
   tokens_used?: number | null;
   usage?: UsageInfo | null;
@@ -190,6 +197,7 @@ export interface StatsDimRow {
   output_tokens: number;
   cache_hit_rate: number | null;
   errors: number;
+  done_count?: number;
   avg_duration_sec: number | null;
   success_rate?: number | null;
 }
@@ -281,6 +289,8 @@ export interface WorkbenchConfig {
     allow_nested_subagents: boolean;
     max_concurrent_runs: number;
     retention_hours?: number;
+    worker_timeout_sec?: number;
+    idle_timeout_sec?: number;
   };
   excluded_models: string[];
   custom_models: Array<{

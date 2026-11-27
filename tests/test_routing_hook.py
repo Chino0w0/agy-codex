@@ -93,7 +93,7 @@ class TestRoutingHook(unittest.TestCase):
         msg = ss["injectSteps"][0]["systemMessage"]["systemMessage"]
         self.assertIn("默认路由已激活", msg)
         self.assertIn("gpt-5.4", msg)
-        self.assertIn("timeout=600", msg)
+        self.assertIn("未配置时不限总时长", msg)
         self.assertIn("timeout=120", msg)
 
     def test_2_switch_off_allows_native_subagent_immediately(self) -> None:
@@ -140,6 +140,14 @@ class TestRoutingHook(unittest.TestCase):
                 self.data_dir,
             )
             self.assertEqual(res, {"decision": "allow"}, msg=f"Should allow for override: {phrase}")
+
+        for negated in ("Do not use native subagent; use Codex", "不要用原生子代理，直接派给 Codex"):
+            res = routing_hook.handle_pre_tool_use(
+                self._subagent_payload("implementer", user_input=negated),
+                self.codex_home,
+                self.data_dir,
+            )
+            self.assertEqual(res["decision"], "deny", msg=f"Should NOT allow native on negated phrase: {negated}")
 
     def test_6_unready_binary_or_auth_fails_open(self) -> None:
         # Missing auth -> fail-open allow + helpful SessionStart notice

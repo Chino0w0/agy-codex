@@ -10,6 +10,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SERVER_DIR = Path(__file__).resolve().parent.parent / "plugin" / "agy-codex" / "server"
 if str(SERVER_DIR) not in sys.path:
@@ -558,6 +559,86 @@ class TestCatalogAndWhitelist(unittest.TestCase):
         self.assertFalse(capped.startswith("Task:"))
         self.assertGreater(len(capped), 0)
         self.assertLessEqual(len(capped), 16)
+
+    def test_timeout_settings_accept_only_bounded_integers(self) -> None:
+        for key in ("worker_timeout_sec", "idle_timeout_sec"):
+            self.assertEqual(codex_catalog.load_workbench_config(self.data_dir)["mapping"][key], 0)
+            for bad in (-1, 86401, False, 1.5, "100", None):
+                with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                    codex_catalog.save_workbench_config({"mapping": {key: bad}}, self.data_dir)
+            saved = codex_catalog.save_workbench_config({"mapping": {key: 86400}}, self.data_dir)
+            self.assertEqual(saved["mapping"][key], 86400)
+
+    def test_isolation_redacts_urls_and_disallows_policy_override(self) -> None:
+        server_id = "sample-service"
+        endpoint = "https://sample-user:sample-pass@example.invalid/api?api_key=sample-key#private"
+        safe_url = "https://example.invalid/api"
+        (self.codex_home / "config.toml").write_text(
+            f'''approval_policy = "always"
+sandbox_mode = "danger-full-access"
+"features.multi_agent_v2" = true
+sample_pref = "safe"
+model_provider = "provider-fixture"
+[model_providers.provider-fixture]
+base_url = "{endpoint}"
+[mcp_servers.{server_id}]
+url = "{endpoint}"
+''', encoding="utf-8",
+        )
+        for key in ("approval_policy", "sandbox_mode", "features.multi_agent_v2", "agents",
+                    "model", "model_provider", "developer_instructions", "foo..bar", "../x"):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                codex_catalog.save_workbench_config({"mapping": {"extra_whitelist_keys": [key]}}, self.data_dir)
+        cfg = {"mapping": {"extra_whitelist_keys": ["sample_pref", "approval_policy", "sandbox_mode",
+                                                    "features.multi_agent_v2"],
+                           "forwarded_mcp_servers": [server_id]}}
+        (self.data_dir / "workbench-config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        disc = codex_catalog.discover_models_and_config(self.codex_home, self.data_dir)
+        self.assertEqual(disc["providers"][0]["base_url"], safe_url)
+        self.assertEqual(disc["mcp_servers"][0]["url"], safe_url)
+        values, meta = codex_catalog.collect_isolated_overrides(self.codex_home, self.data_dir)
+        overrides = dict(values)
+        self.assertEqual(overrides["approval_policy"], "never")
+        self.assertEqual(overrides["sandbox_mode"], "workspace-write")
+        for key in ("features.multi_agent", "features.multi_agent_v2", "agents.enabled"):
+            self.assertIs(overrides[key], False)
+        self.assertEqual(overrides["sample_pref"], "safe")
+        for key in ("model_providers.provider-fixture.base_url", f"mcp_servers.{server_id}.url"):
+            self.assertEqual(overrides[key], endpoint)
+            self.assertEqual(meta["redacted_overrides"][key], safe_url)
+            self.assertEqual(codex_run.sanitize_command_for_meta(["-c", f'{key}="{endpoint}"'], False),
+                             ["-c", f'{key}="{safe_url}"'])
+        self.assertEqual(codex_catalog.redact_url(safe_url + "?page=2#private"), safe_url + "?page=2")
+
+    def test_excluded_default_is_skipped_but_explicit_override_warns(self) -> None:
+        excluded, fallback = "excluded-fixture", "fallback-fixture"
+        (self.codex_home / "config.toml").write_text(f'model = "{fallback}"\n', encoding="utf-8")
+        codex_catalog.save_workbench_config(
+            {"defaults": {"model": excluded}, "excluded_models": [excluded]}, self.data_dir
+        )
+        automatic = codex_catalog.resolve_effective_run_config(self.codex_home, self.data_dir)
+        self.assertEqual(automatic["effective"]["model"], fallback)
+        explicit = codex_catalog.resolve_effective_run_config(self.codex_home, self.data_dir, cli_model=excluded)
+        self.assertEqual(explicit["effective"]["model"], excluded)
+        self.assertIn("excluded_models", " ".join(explicit["warnings"]))
+
+    @unittest.skipUnless(os.name == "nt", "Windows npm launcher")
+    def test_windows_npm_launcher_prefers_native_and_keeps_non_npm_shim(self) -> None:
+        shim = self.root / "codex.cmd"
+        shim.touch()
+        package = self.root / "node_modules" / "@openai" / "codex"
+        with mock.patch.dict(os.environ, {"CODEX_BIN": str(shim)}):
+            self.assertEqual(codex_run.find_codex_bin(), str(shim))
+            self.assertEqual(codex_run._codex_launcher(str(shim)), [str(shim)])
+            (package / "bin").mkdir(parents=True)
+            entry, node = package / "bin" / "codex.js", self.root / "node.exe"
+            entry.touch()
+            node.touch()
+            self.assertEqual(codex_run._codex_launcher(str(shim)), [str(node), str(entry)])
+            native = package / "bin" / "codex.exe"
+            native.touch()
+            self.assertEqual(codex_run.find_codex_bin(), str(native))
+            self.assertEqual(codex_run._codex_launcher(str(shim)), [str(native)])
 
 
 if __name__ == "__main__":

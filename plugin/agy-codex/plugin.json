@@ -1,7 +1,7 @@
 {
   "name": "agy-codex",
   "displayName": "Agy Codex",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Out-of-the-box Antigravity <-> Codex default subagent routing via lifecycle hooks, instant native/Codex toggle, Orchestrator guard, 24h traceable history, and clean 4-tab workbench UI.",
   "logo": "assets/logo.svg",
   "author": {

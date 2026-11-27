@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -57,7 +59,7 @@ def find_codex_bin() -> str:
     """Locate `codex` CLI executable across Windows, macOS, and Linux (skipping .ps1 on Windows)."""
     env_bin = os.environ.get("CODEX_BIN")
     if env_bin and Path(env_bin).is_file():
-        return env_bin
+        return str(_npm_codex_exe(Path(env_bin)) or env_bin)
 
     candidates: list[str] = []
     if os.name == "nt":
@@ -85,11 +87,51 @@ def find_codex_bin() -> str:
 
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and not candidate.lower().endswith(".ps1"):
-            return candidate
+            return str(_npm_codex_exe(Path(candidate)) or candidate)
 
     raise FileNotFoundError(
         "codex CLI executable not found. Checked CODEX_BIN, PATH, and standard OS install locations."
     )
+
+
+def _npm_codex_package(shim: Path) -> Path | None:
+    if os.name == "nt" and shim.name.lower() == "codex.cmd":
+        return shim.parent / "node_modules" / "@openai" / "codex"
+    return None
+
+
+def _npm_codex_exe(shim: Path) -> Path | None:
+    package = _npm_codex_package(shim)
+    if package is None or not package.is_dir():
+        return None
+    machine = platform.machine().lower()
+    arch = {"amd64": ("x64", "x86_64"), "x86_64": ("x64", "x86_64"),
+            "arm64": ("arm64", "aarch64"), "aarch64": ("arm64", "aarch64")}.get(machine)
+    candidates = [package / "codex.exe", package / "bin" / "codex.exe"]
+    if arch:
+        suffix, cpu = arch
+        platform_package = f"codex-win32-{suffix}"
+        for root in (package, package / "node_modules" / "@openai" / platform_package,
+                     package.with_name(platform_package)):
+            vendor = root / "vendor" / f"{cpu}-pc-windows-msvc"
+            candidates.extend(vendor / subdir / "codex.exe" for subdir in ("codex", "bin"))
+    return next((exe for exe in candidates if exe.is_file()), None)
+
+
+def _codex_launcher(codex_bin: str) -> list[str]:
+    shim = Path(codex_bin)
+    native = _npm_codex_exe(shim)
+    if native is not None:
+        return [str(native)]
+    package = _npm_codex_package(shim)
+    if package is not None:
+        entry = package / "bin" / "codex.js"
+        if entry.is_file():
+            local_node = shim.with_name("node.exe")
+            node = str(local_node) if local_node.is_file() else shutil.which("node.exe")
+            if node:
+                return [node, str(entry)]
+    return [codex_bin]
 
 
 def build_exec_env() -> dict[str, str]:
@@ -145,7 +187,7 @@ def _silent_subprocess_kwargs() -> dict[str, Any]:
     return kwargs
 
 
-def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> None:
+def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None, *, force: bool = False) -> None:
     """Terminate a process and all its descendants cleanly across Windows and POSIX."""
     if proc_or_pid is None:
         return
@@ -155,14 +197,15 @@ def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> N
 
     if os.name == "nt":
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True,
                 timeout=5,
                 **_silent_subprocess_kwargs(),
             )
-            return
-        except Exception:
+            if result.returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
             pass
         if isinstance(proc_or_pid, subprocess.Popen):
             try:
@@ -176,20 +219,21 @@ def terminate_process_tree(proc_or_pid: subprocess.Popen[Any] | int | None) -> N
                 pass
         return
 
+    sig = signal.SIGKILL if force else signal.SIGTERM
     try:
-        pgid = os.getpgid(pid)
-        os.killpg(pgid, signal.SIGTERM)
+        pgid = pid if isinstance(proc_or_pid, subprocess.Popen) else os.getpgid(pid)
+        os.killpg(pgid, sig)
         return
     except OSError:
         pass
     if isinstance(proc_or_pid, subprocess.Popen):
         try:
-            proc_or_pid.terminate()
+            (proc_or_pid.kill if force else proc_or_pid.terminate)()
         except OSError:
             pass
     else:
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.kill(pid, sig)
         except OSError:
             pass
 
@@ -247,9 +291,20 @@ def create_isolated_worktree(
             f"Invalid worktree name {slug!r}. Use only letters, digits, '.', '_', or '-'."
         )
 
-    wt_root = get_worktree_root(data_dir)
+    wt_root = codex_catalog.get_plugin_data_dir(data_dir) / "worktrees"
+    wt_candidate = wt_root / slug
+    for path in (wt_root, wt_candidate):
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise ValueError(f"Worktree path must not be a symbolic link or junction: {path}")
+    wt_root = wt_root.resolve()
+    wt_path = wt_candidate.resolve()
+    if wt_path == wt_root or not wt_path.is_relative_to(wt_root):
+        raise ValueError(f"Worktree path must be inside the worktree root: {wt_path}")
     wt_root.mkdir(parents=True, exist_ok=True)
-    wt_path = (wt_root / slug).resolve()
     branch = f"codex/{slug}"
 
     if wt_path.exists():
@@ -460,11 +515,18 @@ def sanitize_command_for_meta(cmd: list[str], has_prompt: bool) -> list[str]:
         tok = cmd[i]
         if tok == "-c" and i + 1 < last_idx:
             arg = cmd[i + 1]
-            key_part = arg.split("=", 1)[0]
+            key_part, sep, raw_value = arg.partition("=")
             if codex_catalog.is_sensitive_key(key_part):
-                redacted.extend(["-c", f'{key_part}="<redacted>"'])
-            else:
-                redacted.extend(["-c", arg])
+                arg = f'{key_part}="<redacted>"'
+            elif sep and raw_value.startswith('"'):
+                try:
+                    value = json.loads(raw_value)
+                    safe_value = codex_catalog.redact_value_for_key(key_part, value)
+                    if safe_value != value:
+                        arg = f"{key_part}={codex_catalog.to_toml_literal(safe_value)}"
+                except json.JSONDecodeError:
+                    pass
+            redacted.extend(["-c", arg])
             i += 2
             continue
         redacted.append(tok)
@@ -522,7 +584,7 @@ def build_codex_command(
     eff_mode = eff.get("mode") or "write"
     sandbox = "read-only" if (subcommand == "review" or eff_mode == "read-only") else "workspace-write"
 
-    cmd: list[str] = [codex_bin, "exec"]
+    cmd = [*_codex_launcher(codex_bin), "exec"]
     meta: dict[str, Any] = {
         "requested": resolved_cfg["requested"],
         "effective": {**eff, "config_mode": effective_config_mode, "mode": eff_mode},
@@ -575,7 +637,7 @@ def build_codex_command(
         allow_nested = bool((wb_cfg.get("mapping") or {}).get("allow_nested_subagents", False))
         if not allow_nested:
             cmd.extend(["-c", "agents.enabled=false"])
-            cmd.extend(["-c", "features.multi_agent=false"])
+            cmd.extend(["-c", "features.multi_agent=false", "-c", "features.multi_agent_v2=false"])
         dev_inst = codex_catalog.build_worker_developer_instructions(
             worker_cfg, allow_nested=allow_nested
         )
@@ -997,6 +1059,8 @@ def run_codex(
             final_status = "error"
         elif handoff_status == "blocked":
             final_status = "blocked"
+        elif handoff_status == "partial":
+            final_status = "partial"
         elif handoff_status == "failed":
             final_status = "error"
         else:
@@ -1007,6 +1071,8 @@ def run_codex(
             err_msg = "Cancelled by user."
         elif final_status == "blocked":
             err_msg = syncer.state.get("error") or handoff_summary or "Worker reported status=blocked."
+        elif final_status == "partial":
+            err_msg = syncer.state.get("error") or handoff_summary or "Worker reported status=partial."
         elif final_status == "error":
             if timed_out:
                 err_msg = f"Timed out after {timeout}s"
@@ -1041,6 +1107,8 @@ def run_codex(
             final_status = "error"
         elif handoff_status == "blocked":
             final_status = "blocked"
+        elif handoff_status == "partial":
+            final_status = "partial"
         elif handoff_status == "failed":
             final_status = "error"
         else:
@@ -1132,7 +1200,7 @@ def doctor_report(
     try:
         codex_bin = find_codex_bin()
         ver_proc = subprocess.run(
-            [codex_bin, "--version"],
+            [*_codex_launcher(codex_bin), "--version"],
             capture_output=True,
             text=True,
             encoding="utf-8",

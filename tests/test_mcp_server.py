@@ -13,6 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SERVER_DIR = Path(__file__).resolve().parent.parent / "plugin" / "agy-codex" / "server"
 if str(SERVER_DIR) not in sys.path:
@@ -119,6 +120,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.server = mcp_server.McpServer(manager=self.manager)
 
     def tearDown(self) -> None:
+        self.manager.shutdown()
         for k, v in self._old_env.items():
             if v is None:
                 os.environ.pop(k, None)
@@ -129,7 +131,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_protocol_and_visibility_separation(self) -> None:
         init = self.server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "agy-codex")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "1.3.0")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "1.4.0")
 
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
@@ -872,6 +874,20 @@ class TestMcpServerAndRunner(unittest.TestCase):
         )["result"]["structuredContent"]
         self.assertEqual(waited["status"], "partial")
         self.assertFalse(waited["ok"])
+        history = self.manager.get_history(filter_mode="issue")
+        self.assertIn(started["run_id"], [r["run_id"] for g in history["groups"] for r in g["runs"]])
+        self.assertEqual(history["groups"][0]["issue_count"], 1)
+        for index, panel_meta in enumerate(
+            (None, {"run_id": "cli-partial-1", "cwd": str(self.workdir), "prompt": "partial"})
+        ):
+            with self.subTest(panel_meta=panel_meta):
+                output = self.root / f"cli-output-{index}.json"
+                result = codex_run.run_codex(
+                    [sys.executable, str(partial_py), "-o", str(output)], self.root / f"cli-{index}.log", output,
+                    0, quiet=True, panel_meta=panel_meta, data_dir=self.data_dir,
+                )
+                self.assertEqual(result["status"], "partial")
+                self.assertFalse(result["ok"])
 
         self._call_tool_raw(
             132,
@@ -1031,7 +1047,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_wait_codex_task_clamps_timeout_to_120(self) -> None:
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 150, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
-        self.assertEqual(tools["start_codex_task"]["inputSchema"]["properties"]["timeout"]["default"], 600)
+        self.assertEqual(tools["start_codex_task"]["inputSchema"]["properties"]["timeout"]["default"], 0)
         wait_timeout_schema = tools["wait_codex_task"]["inputSchema"]["properties"]["timeout"]
         self.assertEqual(wait_timeout_schema["default"], 120)
         self.assertEqual(wait_timeout_schema["maximum"], 120)
@@ -1063,6 +1079,110 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.assertEqual(recorded_timeouts, [120, 120])
         self.assertEqual(clamped_res.get("wait_timeout_clamped_sec"), 120)
         self.assertIsNone(default_res.get("wait_timeout_clamped_sec"))
+
+    def test_invalid_run_ids_rejected_by_every_entry_point(self) -> None:
+        for rid in ("../evil", str(self.root.resolve()), "bad/id", "bad\\id", "a..b"):
+            for operation in (
+                lambda: self.manager.get_run_events(rid),
+                lambda: self.manager.get_status([rid]),
+                lambda: self.manager.wait_runs([rid]),
+                lambda: self.manager.cancel_run(rid),
+                lambda: self.manager.close_runs([rid], closed_by="test"),
+                lambda: self.manager.reopen_run(rid),
+                lambda: self.manager.send_followup(rid, "test"),
+            ):
+                with self.subTest(rid=rid), self.assertRaisesRegex(ValueError, "Invalid run_id"):
+                    operation()
+
+    def test_worker_timeout_defaults_to_unlimited_and_explicit_zero_overrides(self) -> None:
+        params = {"prompt": "run without an explicit limit", "cwd": str(self.workdir)}
+        with mock.patch.object(mcp_server.threading, "Timer") as timer:
+            state = self.manager.start_run(params)
+            self.assertEqual(state.timeout_sec, 0)
+            self.assertEqual(self.manager.wait_runs([state.run_id], timeout=5)["status"], "done")
+            mcp_server.codex_catalog.save_workbench_config({"mapping": {"worker_timeout_sec": 1}}, self.data_dir)
+            unlimited = self.manager.start_run({**params, "timeout": 0})
+            self.assertEqual(unlimited.timeout_sec, 0)
+            self.assertEqual(self.manager.wait_runs([unlimited.run_id], timeout=5)["status"], "done")
+            timer.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            self.manager.start_run({**params, "timeout": -1})
+        state = self.manager.start_run({**params, "prompt": "SLEEP_LONG"})
+        self.assertEqual(state.timeout_sec, 1)
+        self.assertEqual(self.manager.wait_runs([state.run_id], timeout=5)["exit_code"], 124)
+
+    def _test_state(self, run_id: str = "test-run", **kwargs) -> mcp_server.RunState:
+        return mcp_server.RunState(run_id, str(self.workdir), "read-only", "isolated",
+                                   None, None, None, None, "test", **kwargs)
+
+    def test_live_health_detects_loop_deduplicates_commands_and_reports_stall(self) -> None:
+        state = self._test_state()
+        for n in range(4):
+            item = {"id": str(n), "type": "command_execution", "command": "pytest",
+                    "exit_code": 1, "aggregated_output": "test failed", "status": "failed"}
+            self.manager._handle_json_event(state, {"type": "item.started", "item": item})
+            self.assertEqual(state.to_summary_dict()["in_flight_command"], "pytest")
+            for _ in range(2):
+                self.manager._handle_json_event(state, {"type": "item.completed", "item": item})
+        summary = state.to_summary_dict()
+        self.assertEqual(summary["health"], "loop_warning")
+        self.assertIn("连续 4 次", summary["health_reason"])
+        self.assertEqual(summary["completed_commands"], 4)
+        self.assertIsNone(summary["in_flight_command"])
+        self.assertEqual(len(summary["recent_errors"]), 1)
+        brief = mcp_server.format_wait_or_status_brief(summary, is_wait=True)
+        self.assertIn("health: loop_warning", brief)
+        self.assertIn("recent_error:", brief)
+        with mock.patch.object(mcp_server.time, "time", return_value=state.last_activity_at + 190):
+            summary = state.to_summary_dict()
+        self.assertEqual(summary["health"], "stalled")
+        self.assertEqual(summary["idle_sec"], 190.0)
+        self.assertIn("3m 10s", summary["health_reason"])
+
+    def test_repeated_tool_calls_and_distinct_arguments(self) -> None:
+        state = self._test_state()
+        for n in range(6):
+            args = dict((('b', 2), ('a', 1)) if n % 2 else (('a', 1), ('b', 2)))
+            item = {"id": str(n), "type": "mcp_tool_call", "tool": "sample_tool", "arguments": args}
+            for event_type in ("item.started", "item.completed"):
+                self.manager._handle_json_event(state, {"type": event_type, "item": item})
+        self.assertIn("连续 6 次", state.to_summary_dict()["health_reason"])
+        item = {**item, "id": "different", "arguments": {"a": 2}}
+        self.manager._handle_json_event(state, {"type": "item.started", "item": item})
+        self.assertEqual(state.to_summary_dict()["health"], "healthy")
+
+    def test_worker_stderr_root_cause_and_idle_watchdog(self) -> None:
+        for code, idle, reason in (
+            ("import sys; print('429 rate limit', file=sys.stderr); sys.exit(1)", 0, "429 rate limit"),
+            ("import time; time.sleep(10)", 1, "连续无输出卡死超时 (1s)"),
+        ):
+            with self.subTest(idle=idle):
+                state = self._test_state(f"worker-{idle}", idle_timeout_sec=idle)
+                folder = self.manager._state_path(state.run_id).parent
+                folder.mkdir()
+                self.manager._execute_worker(state, [sys.executable, "-c", code], folder / "codex.log",
+                                             folder / "output.json", 0)
+                out = state.to_summary_dict()
+                self.assertEqual(out["health"], "error")
+                self.assertEqual(out["error"], reason)
+                self.assertIsNone(out["idle_sec"])
+                if not idle:
+                    self.assertIn(reason, out["recent_errors"])
+
+    def test_wait_snapshot_is_consistent_and_persisted_event_seq_is_monotonic(self) -> None:
+        running = {"run_id": "sample", "status": "running"}
+        done = {**running, "status": "done"}
+        with mock.patch.object(self.manager, "_get_summary", side_effect=[running, done]) as getter:
+            with mock.patch.object(mcp_server.time, "monotonic", side_effect=[0.0, 1.0]):
+                result = self.manager.wait_runs(["sample"], timeout=1)
+            self.assertEqual(getter.call_count, 1)
+        self.assertEqual(result["status"], "running")
+        self.assertTrue(result["wait_timed_out"])
+        state_path = self.manager._state_path("sample")
+        state_path.parent.mkdir()
+        state_path.write_text(json.dumps({**done, "seq": 2}), encoding="utf-8")
+        self.manager._events_path("sample").write_text('{"seq":9}\n{"seq":7}\n', encoding="utf-8")
+        self.assertEqual(self.manager.get_run_events("sample")["latest_seq"], 9)
 
     def test_worker_timeout_reports_completed_commands_without_preamble_result(self) -> None:
         timeout_py = self.root / "fake_timeout_cmds.py"

@@ -562,6 +562,53 @@ class TestTelemetry(unittest.TestCase):
             f"Expected run-partial-1 in recent_errors, got: {stats['recent_errors']!r}",
         )
 
+    def test_ledger_preserves_session_source_unicode_sep_and_dim_success_rate(self) -> None:
+        now = time.time()
+        codex_telemetry.append_ledger_record(
+            self.data_dir,
+            {
+                "run_id": "run-unicode-1",
+                "source": "cli",
+                "session_id": "sess-cli-42",
+                "title": "Line\u2028Break\u2029Title",
+                "status": "done",
+                "started_at": now - 60,
+                "finished_at": now - 30,
+                "tokens_used": 500,
+                "role": "coding",
+            },
+        )
+        raw_lines = [
+            ln
+            for ln in (self.data_dir / "stats-ledger.jsonl").read_text(encoding="utf-8").split("\n")
+            if ln.strip()
+        ]
+        self.assertEqual(len(raw_lines), 1)
+        recs = codex_telemetry.read_ledger_records(self.data_dir)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["session_id"], "sess-cli-42")
+        self.assertEqual(recs[0]["source"], "cli")
+        self.assertEqual(recs[0]["title"], "Line\u2028Break\u2029Title")
+
+        running_only = [
+            {
+                "run_id": "run-live-1",
+                "status": "running",
+                "started_at": now - 10,
+                "model": "m-live",
+                "provider": "p1",
+                "effort": "high",
+                "role": "coding",
+                "tokens_used": 0,
+            }
+        ]
+        stats_live = codex_telemetry.compute_stats(
+            running_only, self.codex_home, self.data_dir, scope="antigravity", time_range="7d"
+        )
+        live_model = next(r for r in stats_live["by_model"] if r["name"] == "m-live")
+        self.assertEqual(live_model["done_count"], 0)
+        self.assertIsNone(live_model["success_rate"])
+
 
 if __name__ == "__main__":
     unittest.main()
