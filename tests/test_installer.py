@@ -121,6 +121,25 @@ class TestInstaller(unittest.TestCase):
         self.assertFalse(self.data_dir.exists())
         self.assertTrue(config.is_file())
 
+    def test_commit_sha_receipt_prefers_explicit_value(self) -> None:
+        receipt = self.installed / ".agy-codex-install.json"
+        sha = "a" * 40
+        self._assert_ok(self._install("--commit-sha", sha))
+        self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["commitSha"], sha)
+
+        (self.repo / ".git").mkdir()
+        git_head = "b" * 40
+        git_result = subprocess.CompletedProcess([], 0, stdout=f"{git_head}\n")
+        with mock.patch.object(installer.subprocess, "run", return_value=git_result) as git:
+            installer.install_plugin(self.repo, self.plugins_dir)
+            git.assert_called_once()
+            self.assertEqual(git.call_args.args[0], ["git", "-C", str(self.repo), "rev-parse", "HEAD"])
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["commitSha"], git_head)
+            git.reset_mock()
+            installer.install_plugin(self.repo, self.plugins_dir, commit_sha=sha)
+            git.assert_not_called()
+            self.assertEqual(json.loads(receipt.read_text(encoding="utf-8"))["commitSha"], sha)
+
     def test_upgrade_preserves_profile_until_forced(self) -> None:
         self._assert_ok(self._install())
         existing_worker = self.codex_home / "worker.config.toml"

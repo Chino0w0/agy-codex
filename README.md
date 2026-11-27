@@ -21,17 +21,18 @@
   - 按 `custom_models`（面板自定义） > `model_catalog_json`（自动/自定义/禁用可配） > `~/.codex/models_cache.json` > `config.toml` 自动合并模型，且全局支持手输任意模型名；
   - 默认 `isolated` 白名单隔离模式（`--ignore-user-config`）跳过桌面端重型插件、MCP、Hooks 与 Memories，按需透传模型、Provider、代理、Windows 沙箱、`safe.directory=*`（仅子进程环境）与指定 MCP 命名空间；
   - 支持 **`exclude_orchestrator_models`** 双重防嵌套保护、全范围推理档位（`none / minimal / low / medium / high / xhigh / max / ultra` 及自定义档位）与可配置 `catalog_mode` / `effort_policy` / `context_window_policy` / `native_passthrough_subagents` / `excluded_models`。
-- **高效并行子 Agent 编排、健康检测与契约式委派（`v1.4.0`）**：
+- **高效并行子 Agent 编排、会话隔离与健康检测（`v1.5.0`）**：
   - 模型可见 MCP 工具：`list_codex_models`、`start_codex_task`（支持 `context_files`、`acceptance_criteria`、`non_goals`，默认 `timeout=0` 不限总时长，由实时静默/死循环预警与 stderr 报错根因提炼护航）、`get_codex_task_status`、`wait_codex_task`（支持 `run_ids` + `wait_mode="any"|"all"` 滚动验收，单次轮询封顶 120s 规避 MCP 传输超时）、`stop_codex_task`、`close_codex_task` 与 `open_codex_panel`；
-  - `list_codex_models` 与任务生命周期工具返回精简可读的模型调度简报（体积缩减约 90%），并强化 `run_id` 路径边界、跨进程 `stats-ledger.jsonl` 原位去重锁与暂存回滚式跨平台安装器；
+  - **多对话自动隔离**：多个 Antigravity 大对话并行运行时，右侧 `aux_pane` 自动按 `conversation_id` / `parent_session_id` 隔离当前对话的子任务，批量清理互不干扰，并支持一键在「本对话 / 全部对话」之间切换；
+  - `list_codex_models` 与任务生命周期工具返回精简可读的模型调度简报（体积缩减约 90%），并强化 `run_id` 路径边界、跨进程 OS 内核锁 `stats-ledger.jsonl` 原位去重与暂存回滚式跨平台安装器；
   - 并发无阻塞 `serve_stdio` JSON-RPC 调度与跨进程 `pid` 存活识别，`--ephemeral --thread-source subagent` 用后即销毁不污染 Codex Desktop，并修复 Windows 下子进程管道死锁与 `partial` 交接状态识别；
   - 内置精简常驻 `rules/AGENTS.md` + 3 个按需披露 Skill（`codex-dispatch`、`codex-parallel-worktree`、`codex-second-opinion`）与 6 套可定制角色预设。
-- **4 视图原生 MCP App 工作台（零客户端注入、各界面可即时开关）**：
+- **4 视图原生 MCP App 工作台（直连多轮对话 + 在线更新同步）**：
   - 基于 Antigravity 官方 **MCP App** 原生入口（左侧「插件 -> Agy Codex」全屏页 + 右侧 `aux_pane` 分屏 + 对话内联卡片），不做 CDP 页面注入，升级 Antigravity 客户端不失效；
-  - **活跃监控**：顶栏保留唯一全局联动开关；窄侧边栏采用全宽胶囊下拉切换器（支持 `< >` 步进与后台异常微点提示），宽屏保留横向标签栏；内置实时健康预警（静默停滞/死循环/报错根因横幅）、平静耗时显示、完整指令折叠与一键归档；
+  - **活跃监控与用户直连多轮会话（U2A）**：顶栏保留唯一全局联动开关与带旋转反馈的强制刷新按钮；窄侧边栏采用全宽胶囊下拉切换器（支持 `< >` 步进与后台异常微点提示）和「本对话 / 全部」隔离切换；支持点击 **「+ 新建对话」** 直接发起 `persist=true` / `raw=true` 的 Codex 多轮对话（暂停自动委派时也可用），支持连续追问与一键「发给主 Agent 复核」；
   - **历史对话**：严格按 Antigravity 大会话分组折叠，4 行清晰卡片层次（状态标题 + 角色/归档徽章 + 工作摘要 + 模型耗时指标），支持 1 至 168h 可配归档留存（默认 24h）与一键恢复；
   - **统计面板**：专注统计 Antigravity 与 Codex 联动任务（永久紧凑账本 `stats-ledger.jsonl`，不含费用估算），展示累计派发、成功率、缓存命中趋势、模型/角色/Provider/档位分布与报错一键复制；
-  - **模型与配置**：带选择性 `?` 说明气泡，支持随时开关 Codex 联动、默认原生接管路由与 Orchestrator 保护，按需透传 MCP、原生放行白名单、预设路由、**Dry-Run 脱敏命令预览**与 `doctor` 体检。
+  - **模型与配置 + 在线更新同步**：内置纯 Python 标准库 **GitHub 在线更新同步卡片**（支持 Releases 与 `main` 分支检测、12h 缓存、安全校验下载与原子热同步安装，带顶栏角标和可忽略通知条）；带选择性 `?` 说明气泡，支持随时开关 Codex 联动、默认原生接管路由与 Orchestrator 保护，按需透传 MCP、原生放行白名单、预设路由、**Dry-Run 脱敏命令预览**与 `doctor` 体检。
 - **零门槛部署**：纯 Python 3.10+ 标准库 + 预打包单文件 `assets/app.html`，终端用户**无需安装 Node.js**、无需管理员权限；支持命令行或交给 Agent 一句话自动安装与卸载。
 
 ---

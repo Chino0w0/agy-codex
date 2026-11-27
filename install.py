@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -52,7 +53,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip running `codex_run.py doctor` after installation.",
     )
+    parser.add_argument("--commit-sha", default=None, help="Record the source commit in the install receipt.")
     return parser.parse_args()
+
+
+def _detect_git_commit(repo_root: Path) -> str | None:
+    if not (repo_root / ".git").exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding="ascii", errors="replace", timeout=5, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = result.stdout.strip()
+    return sha if re.fullmatch(r"[0-9a-fA-F]{40}", sha) else None
 
 
 def make_executable(path: Path) -> None:
@@ -157,7 +175,9 @@ def _write_json(path: Path, payload: Any) -> None:
     )
 
 
-def _build_plugin(repo_root: Path, src_plugin: Path, stage: Path, target_plugin: Path) -> None:
+def _build_plugin(
+    repo_root: Path, src_plugin: Path, stage: Path, target_plugin: Path, *, commit_sha: str | None = None
+) -> None:
     plugin_meta = json.loads((src_plugin / "plugin.json").read_text(encoding="utf-8"))
     shutil.copy2(src_plugin / "plugin.json", stage / "plugin.json")
 
@@ -194,6 +214,8 @@ def _build_plugin(repo_root: Path, src_plugin: Path, stage: Path, target_plugin:
         "sourceRoot": str(repo_root),
         "files": receipt_files,
     }
+    if commit_sha:
+        receipt["commitSha"] = commit_sha
     _write_json(stage / ".agy-codex-install.json", receipt)
 
 
@@ -268,7 +290,7 @@ def _sync_staged_in_place(stage: Path, target_plugin: Path) -> None:
             tmp_path.unlink(missing_ok=True)
 
 
-def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
+def install_plugin(repo_root: Path, plugins_dir: Path, *, commit_sha: str | None = None) -> Path:
     src_plugin = (repo_root / "plugin" / "agy-codex").resolve()
     plugins_dir = plugins_dir.resolve()
     target_plugin = plugins_dir / "agy-codex"
@@ -289,7 +311,8 @@ def install_plugin(repo_root: Path, plugins_dir: Path) -> Path:
     stage = Path(tempfile.mkdtemp(prefix=f"{stage_prefix}{os.getpid()}-", dir=plugins_dir.parent))
     backup = stage.with_name(".agy-codex-backup-" + stage.name.removeprefix(stage_prefix))
     try:
-        _build_plugin(repo_root, src_plugin, stage, target_plugin)
+        source_commit = commit_sha if commit_sha is not None else _detect_git_commit(repo_root)
+        _build_plugin(repo_root, src_plugin, stage, target_plugin, commit_sha=source_commit)
         _validate_plugin_target(target_plugin, src_plugin)
         # 暂存全部完成后才移动旧版本；切换失败时恢复原安装。
         had_old_plugin = target_plugin.exists()
@@ -379,7 +402,7 @@ def main() -> int:
     _validate_profile_target(target_profile)
 
     _safe_print(f"[{step}/{total_steps}] Installing Agy Codex plugin to {plugins_dir / 'agy-codex'}")
-    codex_run_path = install_plugin(repo_root, plugins_dir)
+    codex_run_path = install_plugin(repo_root, plugins_dir, commit_sha=args.commit_sha)
     step += 1
 
     legacy_plugin = plugins_dir / "codex-in-anti"

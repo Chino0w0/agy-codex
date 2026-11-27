@@ -609,6 +609,42 @@ class TestTelemetry(unittest.TestCase):
         self.assertEqual(live_model["done_count"], 0)
         self.assertIsNone(live_model["success_rate"])
 
+    def test_rapid_back_to_back_and_concurrent_ledger_writes_never_lock_timeout(self) -> None:
+        import concurrent.futures
+
+        now = time.time()
+        # Rapid sequential writes (regression for Windows os.fstat != Path.stat lock leak)
+        for i in range(8):
+            codex_telemetry.append_ledger_record(
+                self.data_dir,
+                {
+                    "run_id": f"seq-run-{i}",
+                    "status": "done",
+                    "started_at": now - 10 + i,
+                    "closed": True,
+                    "closed_at": now + i,
+                    "tokens_used": 100 * (i + 1),
+                },
+            )
+
+        # Concurrent multi-threaded writes
+        def _worker(idx: int) -> None:
+            codex_telemetry.append_ledger_record(
+                self.data_dir,
+                {
+                    "run_id": f"thr-run-{idx}",
+                    "status": "done",
+                    "started_at": now + idx,
+                    "tokens_used": 50 * (idx + 1),
+                },
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(_worker, range(12)))
+
+        records = codex_telemetry.read_ledger_records(self.data_dir)
+        self.assertEqual(len(records), 20)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,13 @@
 
 All notable changes to **Agy Codex (`agy-codex`)** are documented in this file.
 
+## v1.5.0
+
+- **User-Direct Multi-Turn Codex Sessions (U2A Mode)**: Added app-only `start_user_task` MCP tool and an inline **「+ 新建对话」** composer drawer in Active Monitor (narrow 360px side pane and >=720px wide view) so users can chat directly with Codex without consuming Antigravity main chat context. Direct sessions default to `persist=true` and `raw=true` (natural Markdown replies), remain usable even while automatic Antigravity delegation is paused (`enabled=false`), support continuous multi-turn follow-ups (`send_followup` preserving `origin="user"` and `raw=true`), and offer one-click **「发给主 Agent 复核」** handoff back to Antigravity.
+- **Multi-Conversation Active Monitor Isolation**: Scoped `open_codex_panel`, `list_runs`, `close_run`, `close_codex_task`, and `start_user_task` by `parent_session_id` / `conversation_id` (auto-inferred from focused `run_id` when opening the right `aux_pane`). Parallel Antigravity conversations now stay cleanly isolated by default with a one-click **「本对话 / 全部对话」** scope toggle (`+N` indicator for other parallel sessions) and scoped batch archiving that never affects sibling conversations.
+- **Pure-Stdlib Online Update & Sync (`codex_updater.py`)**: Added app-only `check_for_updates`, `start_plugin_update`, and `get_update_status` tools plus a **「插件版本与在线更新同步」** card in **Models & Config** and dismissible topbar update alerts. Features 12-hour check caching, dismiss persistence, GitHub Releases with automatic `main` branch fallback, strict HTTPS GitHub host allowlist across redirects, 32 MB download cap, Zip-Slip/symlink/Windows device-name guards, dev git checkout protection, `commitSha` receipts in `install.py`, and atomic in-place installation via the extracted `install.py --skip-doctor`.
+- **Responsive Refresh Feedback & Windows Kernel Ledger Lock**: Upgraded `#panel-refresh-btn` with spin loading feedback, forced active-run event reload (`since_seq=0`) + view refresh, and descriptive toast summaries. Replaced the `O_EXCL` + `fstat == stat` lock in `codex_telemetry.py` (which leaked `.stats-ledger.lock` on Windows NTFS) with cross-process OS kernel file locking (`msvcrt.locking` / `fcntl.flock`).
+
 ## v1.4.0
 
 - **Unlimited Default Worker Timeout + Live Health Watchdog**: Changed default `start_codex_task.timeout` to `0` (unlimited wall-clock runtime; configurable via `mapping.worker_timeout_sec` and optional `mapping.idle_timeout_sec` in **Models & Config**), replacing stressful countdown kills with live `health` (`healthy` / `stalled` / `loop_warning` / `error`), `health_reason`, `in_flight_command`, and case-insensitive stderr `recent_errors` root-cause extraction.

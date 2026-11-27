@@ -9,7 +9,8 @@ Exposes:
   `get_run_events`, `list_runs`, `get_history`, `close_run`, `reopen_run`,
   `send_followup`, `toggle_codex_enabled`, `toggle_exclude_orchestrator`,
   `get_stats`, `get_workbench_config`, `save_workbench_config`,
-  `preview_resolved_command`, `run_doctor`, `cancel_run`
+  `preview_resolved_command`, `run_doctor`, `cancel_run`, `start_user_task`,
+  `check_for_updates`, `start_plugin_update`, `get_update_status`
 - UI resource: `ui://agy-codex/app.html` (`text/html;profile=mcp-app`)
 """
 
@@ -41,6 +42,7 @@ if str(SERVER_DIR) not in sys.path:
 import codex_catalog  # noqa: E402
 import codex_run  # noqa: E402
 import codex_telemetry  # noqa: E402
+import codex_updater  # noqa: E402
 
 APP_URI = "ui://agy-codex/app.html"
 
@@ -390,6 +392,8 @@ class RunState:
     prompt: str
     prompt_preview: str = ""
     persist: bool = False
+    origin: str = "agent"
+    raw: bool = False
     resume_session_id: str | None = None
     title: str = ""
     role: str = ""
@@ -572,6 +576,8 @@ class RunState:
             "effort": self.effort,
             "preset": self.preset,
             "persist": self.persist,
+            "origin": self.origin,
+            "raw": self.raw,
             "requested": copy.deepcopy(self.requested),
             "effective": copy.deepcopy(self.effective),
             "observed": copy.deepcopy(self.observed),
@@ -688,6 +694,8 @@ class RunManager:
         summary["run_id"] = run_id
         summary.pop("events", None)
         summary.setdefault("expired", False)
+        summary.setdefault("origin", "agent")
+        summary.setdefault("raw", False)
         summary.setdefault("closed", False)
         summary.setdefault("closed_at", None)
         summary.setdefault("closed_by", None)
@@ -735,13 +743,30 @@ class RunManager:
         with self._lock:
             return sum(1 for s in self._runs.values() if s.status == "running")
 
-    def start_run(self, params: dict[str, Any]) -> RunState:
+    def infer_default_cwd(self) -> str:
+        recent = self.list_runs(limit=1, include_closed=True)
+        if recent and not recent[0].get("expired"):
+            cwd = recent[0].get("cwd")
+            try:
+                if isinstance(cwd, str) and cwd and Path(cwd).is_dir():
+                    return cwd
+            except OSError:
+                pass
+        try:
+            cwd_path = Path.cwd()
+            if cwd_path.is_dir() and not cwd_path.resolve().is_relative_to(PLUGIN_ROOT):
+                return str(cwd_path)
+        except (OSError, RuntimeError):
+            pass
+        return str(Path.home())
+
+    def start_run(self, params: dict[str, Any], *, bypass_enabled_check: bool = False) -> RunState:
         with self._lock:
             if self._shutting_down:
                 raise ValueError("The run manager is shutting down.")
         self._maybe_prune_expired()
         wb_cfg = codex_catalog.load_workbench_config(self.data_dir)
-        if not wb_cfg.get("enabled", True):
+        if not bypass_enabled_check and not wb_cfg.get("enabled", True):
             raise ValueError(
                 "Codex subagent dispatch is paused in Agy Codex settings (enabled=false). "
                 "Delegate this subtask using Antigravity native subagents, or re-enable Codex subagents in Agy Codex."
@@ -786,6 +811,7 @@ class RunManager:
         worktree_arg = params.get("worktree")
         search = bool(params.get("search", False))
         raw = bool(params.get("raw", False))
+        origin = "user" if params.get("origin") == "user" else "agent"
         raw_add_dir = params.get("add_dir") or []
         add_dir = [str(d) for d in raw_add_dir if isinstance(d, str) and d.strip()]
         mapping = wb_cfg.get("mapping") or {}
@@ -878,7 +904,7 @@ class RunManager:
 
         eff = meta["effective"]
         warnings = list(meta.get("warnings") or [])
-        if eff.get("mode") == "write" and len(prompt) < 80 and not context_files:
+        if origin == "agent" and eff.get("mode") == "write" and len(prompt) < 80 and not context_files:
             warnings.append(
                 "Write task prompt is short (< 80 chars) without context_files; consider providing reference files and acceptance_criteria to avoid guesswork."
             )
@@ -923,6 +949,8 @@ class RunManager:
             prompt=effective_prompt,
             prompt_preview=prompt[:180],
             persist=persist,
+            origin=origin,
+            raw=raw,
             resume_session_id=resume_sid_str,
             title=title_str,
             role=role_str,
@@ -1105,11 +1133,14 @@ class RunManager:
 
             output_file = self._run_file(state.run_id, output_file.name)
             raw_output = output_file.read_text(encoding="utf-8").strip() if output_file.is_file() else ""
-            parsed_result = safe_parse_handoff(raw_output) if raw_output else None
-            if parsed_result is None and state.last_agent_message:
-                candidate = safe_parse_handoff(state.last_agent_message.strip())
-                if not timed_out or (isinstance(candidate, dict) and "status" in candidate):
-                    parsed_result = candidate
+            if state.origin == "user" and state.raw:
+                parsed_result = raw_output or (state.last_agent_message.strip() if not timed_out else "") or None
+            else:
+                parsed_result = safe_parse_handoff(raw_output) if raw_output else None
+                if parsed_result is None and state.last_agent_message:
+                    candidate = safe_parse_handoff(state.last_agent_message.strip())
+                    if not timed_out or (isinstance(candidate, dict) and "status" in candidate):
+                        parsed_result = candidate
             fallback = codex_run.parse_telemetry("".join([*log_head, *log_tail]))
         except Exception as exc:
             with state.lock:
@@ -1619,6 +1650,7 @@ class RunManager:
         status: str = "all",
         limit: int = 40,
         include_closed: bool = False,
+        parent_session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         self._maybe_prune_expired()
         seen: dict[str, dict[str, Any]] = {}
@@ -1646,6 +1678,9 @@ class RunManager:
         items = list(seen.values())
         if not include_closed:
             items = [r for r in items if not r.get("closed")]
+        scope_sid = codex_catalog._clean_optional_str(parent_session_id)
+        if scope_sid:
+            items = [r for r in items if str(r.get("parent_session_id") or "") == scope_sid]
         if status and status != "all":
             items = [r for r in items if r.get("status") == status]
         if include_closed:
@@ -1762,13 +1797,19 @@ class RunManager:
         *,
         closed_by: str,
         close_all_finished: bool = False,
+        parent_session_id: str | None = None,
     ) -> dict[str, Any]:
         skipped_running_ids: list[str] = []
         targets: list[str] = []
         run_ids = [self._validate_run_id(rid) for rid in run_ids]
 
         if close_all_finished:
-            unclosed = self.list_runs(status="all", limit=1000, include_closed=False)
+            unclosed = self.list_runs(
+                status="all",
+                limit=1000,
+                include_closed=False,
+                parent_session_id=parent_session_id,
+            )
             for item in unclosed:
                 rid = str(item.get("run_id") or "")
                 if not rid:
@@ -1899,6 +1940,7 @@ class RunManager:
         else:
             next_title = codex_run.truncate_text(followup_prompt, 24)
 
+        origin = summary.get("origin", "agent")
         return self.start_run(
             {
                 "prompt": followup_prompt,
@@ -1915,7 +1957,10 @@ class RunManager:
                 "conversation_title": summary.get("parent_session_title"),
                 "persist": True,
                 "session_id": session_id,
-            }
+                "origin": origin,
+                "raw": summary.get("raw", False),
+            },
+            bypass_enabled_check=origin == "user",
         )
 
     def get_history(
@@ -2166,6 +2211,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "run_id": {"type": "string", "description": "Single finished run_id to close."},
                 "run_ids": {"type": "array", "items": {"type": "string"}, "description": "Multiple finished run_ids to close."},
                 "close_all_finished": {"type": "boolean", "default": False, "description": "Close all finished unclosed runs."},
+                "conversation_id": {"type": "string", "description": "Optional parent conversation ID to scope close_all_finished."},
             },
         },
     },
@@ -2175,7 +2221,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
         "description": (
             "Open or update the Agy Codex 4-tab workbench (Subagents Monitor, History, Usage Stats, Models & Config) "
             "in the right side pane (aux_pane) instead of inline in chat. Call right after start_codex_task "
-            "with tab='subagents' and run_id to focus live execution."
+            "with tab='subagents' and run_id (and optional conversation_id) to focus live execution scoped to the current conversation."
         ),
         "inputSchema": {
             "type": "object",
@@ -2183,6 +2229,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
             "properties": {
                 "tab": {"type": "string", "enum": ["subagents", "history", "stats", "models"], "default": "subagents"},
                 "run_id": {"type": "string", "description": "Optional run_id to focus initially."},
+                "conversation_id": {"type": "string", "description": "Optional parent Antigravity conversation ID to isolate the Active Monitor to this conversation."},
             },
         },
         "_meta": {
@@ -2196,6 +2243,70 @@ TOOLS_DEF: list[dict[str, Any]] = [
         },
     },
     # --- App-only tools (zero model token overhead) ---
+    {
+        "name": "start_user_task",
+        "title": "Start a Direct Codex Conversation",
+        "description": "App-only: send a message directly to Codex from the workbench.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["prompt", "cwd"],
+            "properties": {
+                "prompt": {"type": "string"},
+                "cwd": {"type": "string"},
+                "model": {"type": "string"},
+                "provider": {"type": "string"},
+                "effort": {"type": "string"},
+                "mode": {"type": "string", "enum": ["write", "read-only"]},
+                "config_mode": {"type": "string", "enum": ["isolated", "profile", "inherit"]},
+                "preset": {"type": "string"},
+                "worktree": {"type": "string"},
+                "title": {"type": "string"},
+                "conversation_id": {"type": "string"},
+                "conversation_title": {"type": "string"},
+                "persist": {"type": "boolean", "default": True},
+                "raw": {"type": "boolean", "default": True},
+                "search": {"type": "boolean", "default": False},
+            },
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "check_for_updates",
+        "title": "Check for Plugin Updates",
+        "description": "App-only: check GitHub for an update or dismiss a specific version.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "force": {"type": "boolean", "default": False},
+                "channel": {"type": "string", "enum": ["auto", "release", "main"], "default": "auto"},
+                "dismiss_version": {"type": "string"},
+            },
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "start_plugin_update",
+        "title": "Install Plugin Update",
+        "description": "App-only: download and install the selected plugin update in the background.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "channel": {"type": "string", "enum": ["auto", "release", "main"], "default": "auto"},
+                "expected_version": {"type": "string"},
+            },
+        },
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
+    {
+        "name": "get_update_status",
+        "title": "Get Plugin Update Status",
+        "description": "App-only: poll the current plugin update and its latest check result.",
+        "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
+        "_meta": {"ui": {"visibility": ["app"]}},
+    },
     {
         "name": "get_run_events",
         "title": "Get Run Events",
@@ -2219,6 +2330,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "status": {"type": "string", "default": "all"},
                 "limit": {"type": "integer", "default": 40},
                 "include_closed": {"type": "boolean", "default": False},
+                "parent_session_id": {"type": "string", "description": "Optional parent Antigravity conversation ID filter."},
             },
         },
         "_meta": {"ui": {"visibility": ["app"]}},
@@ -2249,6 +2361,7 @@ TOOLS_DEF: list[dict[str, Any]] = [
                 "run_id": {"type": "string"},
                 "run_ids": {"type": "array", "items": {"type": "string"}},
                 "close_all_finished": {"type": "boolean", "default": False},
+                "parent_session_id": {"type": "string", "description": "Optional parent conversation ID to scope batch archiving and refreshed list."},
             },
         },
         "_meta": {"ui": {"visibility": ["app"]}},
@@ -2439,7 +2552,7 @@ class McpServer:
                         "tools": {"listChanged": False},
                         "resources": {"subscribe": False, "listChanged": False},
                     },
-                    "serverInfo": {"name": "agy-codex", "version": "1.4.0"},
+                    "serverInfo": {"name": "agy-codex", "version": "1.5.0"},
                 }
             elif method == "ping":
                 result = {}
@@ -2504,7 +2617,7 @@ class McpServer:
             return self._tool_ok(payload, text=format_models_brief(payload, active_runs=active_runs))
 
         if name == "start_codex_task":
-            state = self.manager.start_run(arguments)
+            state = self.manager.start_run({**arguments, "origin": "agent"})
             with state.lock:
                 summary = state.to_summary_dict()
             wb_cfg = codex_catalog.load_workbench_config(ddir)
@@ -2548,8 +2661,9 @@ class McpServer:
         if name == "close_codex_task":
             run_ids = self._collect_run_ids(arguments)
             close_all = bool(arguments.get("close_all_finished", False))
+            scope_sid = codex_catalog._clean_optional_str(arguments.get("conversation_id"))
             res = self.manager.close_runs(
-                run_ids, closed_by="agent", close_all_finished=close_all
+                run_ids, closed_by="agent", close_all_finished=close_all, parent_session_id=scope_sid
             )
             return self._tool_ok(res, text=format_stop_or_close_brief(res, action="close"))
 
@@ -2557,18 +2671,53 @@ class McpServer:
             tab = str(arguments.get("tab") or "subagents").strip()
             if tab not in ("subagents", "history", "stats", "models"):
                 tab = "subagents"
-            runs = self.manager.list_runs(limit=40)
+            requested_run_id = codex_catalog._clean_optional_str(arguments.get("run_id"))
+            scope_sid = codex_catalog._clean_optional_str(arguments.get("conversation_id"))
+            scope_title: str | None = None
+            if requested_run_id:
+                try:
+                    focused_summary = self.manager._get_summary(requested_run_id)
+                except ValueError:
+                    focused_summary = None
+                if focused_summary:
+                    focused_pid = codex_catalog._clean_optional_str(focused_summary.get("parent_session_id"))
+                    if not scope_sid and focused_pid and focused_pid != "default":
+                        scope_sid = focused_pid
+                    if focused_pid == scope_sid:
+                        scope_title = codex_catalog._clean_optional_str(focused_summary.get("parent_session_title"))
+            if not scope_sid:
+                env_sid = codex_catalog._clean_optional_str(os.environ.get("ANTIGRAVITY_CONVERSATION_ID"))
+                if env_sid and env_sid != "default":
+                    scope_sid = env_sid
+
+            all_unclosed = self.manager.list_runs(limit=500, include_closed=False)
+            if scope_sid:
+                runs = [r for r in all_unclosed if str(r.get("parent_session_id") or "") == scope_sid][:40]
+                if not scope_title and runs:
+                    scope_title = codex_catalog._clean_optional_str(runs[0].get("parent_session_title"))
+            else:
+                runs = all_unclosed[:40]
             all_disk = self.manager.list_runs(limit=500, include_closed=True)
             closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
-            selected = arguments.get("run_id")
+            selected = requested_run_id
             if not selected and runs:
                 selected = runs[0].get("run_id")
             wb_cfg = codex_catalog.load_workbench_config(ddir)
+            total_unclosed = len(all_unclosed)
+            global_active = sum(1 for r in all_unclosed if r.get("status") == "running")
+            other_sessions = max(0, total_unclosed - len(runs)) if scope_sid else 0
             payload = {
                 "view": "panel",
                 "tab": tab,
                 "runs": runs,
                 "selected_run_id": selected,
+                "scope_session_id": scope_sid,
+                "scope_session_title": scope_title,
+                "scope_mode": "session" if scope_sid else "all",
+                "total_unclosed_runs": total_unclosed,
+                "other_sessions_runs": other_sessions,
+                "global_active_runs": global_active,
+                "default_cwd": self.manager.infer_default_cwd(),
                 "enabled": bool(wb_cfg.get("enabled", True)),
                 "intercept_native_subagents": bool(wb_cfg.get("intercept_native_subagents", True)),
                 "exclude_orchestrator_models": bool(wb_cfg.get("exclude_orchestrator_models", True)),
@@ -2589,6 +2738,56 @@ class McpServer:
                 "structuredContent": payload,
             }
 
+        if name == "start_user_task":
+            if not isinstance(arguments.get("cwd"), str) or not arguments["cwd"].strip():
+                raise ValueError("'cwd' is required.")
+            schema = next(tool["inputSchema"] for tool in TOOLS_DEF if tool["name"] == name)
+            unexpected = arguments.keys() - schema["properties"].keys()
+            if unexpected:
+                raise ValueError(f"Unexpected argument(s): {', '.join(sorted(unexpected))}")
+            conv_id = codex_catalog._clean_optional_str(arguments.get("conversation_id"))
+            conv_title = codex_catalog._clean_optional_str(arguments.get("conversation_title"))
+            user_args = {"persist": True, "raw": True, **arguments}
+            user_args.update(
+                origin="user",
+                role="用户直连",
+                conversation_id=conv_id or "user-direct",
+                conversation_title=conv_title or (conv_id if conv_id else "用户直连 Codex"),
+            )
+            state = self.manager.start_run(user_args, bypass_enabled_check=True)
+            wb_cfg = codex_catalog.load_workbench_config(ddir)
+            all_unclosed = self.manager.list_runs(limit=500, include_closed=False)
+            scoped_runs = (
+                [r for r in all_unclosed if str(r.get("parent_session_id") or "") == conv_id][:40]
+                if conv_id
+                else all_unclosed[:40]
+            )
+            return self._tool_ok({
+                **state.to_summary_dict(),
+                "scope_session_id": conv_id,
+                "total_unclosed_runs": len(all_unclosed),
+                "other_sessions_runs": max(0, len(all_unclosed) - len(scoped_runs)) if conv_id else 0,
+                "global_active_runs": sum(1 for r in all_unclosed if r.get("status") == "running"),
+                "active_runs": sum(1 for r in scoped_runs if r.get("status") == "running"),
+                "max_concurrent_runs": int((wb_cfg.get("mapping") or {}).get("max_concurrent_runs", 5)),
+                "runs": scoped_runs,
+            })
+
+        if name == "check_for_updates":
+            return self._tool_ok(codex_updater.check_for_updates(
+                PLUGIN_ROOT, ddir, force=bool(arguments.get("force", False)),
+                channel=arguments.get("channel", "auto"), dismiss_version=arguments.get("dismiss_version"),
+            ))
+
+        if name == "start_plugin_update":
+            return self._tool_ok(codex_updater.start_plugin_update(
+                PLUGIN_ROOT, ddir, channel=arguments.get("channel", "auto"),
+                expected_version=arguments.get("expected_version"), codex_home=chome,
+            ))
+
+        if name == "get_update_status":
+            return self._tool_ok(codex_updater.get_update_status(PLUGIN_ROOT, ddir))
+
         if name == "get_run_events":
             run_id = str(arguments.get("run_id") or "").strip()
             if not run_id:
@@ -2600,15 +2799,36 @@ class McpServer:
             status = str(arguments.get("status") or "all")
             limit = int(arguments.get("limit") or 40)
             include_closed = bool(arguments.get("include_closed", False))
+            scope_sid = codex_catalog._clean_optional_str(arguments.get("parent_session_id"))
             runs = self.manager.list_runs(
-                status=status, limit=limit, include_closed=include_closed
+                status=status,
+                limit=limit,
+                include_closed=include_closed,
+                parent_session_id=scope_sid,
             )
+            all_unclosed = self.manager.list_runs(limit=500, include_closed=False)
             all_disk = self.manager.list_runs(limit=500, include_closed=True)
             closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
             wb_cfg = codex_catalog.load_workbench_config(ddir)
+            total_unclosed = len(all_unclosed)
+            global_active = sum(1 for r in all_unclosed if r.get("status") == "running")
+            other_sessions = (
+                max(
+                    0,
+                    total_unclosed
+                    - sum(1 for r in all_unclosed if str(r.get("parent_session_id") or "") == scope_sid),
+                )
+                if scope_sid
+                else 0
+            )
             return self._tool_ok(
                 {
                     "runs": runs,
+                    "scope_session_id": scope_sid,
+                    "total_unclosed_runs": total_unclosed,
+                    "other_sessions_runs": other_sessions,
+                    "global_active_runs": global_active,
+                    "default_cwd": self.manager.infer_default_cwd(),
                     "enabled": bool(wb_cfg.get("enabled", True)),
                     "intercept_native_subagents": bool(
                         wb_cfg.get("intercept_native_subagents", True)
@@ -2636,13 +2856,23 @@ class McpServer:
         if name == "close_run":
             run_ids = self._collect_run_ids(arguments)
             close_all = bool(arguments.get("close_all_finished", False))
+            scope_sid = codex_catalog._clean_optional_str(arguments.get("parent_session_id"))
             res = self.manager.close_runs(
-                run_ids, closed_by="user", close_all_finished=close_all
+                run_ids, closed_by="user", close_all_finished=close_all, parent_session_id=scope_sid
             )
-            runs = self.manager.list_runs(limit=40)
+            all_unclosed = self.manager.list_runs(limit=500, include_closed=False)
+            runs = (
+                [r for r in all_unclosed if str(r.get("parent_session_id") or "") == scope_sid][:40]
+                if scope_sid
+                else all_unclosed[:40]
+            )
             all_disk = self.manager.list_runs(limit=500, include_closed=True)
             closed_24h = sum(1 for r in all_disk if (r.get("closed") or r.get("closed_at")))
             res["runs"] = runs
+            res["scope_session_id"] = scope_sid
+            res["total_unclosed_runs"] = len(all_unclosed)
+            res["other_sessions_runs"] = max(0, len(all_unclosed) - len(runs)) if scope_sid else 0
+            res["global_active_runs"] = sum(1 for r in all_unclosed if r.get("status") == "running")
             res["active_runs"] = sum(1 for r in runs if r.get("status") == "running")
             res["closed_24h_count"] = closed_24h
             return self._tool_ok(res)
@@ -2727,7 +2957,11 @@ class McpServer:
                 chome, ddir, include_hidden=inc_hidden, include_excluded=True
             )
             doc = codex_run.doctor_report(chome, ddir)
-            return self._tool_ok({**disc, "doctor": doc})
+            return self._tool_ok({
+                **disc, "doctor": doc,
+                "default_cwd": self.manager.infer_default_cwd(),
+                "plugin_version": codex_updater.read_local_install_info(PLUGIN_ROOT)["current_version"],
+            })
 
         if name == "save_workbench_config":
             saved = codex_catalog.save_workbench_config(arguments, ddir)

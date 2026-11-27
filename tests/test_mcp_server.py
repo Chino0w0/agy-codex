@@ -131,7 +131,7 @@ class TestMcpServerAndRunner(unittest.TestCase):
     def test_protocol_and_visibility_separation(self) -> None:
         init = self.server.handle_request({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertEqual(init["result"]["serverInfo"]["name"], "agy-codex")
-        self.assertEqual(init["result"]["serverInfo"]["version"], "1.4.0")
+        self.assertEqual(init["result"]["serverInfo"]["version"], "1.5.0")
 
         tools_resp = self.server.handle_request({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
@@ -151,6 +151,10 @@ class TestMcpServerAndRunner(unittest.TestCase):
             )
 
         for app_tool in (
+            "start_user_task",
+            "check_for_updates",
+            "start_plugin_update",
+            "get_update_status",
             "get_run_events",
             "list_runs",
             "close_run",
@@ -190,6 +194,65 @@ class TestMcpServerAndRunner(unittest.TestCase):
             {"jsonrpc": "2.0", "id": 3, "method": "resources/read", "params": {"uri": mcp_server.APP_URI}}
         )
         self.assertEqual(res_read["result"]["contents"][0]["mimeType"], "text/html;profile=mcp-app")
+
+    def test_user_direct_can_start_and_resume_while_disabled(self) -> None:
+        self._call_tool_raw(4, "toggle_codex_enabled", {"enabled": False})
+        args = {"prompt": "Hello Codex", "cwd": str(self.workdir), "mode": "write"}
+        self.assertIn("error", self._call_tool_raw(5, "start_codex_task", {**args, "origin": "user"}))
+        result = self._call_tool_raw(6, "start_user_task", args)["result"]["structuredContent"]
+        self.assertEqual(result["origin"], "user")
+        self.assertTrue(result["persist"])
+        self.assertTrue(result["raw"])
+        self.assertEqual(result["role"], "用户直连")
+        self.assertEqual(result["parent_session_id"], "user-direct")
+        self.assertEqual(result["parent_session_title"], "用户直连 Codex")
+        self.assertFalse(any("Write task prompt is short" in message for message in result["warnings"]))
+        self.assertEqual(result["runs"][0]["run_id"], result["run_id"])
+        run_id = result["run_id"]
+        done = self.manager.wait_runs([run_id], timeout=10)
+        self.assertEqual(done["status"], "done")
+        self.assertIsInstance(done["result"], str)
+        self.assertEqual(done["session_id"], "0199-fake-session-1")
+
+        # 从新 RunManager 的磁盘记录恢复，确保重启后仍保留直连属性。
+        second = mcp_server.RunManager(data_dir=self.data_dir, codex_home=self.codex_home)
+        self.addCleanup(second.shutdown)
+        followup = second.send_followup(run_id, "Follow-up question")
+        summary = followup.to_summary_dict()
+        for key in ("origin", "raw", "role", "parent_session_id", "parent_session_title", "cwd", "mode", "model",
+                    "provider", "effort", "preset", "config_mode", "persist"):
+            self.assertEqual(summary[key], done[key], key)
+        self.assertEqual(followup.resume_session_id, done["session_id"])
+        self.assertTrue(followup.done_event.wait(10))
+        self.assertEqual(followup.status, "done")
+
+        for name in ("open_codex_panel", "list_runs", "get_workbench_config"):
+            with self.subTest(name=name):
+                payload = self._call_tool_raw(7, name, {})["result"]["structuredContent"]
+                self.assertEqual(Path(payload["default_cwd"]).resolve(), self.workdir.resolve())
+                if name == "get_workbench_config":
+                    self.assertEqual(payload["plugin_version"], "1.5.0")
+
+    def test_default_cwd_falls_back_outside_plugin(self) -> None:
+        with mock.patch.object(Path, "cwd", return_value=self.workdir):
+            self.assertEqual(self.manager.infer_default_cwd(), str(self.workdir))
+        with mock.patch.object(Path, "cwd", return_value=mcp_server.PLUGIN_ROOT / "server"):
+            self.assertEqual(self.manager.infer_default_cwd(), str(Path.home()))
+
+    def test_update_tool_routes(self) -> None:
+        updater = mcp_server.codex_updater
+        root = mcp_server.PLUGIN_ROOT
+        with mock.patch.object(updater, "check_for_updates", return_value={"latest_id": "1.6.0"}) as check:
+            result = self._call_tool_raw(8, "check_for_updates", {"force": True, "channel": "release", "dismiss_version": "1.6.0"})
+            self.assertEqual(result["result"]["structuredContent"], {"latest_id": "1.6.0"})
+            check.assert_called_once_with(root, self.data_dir, force=True, channel="release", dismiss_version="1.6.0")
+        with mock.patch.object(updater, "start_plugin_update", return_value={"status": "checking"}) as start:
+            result = self._call_tool_raw(9, "start_plugin_update", {"channel": "main", "expected_version": "1.6.0"})
+            self.assertEqual(result["result"]["structuredContent"], {"status": "checking"})
+            start.assert_called_once_with(root, self.data_dir, channel="main", expected_version="1.6.0", codex_home=self.codex_home)
+        result = self._call_tool_raw(10, "get_update_status", {})["result"]["structuredContent"]
+        self.assertEqual(result["status"], "idle")
+        self.assertEqual(result["current_version"], "1.5.0")
 
     def test_preview_doctor_models_and_empty_panel(self) -> None:
         models_res = self.server.handle_request(
@@ -603,7 +666,9 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self._call_tool_raw(74, "stop_codex_task", {"run_id": slow_id})
 
         # Closing finished run sets closed_by="agent" and removes it from default list_runs
-        closed = self._call_tool_raw(75, "close_codex_task", {"run_id": fast_id})["result"]["structuredContent"]
+        close_response = self._call_tool_raw(75, "close_codex_task", {"run_id": fast_id})
+        self.assertIn("result", close_response, close_response)
+        closed = close_response["result"]["structuredContent"]
         self.assertEqual(closed["closed_by"], "agent")
         self.assertIsNotNone(closed.get("closed_at"))
 
@@ -1227,6 +1292,101 @@ class TestMcpServerAndRunner(unittest.TestCase):
         self.assertIn("2 条命令", waited.get("error") or "")
         self.assertIn("codex.log", waited.get("error") or "")
         self.assertIn("2 条命令", waited.get("work_digest") or "")
+
+    def test_conversation_isolation_in_panel_list_close_and_user_task(self) -> None:
+        conv_a = "conv-isolation-a"
+        conv_b = "conv-isolation-b"
+        run_a = self._call_tool_raw(
+            170,
+            "start_codex_task",
+            {
+                "prompt": "Task in conversation A",
+                "cwd": str(self.workdir),
+                "mode": "read-only",
+                "conversation_id": conv_a,
+                "conversation_title": "Conversation A",
+            },
+        )["result"]["structuredContent"]
+        run_b = self._call_tool_raw(
+            171,
+            "start_codex_task",
+            {
+                "prompt": "Task in conversation B",
+                "cwd": str(self.workdir),
+                "mode": "read-only",
+                "conversation_id": conv_b,
+                "conversation_title": "Conversation B",
+            },
+        )["result"]["structuredContent"]
+        self._call_tool_raw(
+            172, "wait_codex_task", {"run_ids": [run_a["run_id"], run_b["run_id"]], "timeout": 10}
+        )
+
+        # Opening panel with run_id from conv A automatically isolates Active Monitor to conv A
+        panel_a = self._call_tool_raw(
+            173, "open_codex_panel", {"tab": "subagents", "run_id": run_a["run_id"]}
+        )["result"]["structuredContent"]
+        self.assertEqual(panel_a["scope_session_id"], conv_a)
+        self.assertEqual(panel_a["scope_mode"], "session")
+        self.assertEqual([r["run_id"] for r in panel_a["runs"]], [run_a["run_id"]])
+        self.assertGreaterEqual(panel_a["other_sessions_runs"], 1)
+        self.assertGreaterEqual(panel_a["total_unclosed_runs"], 2)
+
+        # Opening panel with no run_id/conversation_id and no env var (global left sidebar) shows both
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_CONVERSATION_ID": ""}):
+            panel_all = self._call_tool_raw(
+                174, "open_codex_panel", {"tab": "subagents"}
+            )["result"]["structuredContent"]
+        self.assertIsNone(panel_all["scope_session_id"])
+        self.assertEqual(panel_all["scope_mode"], "all")
+        all_ids = {r["run_id"] for r in panel_all["runs"]}
+        self.assertTrue({run_a["run_id"], run_b["run_id"]}.issubset(all_ids))
+
+        # Opening panel when ANTIGRAVITY_CONVERSATION_ID env var is set auto-scopes to that conversation
+        with mock.patch.dict(os.environ, {"ANTIGRAVITY_CONVERSATION_ID": conv_b}):
+            panel_env = self._call_tool_raw(
+                180, "open_codex_panel", {"tab": "subagents"}
+            )["result"]["structuredContent"]
+        self.assertEqual(panel_env["scope_session_id"], conv_b)
+        self.assertEqual(panel_env["scope_mode"], "session")
+        self.assertEqual([r["run_id"] for r in panel_env["runs"]], [run_b["run_id"]])
+
+        # Direct user chat launched from scoped conv A stays in conv A and never leaks to conv B
+        user_a = self._call_tool_raw(
+            175,
+            "start_user_task",
+            {
+                "prompt": "Direct follow-up in conv A",
+                "cwd": str(self.workdir),
+                "mode": "read-only",
+                "conversation_id": conv_a,
+                "conversation_title": "Conversation A",
+            },
+        )["result"]["structuredContent"]
+        self._call_tool_raw(176, "wait_codex_task", {"run_id": user_a["run_id"], "timeout": 10})
+        self.assertEqual(user_a["parent_session_id"], conv_a)
+        self.assertEqual(user_a["origin"], "user")
+        list_b = self._call_tool_raw(
+            177, "list_runs", {"parent_session_id": conv_b}
+        )["result"]["structuredContent"]
+        self.assertEqual([r["run_id"] for r in list_b["runs"]], [run_b["run_id"]])
+        self.assertGreaterEqual(list_b["other_sessions_runs"], 2)
+
+        # Batch archive scoped to conv A must NOT archive conv B's finished run
+        closed_a = self._call_tool_raw(
+            178, "close_run", {"close_all_finished": True, "parent_session_id": conv_a}
+        )["result"]["structuredContent"]
+        self.assertIn(run_a["run_id"], closed_a["closed_ids"])
+        self.assertIn(user_a["run_id"], closed_a["closed_ids"])
+        self.assertNotIn(run_b["run_id"], closed_a["closed_ids"])
+        self.assertEqual(closed_a["runs"], [])
+        self.assertGreaterEqual(closed_a["other_sessions_runs"], 1)
+
+        # Verify conv B's run is still open and unarchived
+        list_b_after = self._call_tool_raw(
+            179, "list_runs", {"parent_session_id": conv_b}
+        )["result"]["structuredContent"]
+        self.assertEqual([r["run_id"] for r in list_b_after["runs"]], [run_b["run_id"]])
 
 
 if __name__ == "__main__":
