@@ -26,7 +26,6 @@ export function renderModelsView(st: ModelsViewState): string {
             <div>加载模型目录与配置中心失败: ${escapeHtml(st.loadError)}</div>
             <div class="load-error-actions">
               <button type="button" id="retry-models-btn" class="btn btn-primary btn-sm">重试加载</button>
-              ${renderCodexToggleButton(st.enabled, "inline")}
             </div>
           </div>
         </div>
@@ -173,12 +172,23 @@ export function renderModelsView(st: ModelsViewState): string {
         </div>
       </div>
 
+      <div class="form-row-2">
+        <div class="field">
+          <label for="cfg-map-worker-timeout">单任务执行超时上限 (秒, 0=不限制)</label>
+          <input type="number" id="cfg-map-worker-timeout" min="0" max="86400" value="${cfg.mapping.worker_timeout_sec ?? 0}" />
+        </div>
+        <div class="field">
+          <label for="cfg-map-idle-timeout">无输出卡死自动中止 (秒, 0=仅预警不中止)</label>
+          <input type="number" id="cfg-map-idle-timeout" min="0" max="86400" value="${cfg.mapping.idle_timeout_sec ?? 0}" />
+        </div>
+      </div>
+
       <div class="retention-box">
         <div class="label-with-tip">
           <span class="retention-title">临时销毁与 ${retentionHours}h 追溯机制</span>
           ${renderHelpTip(
             "ephemeral-ttl",
-            "--ephemeral 与 24h 归档留存",
+            `--ephemeral 与 ${retentionHours}h 归档留存`,
             "`--ephemeral --thread-source subagent` 保证调用结束后不在本地 Codex Desktop 留下垃圾会话；插件目录会为你留存指定小时数的完整步骤日志，过期后自动清理细节仅留 `stats-ledger.jsonl` 永久统计。",
           )}
         </div>
@@ -310,7 +320,7 @@ export function renderModelsView(st: ModelsViewState): string {
           ? `<div class="empty-hint">没有匹配的可见模型。</div>`
           : visibleModels
               .map((m) => {
-                const isExcl = excludedSet.has(m.slug) || Boolean(m.excluded);
+                const isExcl = excludedSet.has(m.slug);
                 const isOrchGuarded = Boolean(m.orchestrator_excluded) && st.excludeOrchestratorModels;
                 const isDirectRestricted =
                   m.tool_mode === "direct" || m.supports_search_tool === false;

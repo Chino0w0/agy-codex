@@ -9,7 +9,6 @@ import {
   getRunRole,
   getRunStatusMeta,
   getRunWorkDigest,
-  renderCodexToggleButton,
   statusDotClass,
 } from "../utils";
 import { renderTraceView, type TraceViewState } from "./trace";
@@ -42,7 +41,6 @@ export interface HistoryViewState {
   openSessionIds: Set<string>;
   traceState: TraceViewState;
   retentionHours: number;
-  enabled: boolean;
 }
 
 export function renderHistoryView(st: HistoryViewState): string {
@@ -76,7 +74,7 @@ export function renderHistoryView(st: HistoryViewState): string {
 
   const filterPills: Array<{ key: HistoryFilter; label: string }> = [
     { key: "all", label: "全部" },
-    { key: "closed", label: "24h 归档" },
+    { key: "closed", label: `${retentionHours}h 归档` },
     { key: "active", label: "活跃中" },
     { key: "issue", label: "仅异常" },
   ];
@@ -94,7 +92,6 @@ export function renderHistoryView(st: HistoryViewState): string {
         )
         .join("")}
       <div class="history-filter-right">
-        ${renderCodexToggleButton(st.enabled, "inline")}
         ${
           st.payload
             ? `<span class="history-total-hint">共 ${st.payload.total_runs} 条记录 (留存 ${retentionHours}h)</span>`
