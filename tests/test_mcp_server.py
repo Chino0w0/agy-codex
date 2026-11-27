@@ -1388,6 +1388,25 @@ class TestMcpServerAndRunner(unittest.TestCase):
         )["result"]["structuredContent"]
         self.assertEqual([r["run_id"] for r in list_b_after["runs"]], [run_b["run_id"]])
 
+        # Verify infer_default_cwd prefers worktree.base_repo over plugin_data/worktrees/*
+        fake_wt_dir = self.data_dir / "worktrees" / "ephemeral-wt"
+        fake_wt_dir.mkdir(parents=True, exist_ok=True)
+        wt_run_dir = self.data_dir / "runs" / "20990101-000000-wt0001"
+        wt_run_dir.mkdir(parents=True, exist_ok=True)
+        (wt_run_dir / "state.json").write_text(
+            json.dumps({
+                "run_id": "20990101-000000-wt0001",
+                "status": "done",
+                "started_at": time.time() + 1000,
+                "cwd": str(fake_wt_dir),
+                "parent_session_id": "conv-wt",
+                "worktree": {"path": str(fake_wt_dir), "base_repo": str(self.workdir)},
+            }),
+            encoding="utf-8",
+        )
+        inferred = self.manager.infer_default_cwd(parent_session_id="conv-wt")
+        self.assertEqual(Path(inferred).resolve(), self.workdir.resolve())
+
 
 if __name__ == "__main__":
     unittest.main()
